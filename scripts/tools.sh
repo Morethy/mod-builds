@@ -23,6 +23,13 @@ git_url=$(sed -n 's/^MIXINS_GIT=//p' "$root/source/packaging/android/native_buil
 cargo install --locked --git "$git_url" --rev "$rev" --root "$root/base/mixins-${rev:0:12}" horizon-mixins-cli
 
 cargo fetch --locked --manifest-path "$root/source/Cargo.toml"
+# The std a version builds with the game since starling-client/starling#611 (build_apk.py's BUILD_STD): its
+# source and its crates, which the sandbox cannot download either. Only for a version that builds it.
+if grep -q -- '-Zbuild-std' "$root/source/packaging/android/build_apk.py"; then
+  rustup component add rust-src
+  RUSTC_BOOTSTRAP=1 cargo fetch --locked -Zbuild-std=std,panic_unwind --target aarch64-linux-android \
+    --manifest-path "$root/source/Cargo.toml"
+fi
 
 # The sandbox's home has this folder as its .cargo.
 rm -rf "$root/cargo"
