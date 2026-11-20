@@ -20,9 +20,12 @@ git init -q "$root/source"
 git -C "$root/source" fetch -q --depth 1 https://github.com/starling-client/starling "$BUILD"
 git -C "$root/source" checkout -q --detach FETCH_HEAD
 
-# The NDK, the build tools and the platform build_apk.py pins, where the sandbox finds them.
-(yes || true) | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$HOME/android" \
-  --install "ndk;$NDK" "build-tools;35.0.0" "platforms;android-36" | tail -3
+# The NDK, the build tools and the platform build_apk.py pins, where the sandbox finds them. store-base.yml installs
+# them before `room.sh clean` deletes the runner's SDK, sdkmanager with it.
+if [ ! -d "$HOME/android/ndk/$NDK" ]; then
+  (yes || true) | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$HOME/android" \
+    --install "ndk;$NDK" "build-tools;35.0.0" "platforms;android-36" | tail -3
+fi
 export ANDROID_HOME=$HOME/android ANDROID_NDK_HOME=$HOME/android/ndk/$NDK
 
 cd "$root/source"
