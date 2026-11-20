@@ -153,7 +153,11 @@ def build_one(row, mods, source, result, build, profile):
         if done.returncode != 0:
             said_by = done.stdout + "\n" + done.stderr
             print(said_by[-4000:], flush=True)
-            error = (done.stderr or done.stdout or "The build failed.").strip()[-600:]
+            # Cargo's own error lines first: the game shows the answer's first line, and the end of the output
+            # is Python's traceback around the failed command (a phone showed ")))", 2026-11-20).
+            errors = [line for line in said_by.splitlines() if line.startswith("error")]
+            error = "\n".join(errors[:6])[:600] if errors else \
+                (done.stderr or done.stdout or "The build failed.").strip()[-600:]
             return said(result, job, {**status, "state": "failed", "error": error,
                                       "settled": bool(OWN_ERROR.search(said_by))})
         record = json.loads((out / "native-mods.json").read_text())
