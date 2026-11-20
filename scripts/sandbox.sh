@@ -53,8 +53,9 @@ back() {
 back rustup .rustup ro
 back android android ro
 # Where store_base.sh built it: Cargo keeps its build by the absolute path of each package, and each build script
-# holds its package's folder. Elsewhere Cargo built the whole game again in here, and horizon-prepare's build script
-# read its sources from where they no longer were (2026-11-20).
+# holds the folder of its package. Elsewhere Cargo built the whole game again in here, and the build script of
+# horizon-prepare read its sources from where they no longer were (2026-11-20). No apostrophe in this script: it is
+# inside single quotes.
 back source store/source rw
 back cargo .cargo rw
 back scripts scripts ro
