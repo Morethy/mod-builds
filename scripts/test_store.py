@@ -258,6 +258,8 @@ class Register(unittest.TestCase):
         with self.assertRaises(ValueError):
             store.register(None, "main", None, "quick", "arm64-v8a")
         with self.assertRaises(ValueError):
+            store.register(None, BUILD, None, "release", "arm64-v8a")
+        with self.assertRaises(ValueError):
             store.register(None, BUILD, None, "quick", "arm64-v8a", "https://example.com/x.apk")
 
 

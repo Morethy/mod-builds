@@ -194,7 +194,7 @@ def main(argv):
     if not store.BUILD.fullmatch(build):
         sys.exit(f"Not a build: {build!r}")
     source = pathlib.Path(os.environ["MOD_LIB_SOURCE"])
-    profile = os.environ.get("PROFILE", "quick")
+    profile = os.environ.get("PROFILE", "fast")
     jobs = json.loads(pathlib.Path(argv[2]).read_text())
     mods, result = pathlib.Path(argv[3]), pathlib.Path(argv[4])
     result.mkdir(parents=True, exist_ok=True)

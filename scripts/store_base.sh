@@ -9,7 +9,8 @@
 # built beside libraries that differ from the phone's would not load there.
 set -euo pipefail
 [[ "${BUILD:-}" =~ ^[0-9a-f]{40}$ ]] || { echo "Not a build: ${BUILD:-}"; exit 1; }
-[[ "${PROFILE:-}" =~ ^[a-z]+$ ]] || { echo "Not a profile: ${PROFILE:-}"; exit 1; }
+# The profile players' Nightlies are built with (android.yml: `fast`, as releases), or `quick` for tests.
+[[ "${PROFILE:-}" =~ ^(fast|quick)$ ]] || { echo "Not a profile: ${PROFILE:-}"; exit 1; }
 triple=$(python3 -I -c 'import os, sys; sys.path.insert(0, "scripts"); import store; print(store.TARGETS[os.environ["ABI"]])')
 root=$HOME/store
 NDK=28.2.13676358
@@ -37,16 +38,17 @@ started=$(date +%s)
 RUSTFLAGS="-C prefer-dynamic" python3 packaging/android/build_apk.py --abi "$ABI" --profile "$PROFILE" --library-only
 echo "The game's build: $(( $(date +%s) - started )) s"
 
-# The game's libraries as the APK ships them (build_apk.py's entry library and `rust_dylibs`, stripped).
+# The game's libraries as the APK ships them (build_apk.py's entry library and `rust_dylibs`, stripped), by the
+# names build_apk.py gives them: which ones they are is the game's to say.
 shipped=$root/shipped
 mkdir -p "$shipped"
-cp target/android/libhorizon_android.so "$shipped/"
 RUSTFLAGS="-C prefer-dynamic" python3 - "$triple" "$PROFILE" "$shipped" <<'EOF'
-import os, pathlib, sys
+import os, pathlib, shutil, sys
 sys.path.insert(0, "packaging/android")
 import build_apk
 triple, profile, out = sys.argv[1], sys.argv[2], pathlib.Path(sys.argv[3])
 built = pathlib.Path("target") / triple / ("debug" if profile == "dev" else profile) / f"lib{build_apk.LIBRARY}.so"
+shutil.copyfile(pathlib.Path("target/android") / f"lib{build_apk.LIBRARY}.so", out / f"lib{build_apk.LIBRARY}.so")
 build_apk.rust_dylibs(pathlib.Path(os.environ["ANDROID_NDK_HOME"]), built.resolve(), out)
 EOF
 (cd "$shipped" && sha256sum ./*.so)

@@ -57,6 +57,9 @@ LIBRARY = re.compile(r"lib[a-z0-9_]{1,64}\.so")
 # What a build's .hmod may be at most (the service's MAX_BODY).
 LARGEST_MOD = 32 << 20
 DID_NOT_FINISH = "The build on GitHub did not finish. Try again."
+# The Cargo profiles an APK is built with: `fast` for players' Nightlies (android.yml, as releases), `quick` for
+# tests. A mod is built with its APK's.
+PROFILES = ("fast", "quick")
 
 
 def mods_tag(build):
@@ -295,7 +298,7 @@ def register(builds, build, nightly, profile, abi, apk=None, date=None, game=Non
     """builds.json with game build `build` for `abi`, first (newest first by date): its Nightly, the Cargo
     profile its APK is built with (a mod is built with the same), and the Nightly's APK the base was checked
     against. A build already there gets the ABI added, or its row replaced for that ABI."""
-    if not BUILD.fullmatch(build) or abi not in TARGETS or not re.fullmatch(r"[a-z]+", profile):
+    if not BUILD.fullmatch(build) or abi not in TARGETS or profile not in PROFILES:
         raise ValueError(f"not a build to register: {build} {abi} {profile}")
     if apk and not re.fullmatch(r"https://github\.com/[\w.-]+/[\w.-]+/releases/download/[\w.+-]+/[\w.+-]+\.apk", apk):
         raise ValueError(f"an APK is a GitHub release's download, not {apk}")
@@ -420,10 +423,10 @@ def main(argv):
         if not row:
             sys.exit(f"{build} is not in the store's {BUILDS}: run store-base.yml for it first")
         with open(os.environ["GITHUB_ENV"], "a") as f:
-            f.write(f"PROFILE={row.get('profile') or 'quick'}\n")
+            f.write(f"PROFILE={row.get('profile') or 'fast'}\n")
     elif command == "register":
         made = register(fetch_json(download_url(STORE, BUILDS)), build, os.environ.get("NIGHTLY") or None,
-                        os.environ.get("PROFILE", "quick"), os.environ["ABI"], os.environ.get("APK") or None)
+                        os.environ.get("PROFILE", "fast"), os.environ["ABI"], os.environ.get("APK") or None)
         ensure_release(run_gh, STORE, "Compile store")
         with tempfile.TemporaryDirectory() as folder:
             path = pathlib.Path(folder) / BUILDS

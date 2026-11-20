@@ -69,7 +69,7 @@ exec setpriv --reuid="$uid" --regid="$gid" --clear-groups --no-new-privs \
   BUILD="$build" ABI="$abi" PROFILE="$profile" MOD_LIB_SOURCE="$home/source" \
   python3 -I "$home/scripts/mod_lib.py" build "$home/jobs.json" "$home/mods" "$home/result"
 ' sandbox "$HOME" "$(id -u)" "$(id -g)" "$jobs" "$mods" "$result" "$scripts" "$layer" "${BUILD:-}" "${ABI:-}" \
-  "${PROFILE:-quick}"
+  "${PROFILE:-fast}"
 code=$?
 # The layer holds root's files.
 sudo -n rm -rf "$layer"

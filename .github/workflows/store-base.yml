@@ -18,8 +18,10 @@ on:
         description: The ABI
         default: arm64-v8a
       profile:
-        description: The Cargo profile the APK is built with (build_apk.py --profile)
-        default: quick
+        description: The Cargo profile the APK is built with (fast for players' Nightlies, quick for tests)
+        type: choice
+        options: [fast, quick]
+        default: fast
       nightly:
         description: The Nightly that ships the build
         default: ''
