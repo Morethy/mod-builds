@@ -52,7 +52,10 @@ back() {
 }
 back rustup .rustup ro
 back android android ro
-back source source rw
+# Where store_base.sh built it: Cargo keeps its build by the absolute path of each package, and each build script
+# holds its package's folder. Elsewhere Cargo built the whole game again in here, and horizon-prepare's build script
+# read its sources from where they no longer were (2026-11-20).
+back source store/source rw
 back cargo .cargo rw
 back scripts scripts ro
 back mods mods ro
@@ -66,7 +69,7 @@ exec setpriv --reuid="$uid" --regid="$gid" --clear-groups --no-new-privs \
   --bounding-set=-all --inh-caps=-all \
   env -i HOME="$home" PATH="$home/.cargo/bin:/usr/bin:/bin" CARGO_NET_OFFLINE=true LANG=C.UTF-8 \
   ANDROID_HOME="$home/android" ANDROID_NDK_HOME="$home/android/ndk/$ndk" \
-  BUILD="$build" ABI="$abi" PROFILE="$profile" MOD_LIB_SOURCE="$home/source" \
+  BUILD="$build" ABI="$abi" PROFILE="$profile" MOD_LIB_SOURCE="$home/store/source" \
   python3 -I "$home/scripts/mod_lib.py" build "$home/jobs.json" "$home/mods" "$home/result"
 ' sandbox "$HOME" "$(id -u)" "$(id -g)" "$jobs" "$mods" "$result" "$scripts" "$layer" "${BUILD:-}" "${ABI:-}" \
   "${PROFILE:-fast}"
