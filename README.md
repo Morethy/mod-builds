@@ -10,6 +10,19 @@ Native mods are compiled into [Starling](https://github.com/starling-client/star
 
 Runs and their logs are public, but the mods aren't: the key never shows up in a log. Builds are kept for two weeks.
 
+The service's answer to a build names this repository (`repo`), and a Starling that knows it waits for `results-<job's first digit>/<job>.json` (or `.failed.json`) and downloads `<job>.so` straight from GitHub, asking the service only every ten minutes or so while it waits. A Starling before it asks `GET /v1/job/<job>` again two seconds after each answer, so the service holds that answer up to 25 s.
+
+## Compile v2: a library per mod
+
+With the game as a Rust library (a Nightly with its SDK), a native mod is its own small library, built once for each game build and ABI, and kept in a store the game reads straight from GitHub:
+
+- `store/builds.json`: every game build the store serves, newest first: its commit, its Nightly, its SDK, and for each ABI the game's own runtime archive (url, SHA-256, size), so a game can move to a newer Nightly without a new APK.
+- `mods-<build>/index.json`: that build's mods, each id, version and `.hmod` SHA-256 to its library (`<job>.so`), the library's SHA-256 and its identity, and the mods that failed there. A job is the `.hmod`'s SHA-256 (32 digits) and the ABI.
+- `catalog.yml` builds every native mod of [Horizon's catalog](https://horizon-rust.github.io/horizon-mods/) for one build, ahead of the players. Given the build's `sdk` (the release download folder with its `sdk.json`), it first adds the build to `builds.json`.
+- `mod.yml` builds one mod the store doesn't have, asked through the service (`POST /v2/mod?build=B&abi=A` with the `.hmod`). Its answer is `mods-<build>/<job>.json` or `.failed.json`, which the game waits for on GitHub.
+
+Both build in a sandbox (`scripts/sandbox.sh`) with a token that can only read, and publish from a job that runs nothing of the mods (`scripts/store.py`). The compiling itself is the SDK's: `scripts/mod_lib.py` calls the compiler the repository variable `MOD_LIB_COMPILER` names, a path in the SDK, and until it's set every v2 build fails, not for good, saying it can't yet. `python -m unittest discover -s scripts` tests the scripts.
+
 ## Your own build service
 
 Anyone can run their own copy of this, on their own GitHub and Cloudflare accounts, and point Starling at it. It costs nothing: Actions are free on a public repository, and so are Workers up to 100,000 requests a day.

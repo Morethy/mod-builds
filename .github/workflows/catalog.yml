@@ -1,0 +1,143 @@
+name: catalog
+run-name: catalog ${{ inputs.build }}
+# Compile v2's store, ahead of the players: every native mod in Horizon's catalog
+# (horizon-rust.github.io/horizon-mods, kind native-mod), each version for the build's game, built once
+# for one game build (a Nightly) and each ABI asked, so a game finds it in mods-<build>/index.json and
+# never asks the Compile service for it (scripts/store.py). Given `sdk`, the build is first added to the
+# store's builds.json, with the game's own runtime for each ABI: how a Nightly comes into the store
+# (Starling's nightly workflow can start this one, through the GitHub App).
+#
+# The mods are built as mod.yml builds one: in the sandbox, with a token that can only read; a job that
+# runs nothing of them publishes. A mod already in the index, or failed there for good, is not built
+# again; run it again after the catalog grows.
+on:
+  workflow_dispatch:
+    inputs:
+      build:
+        description: The game build (its full commit)
+        required: true
+      sdk:
+        description: The release download folder with the build's sdk.json and slices, to add the build to the store (empty for one in it)
+        default: ''
+      nightly:
+        description: The Nightly that ships the build, when sdk.json doesn't say
+        default: ''
+      abis:
+        description: The ABIs to build for, with commas
+        default: arm64-v8a
+permissions:
+  contents: read
+jobs:
+  register:
+    if: inputs.sdk != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # builds.json is written by one job at a time.
+    concurrency:
+      group: store
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    env:
+      BUILD: ${{ inputs.build }}
+      SDK: ${{ inputs.sdk }}
+      NIGHTLY: ${{ inputs.nightly }}
+      ABIS: ${{ inputs.abis }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: The build in the store
+        run: python3 scripts/store.py register
+  plan:
+    needs: register
+    if: always() && needs.register.result != 'failure'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      count: ${{ steps.plan.outputs.count }}
+    env:
+      BUILD: ${{ inputs.build }}
+      ABIS: ${{ inputs.abis }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - id: plan
+        name: What the build lacks
+        run: python3 scripts/store.py plan plan.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plan
+          path: plan.json
+          retention-days: 1
+  build:
+    needs: plan
+    if: needs.plan.outputs.count != '0'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env:
+      BUILD: ${{ inputs.build }}
+      ABIS: ${{ inputs.abis }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: plan
+      - name: The build's SDK
+        run: python3 scripts/store.py sdk sdk
+      - name: Its Rust
+        run: bash scripts/rust.sh
+      - name: The mods, as the catalog has them
+        run: python3 scripts/store.py fetch plan.json mods
+      - name: Build
+        env:
+          MOD_LIB_COMPILER: ${{ vars.MOD_LIB_COMPILER }}
+          SANDBOX_SECONDS: '17000'
+        run: |
+          for abi in ${ABIS//,/ }; do
+            python3 -c 'import json, sys; json.dump([r for r in json.load(open("plan.json")) if r["abi"] == sys.argv[1]], open(sys.argv[2], "w"))' \
+              "$abi" "jobs-$abi.json"
+            bash scripts/sandbox.sh "jobs-$abi.json" mods "sdk/$abi" result
+          done
+      # What was built before a stop goes up too: the next run plans only the rest.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: result
+          path: result/
+          retention-days: 1
+          compression-level: 1
+  publish:
+    needs: build
+    if: always() && needs.build.result != 'skipped'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    concurrency:
+      group: index-${{ inputs.build }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    env:
+      BUILD: ${{ inputs.build }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: result
+          path: result/
+      - name: The answers
+        run: python3 scripts/store.py publish result
+      - name: The index
+        run: python3 scripts/store.py index
