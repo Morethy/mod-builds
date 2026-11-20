@@ -38,8 +38,9 @@ started=$(date +%s)
 RUSTFLAGS="-C prefer-dynamic" python3 packaging/android/build_apk.py --abi "$ABI" --profile "$PROFILE" --library-only
 echo "The game's build: $(( $(date +%s) - started )) s"
 
-# The game's libraries as the APK ships them (build_apk.py's entry library and `rust_dylibs`, stripped), by the
-# names build_apk.py gives them: which ones they are is the game's to say.
+# The game's libraries as the APK ships them (build_apk.py's entry library and `rust_dylibs`, stripped, with the
+# emulated TLS runtime libemutls.so every one of them and every mod needs), by the names build_apk.py gives them:
+# which ones they are is the game's to say.
 shipped=$root/shipped
 mkdir -p "$shipped"
 RUSTFLAGS="-C prefer-dynamic" python3 - "$triple" "$PROFILE" "$shipped" <<'EOF'
