@@ -47,6 +47,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      # Before the room is made: `room.sh clean` deletes the runner's Android SDK, sdkmanager with it (base.yml
+      # installs its tools first too).
+      - name: The Android tools
+        run: |
+          (yes || true) | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$HOME/android" \
+            --install "ndk;28.2.13676358" "build-tools;35.0.0" "platforms;android-36" | tail -3
       - name: Make room
         run: bash scripts/room.sh clean
       - name: The game's build
