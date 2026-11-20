@@ -2,32 +2,44 @@
 # Compile v2's builds (scripts/mod_lib.py) in a sandbox, as build.yml's are (mod_build_sandbox.sh in
 # Starling): a mod's code goes into the compiler, and `include_bytes!` reads any file it can see. So it
 # runs with no network, unable to gain privileges, in namespaces of its own (made with sudo, given up
-# before anything of the mods runs), over a home folder that holds only what the build needs, read-only
-# but for the answers: none of the runner's own files, its workspace or its tokens.
+# before anything of the mods runs), over a home folder that holds only what the build needs: none of the
+# runner's own files, its workspace or its tokens. The base (store_base.sh: the game's checkout with its
+# Cargo build, and Cargo's home) is seen through a layer of its own, thrown away after, so a build can't
+# change what a later one starts from.
 #
-#   sandbox.sh JOBS MODS SDK RESULT     as mod_lib.py's `build`, with BUILD and MOD_LIB_COMPILER
+#   sandbox.sh JOBS MODS RESULT     mod_lib.py's `build`, with BUILD, ABI and PROFILE
 set -uo pipefail
 
-jobs=$(realpath "$1") mods=$(realpath "$2") sdk=$(realpath "$3")
-mkdir -p "$4"
-result=$(realpath "$4")
+jobs=$(realpath "$1") mods=$(realpath "$2")
+mkdir -p "$3"
+result=$(realpath "$3")
 scripts=$(realpath "$(dirname "$0")")
 seconds=${SANDBOX_SECONDS:-3000}
+layer=$HOME/store-layer
+sudo -n rm -rf "$layer"
+mkdir -p "$layer"
 
 sudo -n timeout --kill-after=10 "$seconds" \
   unshare --net --mount --pid --fork --kill-child --propagation private bash -euc '
-home=$1 uid=$2 gid=$3 jobs=$4 mods=$5 sdk=$6 result=$7 scripts=$8 build=$9 compiler=${10} ndk=${11}
+home=$1 uid=$2 gid=$3 jobs=$4 mods=$5 result=$6 scripts=$7 layer=$8 build=$9 abi=${10} profile=${11}
 mount -t proc proc /proc
 mount -t tmpfs -o mode=1777 tmpfs /tmp
+ndk=$(ls "$home/android/ndk" | sort | tail -1)
 
 # What the build may see, set aside before the home folder goes.
 keep=/mnt
 mount -t tmpfs tmpfs "$keep"
 place() { mkdir -p "$keep/$1"; mount --bind "$2" "$keep/$1"; }
+layered() {
+  mkdir -p "$layer/$1/upper" "$layer/$1/work" "$keep/$1"
+  chown "$uid:$gid" "$layer/$1/upper"
+  mount -t overlay overlay -o "lowerdir=$2,upperdir=$layer/$1/upper,workdir=$layer/$1/work" "$keep/$1"
+}
 place rustup "$home/.rustup"
-place cargo "$home/.cargo"
+place android "$home/android"
+layered source "$home/store/source"
+layered cargo "$home/store/cargo"
 place scripts "$scripts"
-place sdk "$sdk"
 place mods "$mods"
 place result "$result"
 cp "$jobs" "$keep/jobs.json"
@@ -39,9 +51,10 @@ back() {
   [ "$3" = rw ] || mount -o remount,bind,ro "$home/$2"
 }
 back rustup .rustup ro
-back cargo .cargo ro
+back android android ro
+back source source rw
+back cargo .cargo rw
 back scripts scripts ro
-back sdk sdk ro
 back mods mods ro
 back result result rw
 cp "$keep/jobs.json" "$home/jobs.json"
@@ -52,7 +65,12 @@ cd /tmp
 exec setpriv --reuid="$uid" --regid="$gid" --clear-groups --no-new-privs \
   --bounding-set=-all --inh-caps=-all \
   env -i HOME="$home" PATH="$home/.cargo/bin:/usr/bin:/bin" CARGO_NET_OFFLINE=true LANG=C.UTF-8 \
-  BUILD="$build" MOD_LIB_COMPILER="$compiler" ANDROID_NDK_HOME="$ndk" \
-  python3 -I "$home/scripts/mod_lib.py" build "$home/jobs.json" "$home/mods" "$home/sdk" "$home/result"
-' sandbox "$HOME" "$(id -u)" "$(id -g)" "$jobs" "$mods" "$sdk" "$result" "$scripts" "${BUILD:-}" \
-  "${MOD_LIB_COMPILER:-}" "${ANDROID_NDK_HOME:-}"
+  ANDROID_HOME="$home/android" ANDROID_NDK_HOME="$home/android/ndk/$ndk" \
+  BUILD="$build" ABI="$abi" PROFILE="$profile" MOD_LIB_SOURCE="$home/source" \
+  python3 -I "$home/scripts/mod_lib.py" build "$home/jobs.json" "$home/mods" "$home/result"
+' sandbox "$HOME" "$(id -u)" "$(id -g)" "$jobs" "$mods" "$result" "$scripts" "$layer" "${BUILD:-}" "${ABI:-}" \
+  "${PROFILE:-quick}"
+code=$?
+# The layer holds root's files.
+sudo -n rm -rf "$layer"
+exit "$code"

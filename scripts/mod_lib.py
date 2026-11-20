@@ -1,29 +1,19 @@
 #!/usr/bin/env python3
-"""Compile v2's build of one mod at a time: each .hmod's library against a game build's SDK, in the
-layout the game's loader reads (crates/horizon-mod-host/src/native_libraries.rs in Starling): a
-`lib<crate>.so` exporting `horizon_native_build`, whose text is the library's identity
-("<build> <mod> <version> <rustc>"), and `horizon_native_mod_v1`, with the entry module generated
-from native_mod_entry.rs.template.
+"""Compile v2's build of one mod at a time: each .hmod's library beside a game build's own Cargo build (the base,
+scripts/store_base.sh), as the game's loader reads it from its native-libs folder (Starling's android_lib.rs and
+horizon-mod-host's native_libraries.rs): `lib<id>.so`, whose `horizon_native_build` says its identity,
+"<build> <id> <version> <rustc release>", and a loader refuses a library of another build.
 
-    python3 scripts/mod_lib.py build JOBS MODS SDK RESULT   # BUILD; JOBS a JSON list of {job, abi, sha256}
+    python3 scripts/mod_lib.py build JOBS MODS RESULT   # BUILD, ABI, PROFILE, MOD_LIB_SOURCE
 
-Each job's .hmod is MODS/<sha256>.hmod. Its answer is RESULT/<job>.status.json and, when it built,
-RESULT/<job>.so; scripts/store.py publishes them from a job that runs nothing of the mods. This runs
-in the sandbox (scripts/sandbox.sh): no network, no token, nothing kept.
+JOBS is a JSON list of {job, abi, sha256}; each job's .hmod is MODS/<sha256>.hmod. Its answer is
+RESULT/<job>.status.json and, when it built, RESULT/<job>.so; scripts/store.py publishes them from a job that runs
+nothing of the mods. This runs in the sandbox (scripts/sandbox.sh): no network, no token, nothing kept.
 
-Only a mod the API route takes is built here (the launcher's `prebuilt::project_refusal`): no build
-script, no features, and no crate but the SDK's own. A mod the route doesn't take is told to use the
-whole-game Compile, for good, and is never built again.
-
-The compiling itself is the SDK's (MOD_LIB_COMPILER, a path in the SDK folder or an absolute one,
-from the Android SDK the game side makes):
-
-    $MOD_LIB_COMPILER --sdk SDK --target TARGET --mod FOLDER --out OUT
-
-builds FOLDER (an unpacked .hmod) as a dylib against SDK's runtime and api slices for TARGET, and
-writes OUT/library.json, {"library": "lib<crate>.so", "identity": "..."}, beside the library. Exit 0
-built, 1 the mod doesn't compile (for good), 75 the service couldn't tell (may pass another time).
-Until that compiler exists every job fails here, not for good, saying so.
+The build is Starling's own, from the base's checkout (MOD_LIB_SOURCE): `tools/android_native_sdk.py mods OUT
+X.hmod --profile PROFILE --abi ABI`, with -C prefer-dynamic, so the game's crates are the ones the APK ships and only
+the mod compiles. Only a mod that route takes is built: no `[native.*]` tables (mixins, bridges, modules), no build
+script, no features, no crate but horizon-mod-api. Any other is told to use the whole-game Compile, for good.
 """
 import json
 import os
@@ -44,10 +34,10 @@ UNPACKED = 64 << 20
 FILES = 4000
 # A mod's build, at most.
 SECONDS = int(os.environ.get("MOD_LIB_SECONDS", "600"))
-# The SDK packages a mod may depend on (launcher/src/native_mods/api.rs `PACKAGES`).
-API_PACKAGES = {"horizon-mod-api", "horizon-mod-points", "horizon-internals"}
-NOT_YET = "This build of the game can't compile mods one by one yet."
-TEMPFAIL = 75
+# The game's crates a mod may depend on: android_native_sdk.py points this one at the base's checkout.
+API_PACKAGES = {"horizon-mod-api"}
+# What in a build's output says the mod's own code doesn't compile (for good), not the service.
+OWN_ERROR = re.compile(r"error\[E\d{4}\]|could not compile `hmod-")
 WHOLE_GAME = "needs the whole-game Compile"
 
 
@@ -96,12 +86,13 @@ def mod_of(folder):
         isinstance(version, str) and store.VERSION.fullmatch(version)
     ):
         raise Refused("has no plain id and version")
-    return mod, version, cargo
+    return mod, version, manifest, cargo
 
 
-def check(cargo, folder):
-    """Refused, for good, when the API route won't build it."""
-    why = refusal(cargo, folder)
+def check(manifest, cargo, folder):
+    """Refused, for good, when this route won't build it."""
+    tables = sorted(k for k, v in (manifest.get("native") or {}).items() if isinstance(v, (list, dict)))
+    why = f"has [native.{', native.'.join(tables)}]" if tables else refusal(cargo, folder)
     if why:
         raise Refused(f"{why}: it {WHOLE_GAME}")
 
@@ -133,46 +124,52 @@ def dependency_tables(cargo):
             yield target.get("dependencies") or {}
 
 
-def build_one(row, mods, sdk, result, build, compiler):
-    """One job's answer into `result`."""
-    job, abi, source = row["job"], row["abi"], row["sha256"]
-    status = {"build": build, "source": source, "abi": abi}
+def build_one(row, mods, source, result, build, profile):
+    """One job's answer into `result`, built with the base's checkout `source`."""
+    job, abi, digest = row["job"], row["abi"], row["sha256"]
+    status = {"build": build, "source": digest, "abi": abi}
     work = result / "work" / job
     shutil.rmtree(work, ignore_errors=True)
     folder, out = work / "mod", work / "out"
     folder.mkdir(parents=True)
-    out.mkdir()
     try:
-        hmod = mods / f"{source}.hmod"
+        hmod = mods / f"{digest}.hmod"
         if store.job_of(store.sha256_of(hmod), abi) != job:
             raise Refused("is not the file that was asked for")
         try:
             unpack(hmod, folder)
         except zipfile.BadZipFile:
             raise Refused("is not a .hmod")
-        mod, version, cargo = mod_of(folder)
+        mod, version, manifest, cargo = mod_of(folder)
         status.update(id=mod, version=version)
-        check(cargo, folder)
-        if not compiler:
-            return said(result, job, {**status, "state": "failed", "error": NOT_YET, "settled": False})
-        command = [*compiler, "--sdk", str(sdk), "--target", store.TARGETS[abi], "--mod", str(folder), "--out", str(out)]
+        check(manifest, cargo, folder)
+        command = [sys.executable, str(source / "tools" / "android_native_sdk.py"), "mods", str(out), str(hmod),
+                   "--profile", profile, "--abi", abi]
+        env = {**os.environ, "RUSTFLAGS": "-C prefer-dynamic", "HORIZON_GAME_BUILD_ID": build}
         try:
-            done = subprocess.run(command, capture_output=True, text=True, timeout=SECONDS)
+            done = subprocess.run(command, cwd=source, env=env, capture_output=True, text=True, timeout=SECONDS)
         except subprocess.TimeoutExpired:
             return said(result, job, {**status, "state": "failed", "error": "The build took too long.", "settled": False})
         if done.returncode != 0:
+            said_by = done.stdout + "\n" + done.stderr
+            print(said_by[-4000:], flush=True)
             error = (done.stderr or done.stdout or "The build failed.").strip()[-600:]
             return said(result, job, {**status, "state": "failed", "error": error,
-                                      "settled": done.returncode != TEMPFAIL})
-        made = json.loads((out / "library.json").read_text())
-        name, identity = made.get("library"), made.get("identity")
+                                      "settled": bool(OWN_ERROR.search(said_by))})
+        record = json.loads((out / "native-mods.json").read_text())
+        made = next((r for r in record.get("libraries", []) if isinstance(r, dict) and r.get("mod") == mod), None)
+        if made is None:
+            raise ValueError(f"the build made no library of {mod}")
+        name, identity = made.get("file"), made.get("identity")
         if not (isinstance(name, str) and store.LIBRARY.fullmatch(name) and (out / name).is_file()):
-            raise ValueError("the compiler named no library")
+            raise ValueError(f"the build named no plain library: {name!r}")
         words = str(identity).split(" ")
         if len(words) != 4 or words[:3] != [build, mod, version]:
             raise ValueError(f"the library's identity {identity!r} is not {build[:12]} {mod} {version}")
-        shutil.copyfile(out / name, result / f"{job}.so")
         library = result / f"{job}.so"
+        shutil.copyfile(out / name, library)
+        if store.sha256_of(library) != made.get("sha256"):
+            raise ValueError("the library is not the one its record says")
         return said(result, job, {**status, "state": "done", "library": name, "identity": identity,
                                   "sha256": store.sha256_of(library), "size": library.stat().st_size})
     except Refused as e:
@@ -191,22 +188,20 @@ def said(result, job, status):
 
 
 def main(argv):
-    if len(argv) != 6 or argv[1] != "build":
+    if len(argv) != 5 or argv[1] != "build":
         sys.exit(__doc__)
     build = os.environ.get("BUILD", "")
     if not store.BUILD.fullmatch(build):
         sys.exit(f"Not a build: {build!r}")
+    source = pathlib.Path(os.environ["MOD_LIB_SOURCE"])
+    profile = os.environ.get("PROFILE", "quick")
     jobs = json.loads(pathlib.Path(argv[2]).read_text())
-    mods, sdk, result = (pathlib.Path(a) for a in argv[3:6])
+    mods, result = pathlib.Path(argv[3]), pathlib.Path(argv[4])
     result.mkdir(parents=True, exist_ok=True)
-    # The compiler comes with the SDK: a path in it is read from where the SDK is.
-    compiler = os.environ.get("MOD_LIB_COMPILER", "").split()
-    if compiler and not os.path.isabs(compiler[0]):
-        compiler[0] = str(sdk / compiler[0])
     for row in jobs:
         if not (store.JOB.fullmatch(str(row.get("job"))) and store.SHA256.fullmatch(str(row.get("sha256")))):
             continue
-        build_one(row, mods, sdk, result, build, compiler)
+        build_one(row, mods, source, result, build, profile)
     shutil.rmtree(result / "work", ignore_errors=True)
 
 

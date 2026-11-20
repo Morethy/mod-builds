@@ -3,9 +3,10 @@ run-name: mod ${{ inputs.job }} ${{ inputs.build }}
 # Compile v2: one mod's library for one game build (a Nightly) and ABI, asked for through Starling's
 # Compile service (worker/, POST /v2/mod) for a mod the store doesn't have yet. As build.yml: the service
 # keeps the .hmod sealed in the `requests` release, the first job opens it with the key in this run's
-# inputs and builds it in the sandbox (scripts/sandbox.sh: no network, nothing of the runner's), with a
-# token that can only read; the second job runs nothing of the mod and puts the answer in mods-<build>,
-# where the game downloads it (scripts/store.py publish); the third makes that build's index again.
+# inputs and builds it beside the build's base (store-base.yml) in the sandbox (scripts/sandbox.sh: no
+# network, nothing of the runner's), with a token that can only read; the second job runs nothing of the
+# mod and puts the answer in mods-<build>, where the game downloads it (scripts/store.py publish); the
+# third makes that build's index again.
 on:
   workflow_dispatch:
     inputs:
@@ -29,11 +30,10 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       BUILD: ${{ inputs.build }}
       ABI: ${{ inputs.abi }}
-      ABIS: ${{ inputs.abi }}
       JOB: ${{ inputs.job }}
       ASK: ${{ inputs.ask }}
       GH_REPO: ${{ github.repository }}
@@ -41,19 +41,26 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: The build's SDK
-        run: python3 scripts/store.py sdk sdk
-      - name: Its Rust
-        run: bash scripts/rust.sh
+      - name: The build's profile
+        run: python3 scripts/store.py env
+      - name: Make room
+        run: bash scripts/room.sh
+      # The base of this build (store-base.yml): the APK's own Cargo build, which only that workflow writes.
+      - uses: actions/cache/restore@v4
+        with:
+          key: store-${{ inputs.build }}-${{ inputs.abi }}-${{ env.PROFILE }}
+          fail-on-cache-miss: true
+          path: |
+            ~/.rustup
+            ~/android
+            ~/store/source
+            ~/store/cargo
       - name: The mod
         run: bash scripts/unseal.sh
       - name: Build
         env:
-          # The SDK's own compiler (scripts/mod_lib.py), a path in the SDK: set as a repository variable
-          # once the Android SDK has one. Until then the job says it can't build yet, not for good.
-          MOD_LIB_COMPILER: ${{ vars.MOD_LIB_COMPILER }}
           SANDBOX_SECONDS: '1200'
-        run: bash scripts/sandbox.sh jobs.json mods "sdk/$ABI" result
+        run: bash scripts/sandbox.sh jobs.json mods result
       - uses: actions/upload-artifact@v4
         with:
           name: result

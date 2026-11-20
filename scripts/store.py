@@ -3,17 +3,18 @@
 repository's releases, where the game reads it straight from GitHub (the Compile service, worker/, is
 asked only for a mod the store doesn't have).
 
-    store/builds.json           every game build the store serves, newest first: its Nightly, its
-                                SDK, and per ABI the game's own runtime archive (url, sha256, size)
+    store/builds.json           every game build the store serves, newest first: its Nightly, the Cargo
+                                profile of its APK, and its ABIs (each with the Nightly's APK it was
+                                checked against)
     mods-<build>/index.json     that build's mods: id, version and the .hmod's SHA-256, to the
                                 library's asset and SHA-256, and the mods that failed there
     mods-<build>/<job>.so       one mod's library (job: the .hmod's SHA-256, 32 digits, and the ABI)
     mods-<build>/<job>.json     its answer, which the index is made from; <job>.failed.json if none
 
-    python3 scripts/store.py register              # BUILD, NIGHTLY, SDK, ABIS: builds.json gets BUILD
+    python3 scripts/store.py register              # BUILD, ABI, PROFILE, NIGHTLY, APK: builds.json gets BUILD
+    python3 scripts/store.py env                   # BUILD: its PROFILE into GITHUB_ENV
     python3 scripts/store.py plan OUT              # BUILD, ABIS: the catalog's native mods BUILD lacks
     python3 scripts/store.py fetch PLAN DIR        # each planned .hmod, checked against the catalog
-    python3 scripts/store.py sdk DIR               # BUILD, ABIS: DIR/<abi>/ the SDK's runtime and api
     python3 scripts/store.py publish RESULT        # BUILD (+ JOB, ASK, BUILT for one asked mod)
     python3 scripts/store.py index                 # BUILD: mods-<BUILD>/index.json from its answers
 
@@ -22,14 +23,12 @@ checked and uploaded, and each answer is read as JSON and written again with the
 reads, so nothing a mod made can say more than that.
 """
 import hashlib
-import io
 import json
 import os
 import pathlib
 import re
 import subprocess
 import sys
-import tarfile
 import tempfile
 import time
 import urllib.error
@@ -292,37 +291,30 @@ def write_index(build, gh, out):
 # ---- the builds the store serves -------------------------------------------------------------------
 
 
-def register(builds, sdk_index, base, nightly, abis):
-    """builds.json with the build whose SDK index is `sdk_index` (its sdk.json, at `base`), first:
-    the game's runtime archive for each of `abis`, as sdk.json lists it. A build already there is
-    replaced."""
-    build = (sdk_index.get("build") or {}).get("commit", "")
-    if sdk_index.get("schema") != 1 or not BUILD.fullmatch(build):
-        raise ValueError("not an SDK index this store reads")
-    if not re.fullmatch(r"https://github\.com/[\w.-]+/[\w.-]+/releases/download/[\w.+-]+/", base):
-        raise ValueError(f"an SDK is a GitHub release's download folder, not {base}")
-    games = {}
-    for abi in abis:
-        target = TARGETS[abi]
-        name = f"runtime-{target}.tar.xz"
-        asset = (sdk_index.get("assets") or {}).get(name)
-        if not isinstance(asset, dict) or not SHA256.fullmatch(str(asset.get("sha256", ""))):
-            raise ValueError(f"sdk.json has no {name}")
-        games[abi] = {"target": target, "file": name, "url": base + name, "sha256": asset["sha256"],
-                      "size": int(asset["size"])}
-    row = {
-        "build": build,
-        "nightly": nightly or (sdk_index["build"].get("nightly")),
-        "date": sdk_index["build"].get("date"),
-        "game": sdk_index["build"].get("game"),
-        "rust": (sdk_index.get("toolchain") or {}).get("rust"),
-        "sdk": base,
-        "abis": games,
-    }
-    rows = [b for b in (builds or {}).get("builds", []) if isinstance(b, dict) and b.get("build") != build]
-    rows.append(row)
+def register(builds, build, nightly, profile, abi, apk=None, date=None, game=None):
+    """builds.json with game build `build` for `abi`, first (newest first by date): its Nightly, the Cargo
+    profile its APK is built with (a mod is built with the same), and the Nightly's APK the base was checked
+    against. A build already there gets the ABI added, or its row replaced for that ABI."""
+    if not BUILD.fullmatch(build) or abi not in TARGETS or not re.fullmatch(r"[a-z]+", profile):
+        raise ValueError(f"not a build to register: {build} {abi} {profile}")
+    if apk and not re.fullmatch(r"https://github\.com/[\w.-]+/[\w.-]+/releases/download/[\w.+-]+/[\w.+-]+\.apk", apk):
+        raise ValueError(f"an APK is a GitHub release's download, not {apk}")
+    rows = [b for b in (builds or {}).get("builds", []) if isinstance(b, dict) and BUILD.fullmatch(str(b.get("build")))]
+    row = next((b for b in rows if b["build"] == build), None)
+    if row is None:
+        row = {"build": build, "abis": {}}
+        rows.append(row)
+    row.update({k: v for k, v in {"nightly": nightly, "date": date or time.strftime("%Y-%m-%d", time.gmtime()),
+                                  "game": game, "profile": profile}.items() if v or k not in row})
+    row.setdefault("abis", {})[abi] = {"target": TARGETS[abi], **({"apk": apk} if apk else {})}
     rows.sort(key=lambda b: str(b.get("date") or ""), reverse=True)
     return {"schema": SCHEMA, "builds": rows}
+
+
+def build_row(build):
+    """Build `build`'s row of the store's builds.json, or None."""
+    listed = fetch_json(download_url(STORE, BUILDS)) or {}
+    return next((b for b in listed.get("builds", []) if isinstance(b, dict) and b.get("build") == build), None)
 
 
 # ---- what the catalog asks for --------------------------------------------------------------------
@@ -379,39 +371,6 @@ def fetch_planned(planned, into):
     return kept
 
 
-# ---- a build's SDK ---------------------------------------------------------------------------------
-
-# The SDK slices a mod's library is built from (prebuilt_game.py `pack`): the game's runtime, which it
-# links against, and the API crates' metadata. The engine slice is never read on this route.
-SLICES = ("runtime", "api")
-
-
-def fetch_sdk(row, abi, into, get=fetch):
-    """Build `row`'s (builds.json) SDK for `abi` into `into`: sdk.json, and each slice in SLICES
-    unpacked into into/<slice>, each checked against sdk.json's SHA-256 and size before it is
-    unpacked, as plain files and folders only."""
-    base = row["sdk"]
-    index = get(base + "sdk.json")
-    if index is None:
-        raise ValueError(f"no sdk.json at {base}")
-    listed = json.loads(index)
-    if (listed.get("build") or {}).get("commit") != row["build"]:
-        raise ValueError(f"{base}sdk.json is not build {row['build']}")
-    into.mkdir(parents=True, exist_ok=True)
-    (into / "sdk.json").write_bytes(index)
-    for kind in SLICES:
-        name = f"{kind}-{TARGETS[abi]}.tar.xz"
-        asset = (listed.get("assets") or {}).get(name)
-        if not isinstance(asset, dict):
-            raise ValueError(f"sdk.json lists no {name}")
-        body = get(base + name, limit=4 << 30)
-        if body is None or len(body) != asset.get("size") or hashlib.sha256(body).hexdigest() != asset.get("sha256"):
-            raise ValueError(f"{name} is not the one sdk.json says")
-        with tarfile.open(fileobj=io.BytesIO(body), mode="r:xz") as archive:
-            archive.extractall(into / kind, filter="data")
-    return listed
-
-
 # ---- the GitHub CLI --------------------------------------------------------------------------------
 
 
@@ -431,7 +390,7 @@ def abis():
 def main(argv):
     command = argv[1] if len(argv) > 1 else ""
     build = os.environ.get("BUILD", "")
-    if command != "register" and not BUILD.fullmatch(build):
+    if not BUILD.fullmatch(build):
         sys.exit(f"Not a build: {build!r}")
     if command == "publish":
         ask = os.environ.get("ASK") or None
@@ -441,10 +400,9 @@ def main(argv):
         write_index(build, run_gh, pathlib.Path("answer"))
     elif command == "plan":
         catalog = fetch_json(CATALOG)
-        listed = fetch_json(download_url(STORE, BUILDS)) or {}
-        known = next((b for b in listed.get("builds", []) if b.get("build") == build), None)
+        known = build_row(build)
         if not known:
-            sys.exit(f"{build} is not in the store's {BUILDS}: register it first")
+            sys.exit(f"{build} is not in the store's {BUILDS}: run store-base.yml for it first")
         have = fetch_json(download_url(mods_tag(build), INDEX))
         planned = plan(catalog, build, [a for a in abis() if a in known["abis"]], have, known.get("game"))
         pathlib.Path(argv[2]).write_text(json.dumps(planned, indent=1))
@@ -456,24 +414,16 @@ def main(argv):
         planned = json.loads(pathlib.Path(argv[2]).read_text())
         kept = fetch_planned(planned, pathlib.Path(argv[3]))
         pathlib.Path(argv[2]).write_text(json.dumps(kept, indent=1))
-    elif command == "sdk":
-        listed = fetch_json(download_url(STORE, BUILDS)) or {}
-        row = next((b for b in listed.get("builds", []) if b.get("build") == build), None)
+    elif command == "env":
+        # The build's Cargo profile, for the base's cache key and the build itself.
+        row = build_row(build)
         if not row:
-            sys.exit(f"{build} is not in the store's {BUILDS}")
-        for abi in abis():
-            sdk = fetch_sdk(row, abi, pathlib.Path(argv[2]) / abi)
-        if out := os.environ.get("GITHUB_ENV"):
-            with open(out, "a") as f:
-                f.write(f"RUST={(sdk.get('toolchain') or {}).get('rust', '')}\n")
+            sys.exit(f"{build} is not in the store's {BUILDS}: run store-base.yml for it first")
+        with open(os.environ["GITHUB_ENV"], "a") as f:
+            f.write(f"PROFILE={row.get('profile') or 'quick'}\n")
     elif command == "register":
-        base = os.environ["SDK"].rstrip("/") + "/"
-        sdk_index = fetch_json(base + "sdk.json")
-        if sdk_index is None:
-            sys.exit(f"No sdk.json at {base}")
-        if build and (sdk_index.get("build") or {}).get("commit") != build:
-            sys.exit(f"{base}sdk.json is not build {build}")
-        made = register(fetch_json(download_url(STORE, BUILDS)), sdk_index, base, os.environ.get("NIGHTLY"), abis())
+        made = register(fetch_json(download_url(STORE, BUILDS)), build, os.environ.get("NIGHTLY") or None,
+                        os.environ.get("PROFILE", "quick"), os.environ["ABI"], os.environ.get("APK") or None)
         ensure_release(run_gh, STORE, "Compile store")
         with tempfile.TemporaryDirectory() as folder:
             path = pathlib.Path(folder) / BUILDS

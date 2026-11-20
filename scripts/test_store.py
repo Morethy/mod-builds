@@ -27,19 +27,25 @@ def hmod(files):
 MANIFEST = "id = 'veinminer'\nversion = '0.3.0'\napi = '0.2'\n[native]\ngame = '26.3'\nhorizon = 'x'\nmixins = 'y'\n"
 CARGO = "[package]\nname = 'veinminer'\nversion = '0.3.0'\nedition = '2024'\n[dependencies]\nhorizon-mod-api = { path = '.horizon/sdk/api/crates/horizon-mod-api' }\n"
 MOD = hmod({"horizon-mod.toml": MANIFEST, "Cargo.toml": CARGO, "src/lib.rs": "pub fn hooks() {}"})
-# A compiler that does what the SDK's will: a library and library.json in --out.
-COMPILER = textwrap.dedent(
-    f"""
-    import json, pathlib, sys, tomllib
-    args = dict(zip(sys.argv[1::2], sys.argv[2::2]))
-    folder, out = pathlib.Path(args["--mod"]), pathlib.Path(args["--out"])
-    if (folder / "src/broken.rs").exists():
-        sys.exit("error[E0425]: cannot find value `x` in this scope")
-    manifest = tomllib.loads((folder / "horizon-mod.toml").read_text())
-    (out / "libveinminer.so").write_bytes(b"\\x7fELF " + args["--target"].encode())
-    identity = "{BUILD} " + manifest["id"] + " " + manifest["version"] + " {RUST}"
-    (out / "library.json").write_text(json.dumps({{"library": "libveinminer.so", "identity": identity}}))
-    """
+# Starling's tools/android_native_sdk.py `mods`, as the base's checkout has it: the library and native-mods.json in
+# OUT, and the error a mod that doesn't compile makes Cargo say.
+ANDROID_SDK = textwrap.dedent(
+    r"""
+    import hashlib, json, os, pathlib, sys, tomllib, zipfile
+    out, hmod = pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3])
+    args = dict(zip(sys.argv[4::2], sys.argv[5::2]))
+    assert os.environ["RUSTFLAGS"] == "-C prefer-dynamic"
+    with zipfile.ZipFile(hmod) as z:
+        manifest = tomllib.loads(z.read("horizon-mod.toml").decode())
+        if "src/broken.rs" in z.namelist():
+            sys.exit("error[E0425]: cannot find value `x` in this scope; could not compile `hmod-veinminer`")
+    out.mkdir(parents=True)
+    library = out / f"lib{manifest['id']}.so"
+    library.write_bytes(b"ELF " + args["--abi"].encode())
+    identity = f"{os.environ['HORIZON_GAME_BUILD_ID']} {manifest['id']} {manifest['version']} RUST_RELEASE"
+    (out / "native-mods.json").write_text(json.dumps({"libraries": [{"file": library.name, "mod": manifest["id"],
+        "sha256": hashlib.sha256(library.read_bytes()).hexdigest(), "identity": identity}]}))
+    """.replace("RUST_RELEASE", RUST)
 )
 
 
@@ -50,18 +56,18 @@ class Builds(unittest.TestCase):
         self.mods.mkdir()
         self.result = self.dir / "result"
         self.result.mkdir()
-        (self.dir / "compiler.py").write_text(COMPILER)
-        self.compiler = [sys.executable, str(self.dir / "compiler.py")]
+        self.source = self.dir / "source"
+        (self.source / "tools").mkdir(parents=True)
+        (self.source / "tools" / "android_native_sdk.py").write_text(ANDROID_SDK)
 
     def job(self, body, abi="arm64-v8a"):
         source = hashlib.sha256(body).hexdigest()
         (self.mods / f"{source}.hmod").write_bytes(body)
         return {"job": store.job_of(source, abi), "abi": abi, "sha256": source}
 
-    def build(self, body, compiler=True):
+    def build(self, body):
         row = self.job(body)
-        return mod_lib.build_one(row, self.mods, self.dir / "sdk", self.result, BUILD,
-                                 self.compiler if compiler else []), row["job"]
+        return mod_lib.build_one(row, self.mods, self.source, self.result, BUILD, "quick"), row["job"]
 
     def test_a_mod_builds_into_its_library_and_says_who_it_is(self):
         status, job = self.build(MOD)
@@ -69,7 +75,7 @@ class Builds(unittest.TestCase):
         self.assertEqual(status["identity"], f"{BUILD} veinminer 0.3.0 {RUST}")
         self.assertEqual(status["library"], "libveinminer.so")
         library = self.result / f"{job}.so"
-        self.assertEqual(library.read_bytes(), b"\x7fELF aarch64-linux-android")
+        self.assertEqual(library.read_bytes(), b"ELF arm64-v8a")
         self.assertEqual(status["sha256"], hashlib.sha256(library.read_bytes()).hexdigest())
         # And store.py reads it back as the store keeps it.
         state, kept, _ = store.answer(self.result, job, True)
@@ -106,15 +112,16 @@ class Builds(unittest.TestCase):
         self.assertIn("E0425", status["error"])
         self.assertTrue(status["settled"])
 
-    def test_without_the_sdks_compiler_a_job_fails_and_may_pass_later(self):
-        status, _ = self.build(MOD, compiler=False)
-        self.assertEqual((status["state"], status["settled"]), ("failed", False))
-        self.assertEqual(status["error"], mod_lib.NOT_YET)
+    def test_a_mod_with_native_tables_needs_the_whole_game(self):
+        manifest = MANIFEST + "[[native.mixin]]\nclass = 'x'\n"
+        status, _ = self.build(hmod({"horizon-mod.toml": manifest, "Cargo.toml": CARGO, "src/lib.rs": ""}))
+        self.assertEqual((status["state"], status["settled"]), ("failed", True))
+        self.assertIn("[native.mixin]", status["error"])
 
     def test_a_file_not_the_one_asked_for_is_not_built(self):
         row = self.job(MOD)
         (self.mods / f"{row['sha256']}.hmod").write_bytes(MOD + b"changed")
-        status = mod_lib.build_one(row, self.mods, self.dir, self.result, BUILD, self.compiler)
+        status = mod_lib.build_one(row, self.mods, self.source, self.result, BUILD, "quick")
         self.assertEqual(status["state"], "failed")
 
 
@@ -233,63 +240,25 @@ class Plan(unittest.TestCase):
 
 
 class Register(unittest.TestCase):
-    sdk = {
-        "schema": 1,
-        "build": {"commit": BUILD, "game": "26.3", "date": "2026-11-20", "nightly": "nightly-2026-11-20"},
-        "toolchain": {"rust": RUST},
-        "assets": {"runtime-aarch64-linux-android.tar.xz": {"sha256": "f" * 64, "size": 123, "kind": "runtime",
-                                                             "codec": "xz", "target": "aarch64-linux-android"}},
-    }
-    base = "https://github.com/starling-client/starling/releases/download/sdk-x/"
+    apk = "https://github.com/starling-client/starling/releases/download/nightly-1/starling-preview-arm64-v8a.apk"
 
-    def test_a_build_comes_first_with_its_games_runtime(self):
-        older = {"schema": 1, "builds": [{"build": "1" * 40, "date": "2026-11-19"}]}
-        made = store.register(older, self.sdk, self.base, None, ["arm64-v8a"])
+    def test_a_build_comes_first_with_its_profile_and_apk(self):
+        older = {"schema": 1, "builds": [{"build": "1" * 40, "date": "2026-11-19", "abis": {}}]}
+        made = store.register(older, BUILD, "nightly-1", "quick", "arm64-v8a", self.apk, "2026-11-20")
         self.assertEqual([b["build"] for b in made["builds"]], [BUILD, "1" * 40])
-        game = made["builds"][0]["abis"]["arm64-v8a"]
-        self.assertEqual(game["url"], self.base + "runtime-aarch64-linux-android.tar.xz")
-        self.assertEqual((game["sha256"], game["size"]), ("f" * 64, 123))
-        self.assertEqual(made["builds"][0]["nightly"], "nightly-2026-11-20")
-        again = store.register(made, self.sdk, self.base, "renamed", ["arm64-v8a"])
+        row = made["builds"][0]
+        self.assertEqual((row["nightly"], row["profile"]), ("nightly-1", "quick"))
+        self.assertEqual(row["abis"]["arm64-v8a"], {"target": "aarch64-linux-android", "apk": self.apk})
+        again = store.register(made, BUILD, None, "quick", "x86_64", None, "2026-11-20")
         self.assertEqual(len(again["builds"]), 2)
-        self.assertEqual(again["builds"][0]["nightly"], "renamed")
+        self.assertEqual(sorted(again["builds"][0]["abis"]), ["arm64-v8a", "x86_64"])
+        self.assertEqual(again["builds"][0]["nightly"], "nightly-1", "kept")
 
-    def test_an_sdk_without_the_abis_runtime_or_off_github_is_refused(self):
+    def test_what_is_not_a_build_or_an_apk_off_github_is_refused(self):
         with self.assertRaises(ValueError):
-            store.register(None, self.sdk, self.base, None, ["x86_64"])
+            store.register(None, "main", None, "quick", "arm64-v8a")
         with self.assertRaises(ValueError):
-            store.register(None, self.sdk, "https://example.com/sdk/", None, ["arm64-v8a"])
-
-
-class Sdk(unittest.TestCase):
-    def test_the_slices_are_checked_then_unpacked_and_nothing_else(self):
-        import tarfile
-
-        def slice_of(files):
-            buffer = io.BytesIO()
-            with tarfile.open(fileobj=buffer, mode="w:xz") as tar:
-                for name, data in files.items():
-                    info = tarfile.TarInfo(name)
-                    info.size = len(data)
-                    tar.addfile(info, io.BytesIO(data))
-            return buffer.getvalue()
-
-        runtime = slice_of({"deps/libhorizon_client.so": b"ELF"})
-        api = slice_of({"deps/libmod_api.rmeta": b"rmeta"})
-        base = "https://github.com/starling-client/starling/releases/download/sdk-x/"
-        index = {"schema": 1, "build": {"commit": BUILD}, "toolchain": {"rust": RUST}, "assets": {
-            "runtime-aarch64-linux-android.tar.xz": {"sha256": hashlib.sha256(runtime).hexdigest(), "size": len(runtime)},
-            "api-aarch64-linux-android.tar.xz": {"sha256": hashlib.sha256(api).hexdigest(), "size": len(api)},
-        }}
-        files = {base + "sdk.json": json.dumps(index).encode(), base + "runtime-aarch64-linux-android.tar.xz": runtime,
-                 base + "api-aarch64-linux-android.tar.xz": api}
-        into = pathlib.Path(tempfile.mkdtemp())
-        store.fetch_sdk({"build": BUILD, "sdk": base}, "arm64-v8a", into, lambda url, limit=0: files.get(url))
-        self.assertEqual((into / "runtime/deps/libhorizon_client.so").read_bytes(), b"ELF")
-        self.assertEqual((into / "api/deps/libmod_api.rmeta").read_bytes(), b"rmeta")
-        files[base + "api-aarch64-linux-android.tar.xz"] = slice_of({"../evil": b"x"})
-        with self.assertRaises(ValueError):
-            store.fetch_sdk({"build": BUILD, "sdk": base}, "arm64-v8a", into / "again", lambda url, limit=0: files.get(url))
+            store.register(None, BUILD, None, "quick", "arm64-v8a", "https://example.com/x.apk")
 
 
 if __name__ == "__main__":
