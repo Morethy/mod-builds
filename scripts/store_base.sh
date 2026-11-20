@@ -37,6 +37,10 @@ curl -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal
 GITHUB_ENV='' bash tools/ci/rustup_install.sh --profile minimal --component rust-src --target "$triple"
 cargo install cargo-ndk --version 3.5.4 --locked
 python3 tools/android_native_sdk.py prepare
+# The game's build identity as each mod's build gives it (mod_lib.py): horizon-mod-host's build script reads it
+# (rerun-if-env-changed), so a base built without it had Cargo build the whole game again for every mod, some 15
+# minutes, though `git rev-parse HEAD` named the same commit (2026-11-20).
+export HORIZON_GAME_BUILD_ID=$BUILD
 started=$(date +%s)
 RUSTFLAGS="-C prefer-dynamic" python3 packaging/android/build_apk.py --abi "$ABI" --profile "$PROFILE" --library-only
 echo "The game's build: $(( $(date +%s) - started )) s"
