@@ -324,7 +324,7 @@ def build_row(build):
 
 
 # What a failure for good said of a mod the build route has since learned to take (mod_lib.py GAME_CRATES): asked again.
-NOW_TAKEN = re.compile(r"uses the crate (serde_json|sha2|log):|makes the game's crates build again")
+NOW_TAKEN = re.compile(r"uses the crate (serde_json|sha2|log):|makes the game's crates build again|The game's crates built again")
 
 
 def plan(catalog, build, abis, have, game=None):

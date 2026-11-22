@@ -188,10 +188,10 @@ def build_one(row, mods, source, result, build, profile):
         # dependencies turned on, say) is one the APK doesn't have, and the library would not open on a phone.
         again = sorted(set(COMPILED.findall(done.stdout + "\n" + done.stderr)) - {f"hmod-{mod}"})
         if again:
-            # Not for good: the base's own crates built again once for a mod that asks nothing of them (Actually
-            # Additions, 2026-11-22: android-activity, cpal, horizon-android), so a later run may find them as built.
-            return said(result, job, {**status, "state": "failed", "settled": False,
-                                      "error": f"The game's crates built again beside this mod ({', '.join(again[:4])})."})
+            # Said, not refused: a build asked for by a phone (mod.yml) compiles android-activity, cpal, horizon-android
+            # and horizon-client again every time, and its library opens on the phone all the same. Refusing it made
+            # players ask again for ever, ten minutes each (2026-11-22).
+            print(f"{job}: the game's crates built again beside {mod}: {', '.join(again[:6])}", flush=True)
         record = json.loads((out / "native-mods.json").read_text())
         made = next((r for r in record.get("libraries", []) if isinstance(r, dict) and r.get("mod") == mod), None)
         if made is None:
