@@ -13,7 +13,9 @@ nothing of the mods. This runs in the sandbox (scripts/sandbox.sh): no network, 
 The build is Starling's own, from the base's checkout (MOD_LIB_SOURCE): `tools/android_native_sdk.py mods OUT
 X.hmod --profile PROFILE --abi ABI`, with -C prefer-dynamic, so the game's crates are the ones the APK ships and only
 the mod compiles. Only a mod that route takes is built: no `[native.*]` tables (mixins, bridges, modules), no build
-script, no features, no crate but horizon-mod-api. Any other is told to use the whole-game Compile, for good.
+script, no features, no crate but horizon-mod-api and the few of the game's own it may share (GAME_CRATES). Any other
+is told to use the whole-game Compile, for good, and so is one whose build compiled a crate of the game's again: its
+library would name the game's symbols as no APK has them.
 """
 import json
 import os
@@ -36,6 +38,11 @@ FILES = 4000
 SECONDS = int(os.environ.get("MOD_LIB_SECONDS", "600"))
 # The game's crates a mod may depend on: android_native_sdk.py points this one at the base's checkout.
 API_PACKAGES = {"horizon-mod-api"}
+# Crates of the game's own lock a mod may also depend on, plainly (a version, no features): the base's Cargo home holds
+# them and the game's build made them already, so the sandbox, without a network, compiles only the mod.
+GAME_CRATES = {"serde_json", "sha2", "log"}
+# A crate Cargo compiled, as its output says it.
+COMPILED = re.compile(r"^\s*Compiling (\S+) v", re.M)
 # What in a build's output says the mod's own code doesn't compile (for good), not the service.
 OWN_ERROR = re.compile(r"error\[E\d{4}\]|could not compile `hmod-")
 WHOLE_GAME = "needs the whole-game Compile"
@@ -110,10 +117,12 @@ def refusal(cargo, folder):
     for table in dependency_tables(cargo):
         for key, value in table.items():
             krate = value.get("package", key) if isinstance(value, dict) else key
-            if krate not in API_PACKAGES:
+            if krate not in API_PACKAGES | GAME_CRATES:
                 return f"uses the crate {krate}"
             if isinstance(value, dict) and (value.get("features") or value.get("default-features") is False):
                 return f"chooses features of {krate}"
+            if krate in GAME_CRATES and isinstance(value, dict) and set(value) - {"version", "package"}:
+                return f"takes {krate} from elsewhere than the game's own"
     return None
 
 
@@ -160,6 +169,11 @@ def build_one(row, mods, source, result, build, profile):
                 (done.stderr or done.stdout or "The build failed.").strip()[-600:]
             return said(result, job, {**status, "state": "failed", "error": error,
                                       "settled": bool(OWN_ERROR.search(said_by))})
+        # Only the mod compiles beside the base. A crate of the game's that compiled again (a feature the mod's
+        # dependencies turned on, say) is one the APK doesn't have, and the library would not open on a phone.
+        again = sorted(set(COMPILED.findall(done.stdout + "\n" + done.stderr)) - {f"hmod-{mod}"})
+        if again:
+            raise Refused(f"makes the game's crates build again ({', '.join(again[:4])}): it {WHOLE_GAME}")
         record = json.loads((out / "native-mods.json").read_text())
         made = next((r for r in record.get("libraries", []) if isinstance(r, dict) and r.get("mod") == mod), None)
         if made is None:
