@@ -42,7 +42,11 @@ python3 tools/android_native_sdk.py prepare
 # minutes, though `git rev-parse HEAD` named the same commit (2026-11-20).
 export HORIZON_GAME_BUILD_ID=$BUILD
 started=$(date +%s)
-RUSTFLAGS="-C prefer-dynamic" python3 packaging/android/build_apk.py --abi "$ABI" --profile "$PROFILE" --library-only
+# In the environment each mod's build has (sandbox.sh's `env -i`), not the runner's own: the build scripts of
+# android-activity and the like read the environment (cc's rerun-if-env-changed), so with a base built in the runner's,
+# every build a phone asked for compiled android-activity, cpal, horizon-android and horizon-client again, ten minutes
+# where the mod alone takes one (2026-11-22).
+env -i HOME="$HOME" PATH="$HOME/.cargo/bin:/usr/bin:/bin" LANG=C.UTF-8   ANDROID_HOME="$ANDROID_HOME" ANDROID_NDK_HOME="$ANDROID_NDK_HOME" HORIZON_GAME_BUILD_ID="$BUILD"   RUSTFLAGS="-C prefer-dynamic"   python3 packaging/android/build_apk.py --abi "$ABI" --profile "$PROFILE" --library-only
 echo "The game's build: $(( $(date +%s) - started )) s"
 
 # The game's libraries as the APK ships them (build_apk.py's entry library and `rust_dylibs`, stripped, with the

@@ -59,7 +59,8 @@ jobs:
         run: bash scripts/store_base.sh
       - uses: actions/cache/save@v4
         with:
-          key: store-${{ inputs.build }}-${{ inputs.abi }}-${{ inputs.profile }}
+          # store2: built in the sandbox's environment (store_base.sh); a cache's key can't be written twice.
+          key: store2-${{ inputs.build }}-${{ inputs.abi }}-${{ inputs.profile }}
           path: |
             ~/.rustup
             ~/android
