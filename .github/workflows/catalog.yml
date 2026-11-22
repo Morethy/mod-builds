@@ -1,5 +1,5 @@
 name: catalog
-run-name: catalog ${{ inputs.build }} ${{ inputs.abi }}
+run-name: catalog ${{ inputs.build || vars.CATALOG_BUILD }} ${{ inputs.abi || 'arm64-v8a' }}
 # Compile v2's store, ahead of the players: every native mod in Horizon's catalog
 # (horizon-rust.github.io/horizon-mods, kind native-mod), each version for the build's game, built once
 # for one game build (a Nightly) and ABI beside that build's base (store-base.yml, which runs first and
@@ -10,6 +10,10 @@ run-name: catalog ${{ inputs.build }} ${{ inputs.abi }}
 # runs nothing of them publishes. A mod already in the index, or failed there for good, is not built
 # again; run it again after the catalog grows.
 on:
+  # Every three hours for the release players have (the repository variable CATALOG_BUILD): the catalog grows
+  # every day, and a version no run built yet is one each player waits for a build of.
+  schedule:
+    - cron: '17 */3 * * *'
   workflow_dispatch:
     inputs:
       build:
@@ -27,8 +31,8 @@ jobs:
     outputs:
       count: ${{ steps.plan.outputs.count }}
     env:
-      BUILD: ${{ inputs.build }}
-      ABIS: ${{ inputs.abi }}
+      BUILD: ${{ inputs.build || vars.CATALOG_BUILD }}
+      ABIS: ${{ inputs.abi || 'arm64-v8a' }}
       GH_REPO: ${{ github.repository }}
     steps:
       - uses: actions/checkout@v4
@@ -48,8 +52,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 300
     env:
-      BUILD: ${{ inputs.build }}
-      ABI: ${{ inputs.abi }}
+      BUILD: ${{ inputs.build || vars.CATALOG_BUILD }}
+      ABI: ${{ inputs.abi || 'arm64-v8a' }}
       GH_REPO: ${{ github.repository }}
     steps:
       - uses: actions/checkout@v4
@@ -64,7 +68,9 @@ jobs:
         run: bash scripts/room.sh
       - uses: actions/cache/restore@v4
         with:
-          key: store-${{ inputs.build }}-${{ inputs.abi }}-${{ env.PROFILE }}
+          key: store2-${{ inputs.build || vars.CATALOG_BUILD }}-${{ inputs.abi || 'arm64-v8a' }}-${{ env.PROFILE }}
+          # A base from before store2 (built in the runner's environment: each mod's build is slower beside it).
+          restore-keys: store-${{ inputs.build || vars.CATALOG_BUILD }}-${{ inputs.abi || 'arm64-v8a' }}-${{ env.PROFILE }}
           fail-on-cache-miss: true
           path: |
             ~/.rustup
@@ -91,12 +97,12 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     concurrency:
-      group: index-${{ inputs.build }}
+      group: index-${{ inputs.build || vars.CATALOG_BUILD }}
       cancel-in-progress: false
     permissions:
       contents: write
     env:
-      BUILD: ${{ inputs.build }}
+      BUILD: ${{ inputs.build || vars.CATALOG_BUILD }}
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:

@@ -48,7 +48,9 @@ jobs:
       # The base of this build (store-base.yml): the APK's own Cargo build, which only that workflow writes.
       - uses: actions/cache/restore@v4
         with:
-          key: store-${{ inputs.build }}-${{ inputs.abi }}-${{ env.PROFILE }}
+          key: store2-${{ inputs.build }}-${{ inputs.abi }}-${{ env.PROFILE }}
+          # A base from before store2 (built in the runner's environment: each mod's build is slower beside it).
+          restore-keys: store-${{ inputs.build }}-${{ inputs.abi }}-${{ env.PROFILE }}
           fail-on-cache-miss: true
           path: |
             ~/.rustup
