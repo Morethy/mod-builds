@@ -329,7 +329,9 @@ NOW_TAKEN = re.compile(r"uses the crate (serde_json|sha2|log):")
 
 def plan(catalog, build, abis, have, game=None):
     """The catalog's native mods to build for `build`: every version of each (not revoked, for the
-    build's vanilla `game` when it says one) and each ABI, but those its index `have` holds done or
+    build's vanilla `game` when it says one) and each ABI, and the newest version of each other mod, for
+    mod_lib.py to say whether it is a wasm mod (the game's catalogs leave those out); but those its index
+    `have` holds done or
     failed for good (unless for a reason the route now takes, NOW_TAKEN). Each: id, version, the .hmod's url,
     sha256 and size, its job."""
     revoked = {(r.get("id"), r.get("sha256")) for r in catalog.get("revoked", []) if isinstance(r, dict)}
@@ -338,11 +340,12 @@ def plan(catalog, build, abis, have, game=None):
              if row.get("settled") and not NOW_TAKEN.search(str(row.get("error", "")))}
     planned, seen = [], set()
     for project in catalog.get("projects", []):
-        if project.get("kind") != "native-mod" or not ID.fullmatch(str(project.get("id", ""))):
+        if project.get("kind") not in ("native-mod", "mod") or not ID.fullmatch(str(project.get("id", ""))):
             continue
         if (project["id"], None) in revoked:
             continue
-        for version in project.get("versions", []):
+        versions = project.get("versions", [])
+        for version in versions if project["kind"] == "native-mod" else versions[:1]:
             file = version.get("file") or {}
             source = str(file.get("sha256", ""))
             if not SHA256.fullmatch(source) or (project["id"], source) in revoked:

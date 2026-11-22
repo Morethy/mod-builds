@@ -16,6 +16,9 @@ the mod compiles. Only a mod that route takes is built: no `[native.*]` tables (
 script, no features, no crate but horizon-mod-api and the few of the game's own it may share (GAME_CRATES). Any other
 is told to use the whole-game Compile, for good, and so is one whose build compiled a crate of the game's again: its
 library would name the game's symbols as no APK has them.
+
+The registry's other mods come here too (store.py `plan`), only to be told apart: one with a `mod.wasm` is answered
+"doesn't run on Starling", which the game's catalogs read to leave it out; one of content alone is no native mod.
 """
 import json
 import os
@@ -46,6 +49,8 @@ COMPILED = re.compile(r"^\s*Compiling (\S+) v", re.M)
 # What in a build's output says the mod's own code doesn't compile (for good), not the service.
 OWN_ERROR = re.compile(r"error\[E\d{4}\]|could not compile `hmod-")
 WHOLE_GAME = "needs the whole-game Compile"
+# What the game's catalogs read (Starling's starling_store.rs NOT_ON_STARLING) to leave a mod out.
+NOT_ON_STARLING = "doesn't run on Starling"
 
 
 class Refused(Exception):
@@ -80,20 +85,29 @@ def unpack(hmod, into):
 
 
 def mod_of(folder):
-    """The mod's id and version (horizon-mod.toml), and its Cargo.toml."""
+    """The mod's id and version, and its horizon-mod.toml."""
     try:
         manifest = tomllib.loads((folder / "horizon-mod.toml").read_text())
-        cargo = tomllib.loads((folder / "Cargo.toml").read_text())
     except (OSError, ValueError) as e:
-        raise Refused(f"is not a native mod: {e}")
+        raise Refused(f"is not a mod: {e}")
     mod, version = manifest.get("id"), manifest.get("version")
-    if not isinstance(manifest.get("native"), dict):
-        raise Refused("is not a native mod")
     if not (isinstance(mod, str) and store.ID.fullmatch(mod)) or not (
         isinstance(version, str) and store.VERSION.fullmatch(version)
     ):
         raise Refused("has no plain id and version")
-    return mod, version, manifest, cargo
+    return mod, version, manifest
+
+
+def native_of(folder, manifest):
+    """The native mod's Cargo.toml. A wasm mod is told it doesn't run on Starling, for the catalogs to read."""
+    if (folder / "mod.wasm").is_file() or isinstance(manifest.get("wasm"), dict):
+        raise Refused(f"is a wasm mod: it {NOT_ON_STARLING}")
+    if not isinstance(manifest.get("native"), dict):
+        raise Refused("is not a native mod")
+    try:
+        return tomllib.loads((folder / "Cargo.toml").read_text())
+    except (OSError, ValueError) as e:
+        raise Refused(f"is not a native mod: {e}")
 
 
 def check(manifest, cargo, folder):
@@ -149,8 +163,9 @@ def build_one(row, mods, source, result, build, profile):
             unpack(hmod, folder)
         except zipfile.BadZipFile:
             raise Refused("is not a .hmod")
-        mod, version, manifest, cargo = mod_of(folder)
+        mod, version, manifest = mod_of(folder)
         status.update(id=mod, version=version)
+        cargo = native_of(folder, manifest)
         check(manifest, cargo, folder)
         command = [sys.executable, str(source / "tools" / "android_native_sdk.py"), "mods", str(out), str(hmod),
                    "--profile", profile, "--abi", abi]

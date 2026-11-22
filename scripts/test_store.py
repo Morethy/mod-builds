@@ -116,6 +116,16 @@ class Builds(unittest.TestCase):
         self.assertIn("serde_json", status["error"])
         self.assertIn("whole-game Compile", status["error"])
 
+    def test_a_wasm_mod_is_told_it_does_not_run_on_starling_and_content_alone_is_no_native_mod(self):
+        plain = "id = 'zoom'\nversion = '3.0.3'\napi = '0.2'\n"
+        status, _ = self.build(hmod({"horizon-mod.toml": plain + "[wasm]\nsha512 = 'x'\n", "mod.wasm": "\0asm"}))
+        self.assertEqual((status["state"], status["settled"], status["id"], status["version"]),
+                         ("failed", True, "zoom", "3.0.3"), status)
+        self.assertIn("doesn't run on Starling", status["error"])
+        status, _ = self.build(hmod({"horizon-mod.toml": plain, "assets/zoom/lang/en_us.json": "{}"}))
+        self.assertEqual((status["state"], status["settled"], status["id"]), ("failed", True, "zoom"), status)
+        self.assertNotIn("doesn't run on Starling", status["error"])
+
     def test_a_file_outside_the_mod_or_a_mod_not_native_is_refused(self):
         for body in (hmod({"../evil": "x", "horizon-mod.toml": MANIFEST, "Cargo.toml": CARGO}),
                      hmod({"horizon-mod.toml": "id = 'x'\nversion = '1'\n", "Cargo.toml": CARGO}),
@@ -262,6 +272,12 @@ class Plan(unittest.TestCase):
             good = {"mods": [], "failed": [{"job": store.job_of("a" * 64, "arm64-v8a"), "settled": True, "error": error}]}
             self.assertEqual(len(store.plan(self.catalog, BUILD, ["arm64-v8a"], good, "26.3")), again, error)
         self.assertEqual(len(store.plan(self.catalog, BUILD, ["arm64-v8a", "x86_64"], None, "26.3")), 2)
+        # Another mod of the registry: only its newest version, for mod_lib.py to say whether it is a wasm mod.
+        file = lambda letter: {"url": "https://x/z.hmod", "size": 9, "sha256": letter * 64}
+        other = {"projects": [{"id": "zoom", "kind": "mod", "versions": [
+            {"version": "3.0.3", "game": "26.3", "file": file("7")}, {"version": "3.0.2", "game": "26.3", "file": file("8")}]}]}
+        self.assertEqual([(p["id"], p["version"]) for p in store.plan(other, BUILD, ["arm64-v8a"], None, "26.3")],
+                         [("zoom", "3.0.3")])
 
 
 class Register(unittest.TestCase):
