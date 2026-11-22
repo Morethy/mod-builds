@@ -37,6 +37,10 @@ ANDROID_SDK = textwrap.dedent(
     assert os.environ["RUSTFLAGS"] == "-C prefer-dynamic"
     with zipfile.ZipFile(hmod) as z:
         manifest = tomllib.loads(z.read("horizon-mod.toml").decode())
+        if "src/again.rs" in z.namelist():
+            print("   Compiling serde_json v1.0.151\n   Compiling hmod-veinminer v0.3.0 (/x)", file=sys.stderr)
+        else:
+            print("   Compiling hmod-veinminer v0.3.0 (/x)", file=sys.stderr)
         if "src/broken.rs" in z.namelist():
             sys.exit("error[E0425]: cannot find value `x` in this scope; could not compile `hmod-veinminer`")
     out.mkdir(parents=True)
@@ -95,6 +99,22 @@ class Builds(unittest.TestCase):
             self.assertEqual(status["state"], "failed", why)
             self.assertTrue(status["settled"], why)
             self.assertIn("whole-game Compile", status["error"], why)
+
+    def test_a_crate_of_the_games_own_is_taken_plainly_and_only_while_the_game_stays_as_built(self):
+        files = {"horizon-mod.toml": MANIFEST, "src/lib.rs": ""}
+        for line in ("serde_json = '1'\n", "sha2 = { version = '0.10' }\n", "log = '0.4'\n"):
+            status, _ = self.build(hmod({**files, "Cargo.toml": CARGO + line}))
+            self.assertEqual(status["state"], "done", (line, status))
+        for line in ("serde_json = { version = '1', features = ['raw_value'] }\n",
+                     "log = { git = 'https://example.com/log' }\n"):
+            status, _ = self.build(hmod({**files, "Cargo.toml": CARGO + line}))
+            self.assertEqual((status["state"], status["settled"]), ("failed", True), line)
+            self.assertIn("whole-game Compile", status["error"], line)
+        # The game's crates compiled again: no APK has them so.
+        status, _ = self.build(hmod({**files, "Cargo.toml": CARGO + "serde_json = '1'\n", "src/again.rs": ""}))
+        self.assertEqual((status["state"], status["settled"]), ("failed", True), status)
+        self.assertIn("serde_json", status["error"])
+        self.assertIn("whole-game Compile", status["error"])
 
     def test_a_file_outside_the_mod_or_a_mod_not_native_is_refused(self):
         for body in (hmod({"../evil": "x", "horizon-mod.toml": MANIFEST, "Cargo.toml": CARGO}),
@@ -236,6 +256,11 @@ class Plan(unittest.TestCase):
         # A failure that may pass is planned again; one for good is not.
         maybe = {"mods": [], "failed": [{"job": store.job_of("a" * 64, "arm64-v8a"), "settled": False}]}
         self.assertEqual(len(store.plan(self.catalog, BUILD, ["arm64-v8a"], maybe, "26.3")), 1)
+        for error, again in (("This mod has [native.mixin]: it needs the whole-game Compile.", 0),
+                             ("This mod uses the crate serde_json: it needs the whole-game Compile.", 1),
+                             ("This mod uses the crate rand: it needs the whole-game Compile.", 0)):
+            good = {"mods": [], "failed": [{"job": store.job_of("a" * 64, "arm64-v8a"), "settled": True, "error": error}]}
+            self.assertEqual(len(store.plan(self.catalog, BUILD, ["arm64-v8a"], good, "26.3")), again, error)
         self.assertEqual(len(store.plan(self.catalog, BUILD, ["arm64-v8a", "x86_64"], None, "26.3")), 2)
 
 
