@@ -1,0 +1,574 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 726d345..89a102f 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -24,13 +24,17 @@
+ //! lock, the menu's slot and padlock rules, the carried payload's clamp, the
+ //! scanner's box, price and readout) and [`support`] is the game glue. See
+ //! `notes.md` for the slice boundary, the deliberate deviations and the gaps.
++mod starling_tick;
++mod starling_command;
++mod starling_screen;
+ pub mod runtime;
+ mod support;
+ 
++use crate::starling_command::RunModCommandEvent;
+ use mod_api::{
+     self, BlockDropsEvent, Flow, Hooks, HostSide, LevelHost, PlayerContainerOpenEvent,
+     RegisterCommandsEvent, Registrar, RegistrationContext, RightClickBlockEvent,
+-    RunModCommandEvent, ServerHost,
++    ServerHost,
+ };
+ 
+ /// The mod holds no state of its own: the storage is the block entity's saved
+@@ -63,15 +67,6 @@ impl Hooks for Mod {
+         support::on_register_commands(event);
+     }
+ 
+-    /// The bodies of `/rftoolsstorage info|lock`.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        support::on_run_mod_command(host, event)
+-    }
+-
+     /// The menu's padlock reads a data slot, which is not saved: fill it with
+     /// the block's real state when the menu opens.
+     fn player_container_open(
+@@ -82,3 +77,20 @@ impl Hooks for Mod {
+         support::on_player_container_open(host, event);
+     }
+ }
++
++/// Starling's port: the old `run_mod_command` hook's body.
++pub(crate) fn starling_run_mod_command(
++    host: &mut dyn ServerHost,
++    event: &mut crate::starling_command::RunModCommandEvent<'_>,
++) -> Flow {
++        support::on_run_mod_command(host, event)
++    }
++
++/// Starling's port: every declared usage runs the old hook's body.
++pub(crate) fn starling_executor(
++    host: &mut dyn ServerHost,
++    source: &mod_api::CommandSource,
++    command: &mod_api::CommandInvocation,
++) -> Option<i32> {
++    crate::starling_command::execute(host, source, command, starling_run_mod_command)
++}
+diff --git a/rftoolsstorage/src/starling_command.rs b/src/starling_command.rs
+new file mode 100644
+index 0000000..894f55f
+--- /dev/null
++++ b/src/starling_command.rs
+@@ -0,0 +1,31 @@
++//! Starling's port to Sunrise's API: Horizon's `run_mod_command` hook, which got every command of
++//! the mod in one event, is a per-usage executor in Sunrise. The old event is rebuilt here around
++//! the executor's arguments, so the mod's command code runs as it was written.
++use mod_api::{CommandInvocation, CommandSource, Flow, ServerHost};
++
++/// Horizon's `RunModCommandEvent`: the parsed command and who ran it.
++pub(crate) struct RunModCommandEvent<'a> {
++    pub command: &'a CommandInvocation,
++    pub source: &'a CommandSource,
++    /// Whether an earlier mod took the command: in Sunrise each usage has its own executor, so never.
++    pub cancelled: bool,
++}
++
++/// The executor of every usage the mod declares: the old hook's body (`run`), whose `Cancel` was a
++/// command it ran and `Continue` one it did not.
++pub(crate) fn execute(
++    host: &mut dyn ServerHost,
++    source: &CommandSource,
++    command: &CommandInvocation,
++    run: fn(&mut dyn ServerHost, &mut RunModCommandEvent<'_>) -> Flow,
++) -> Option<i32> {
++    let mut event = RunModCommandEvent {
++        command,
++        source,
++        cancelled: false,
++    };
++    match run(host, &mut event) {
++        Flow::Continue => None,
++        _ => Some(1),
++    }
++}
+diff --git a/rftoolsstorage/src/starling_screen.rs b/src/starling_screen.rs
+new file mode 100644
+index 0000000..93ae332
+--- /dev/null
++++ b/src/starling_screen.rs
+@@ -0,0 +1,155 @@
++//! Starling's port to Sunrise's API: Horizon asked a block entity's Part for its screen (`screen`,
++//! `screen_draw`, `screen_click`, `screen_tooltip`, keyed by the block); Sunrise registers one
++//! screen per menu type, with closures. The Part's old methods run here, through Horizon's events
++//! rebuilt around Sunrise's frame, so the mod's screen code stays as it was written.
++use std::sync::Arc;
++
++use mod_api::{
++    ClientHost, DrawContext, Host, MenuScreen, MenuScreenLayout, MenuScreenOpen, Registrar,
++    ScreenSlot, Text,
++};
++
++/// Horizon's screen layout.
++#[derive(Clone, Debug, Default)]
++pub(crate) struct Screen {
++    pub width: f32,
++    pub height: f32,
++    pub slots: Vec<Option<[f32; 2]>>,
++    pub inventory_y: f32,
++    pub inventory_x: f32,
++    pub own_labels: bool,
++    pub own_background: bool,
++    pub recipe_book: Option<mod_api::RecipeBookTypeKey>,
++    pub recipe_book_toggle: Option<[f32; 2]>,
++}
++
++impl Screen {
++    fn layout(self) -> MenuScreenLayout {
++        MenuScreenLayout {
++            width: self.width,
++            height: self.height,
++            slots: self
++                .slots
++                .into_iter()
++                .map(|slot| {
++                    slot.map(|position| ScreenSlot {
++                        position,
++                        no_item_icon: None,
++                    })
++                })
++                .collect(),
++            inventory_y: self.inventory_y,
++            inventory_x: self.inventory_x,
++            own_labels: self.own_labels,
++            own_background: self.own_background,
++            recipe_book: self.recipe_book,
++            recipe_book_toggle: self
++                .recipe_book_toggle
++                .map(|[x, y]| mod_api::RecipeBookToggle {
++                    x,
++                    y,
++                    from: mod_api::ToggleOrigin::Menu,
++                }),
++            ..MenuScreenLayout::default()
++        }
++    }
++}
++
++/// Horizon's `ScreenEvent`: the block whose menu opens.
++pub(crate) struct ScreenEvent<'a> {
++    pub block: &'a str,
++}
++
++/// Horizon's `ScreenDrawEvent`.
++pub(crate) struct ScreenDrawEvent<'a> {
++    pub block: &'a str,
++    pub origin: [f32; 2],
++    pub at: [f32; 2],
++    pub data: &'a [i32],
++    pub draw: &'a mut dyn DrawContext,
++}
++
++/// Horizon's `ScreenClickEvent`.
++pub(crate) struct ScreenClickEvent<'a> {
++    pub block: &'a str,
++    pub origin: [f32; 2],
++    pub at: [f32; 2],
++    pub data: &'a [i32],
++    pub right: bool,
++}
++
++/// Horizon's `ScreenTooltipEvent`.
++pub(crate) struct ScreenTooltipEvent<'a> {
++    pub block: &'a str,
++    pub origin: [f32; 2],
++    pub at: [f32; 2],
++    pub data: &'a [i32],
++    pub slot: Option<u32>,
++    pub lines: &'a mut Vec<(Text, u32)>,
++}
++
++/// A Part's old screen methods.
++pub(crate) trait StarlingScreens: Send + Sync + 'static {
++    fn screen(&self, _host: &dyn Host, _event: &mut ScreenEvent<'_>) -> Option<Screen> {
++        None
++    }
++    fn screen_draw(&self, _host: &dyn ClientHost, _event: &mut ScreenDrawEvent<'_>) {}
++    fn screen_click(&self, _host: &dyn ClientHost, _event: &mut ScreenClickEvent<'_>) -> Option<i32> {
++        None
++    }
++    fn screen_tooltip(&self, _host: &dyn ClientHost, _event: &mut ScreenTooltipEvent<'_>) {}
++}
++
++/// `part`'s screen for the menu type `menu`.
++pub(crate) fn register(r: &mut dyn Registrar, menu: &str, part: impl StarlingScreens) {
++    let part = Arc::new(part);
++    let factory = move |host: &dyn ClientHost, open: MenuScreenOpen<'_>| -> Option<MenuScreen> {
++        let block = open.block.unwrap_or_default().to_owned();
++        let screen = part.screen(host, &mut ScreenEvent { block: &block })?;
++        let (draw_part, click_part, tip_part) = (part.clone(), part.clone(), part.clone());
++        let (draw_block, click_block, tip_block) = (block.clone(), block.clone(), block);
++        Some(
++            MenuScreen::new(screen.layout())
++                .with_draw(move |host, frame, draw| {
++                    draw_part.screen_draw(
++                        host,
++                        &mut ScreenDrawEvent {
++                            block: &draw_block,
++                            origin: frame.origin,
++                            at: frame.at,
++                            data: frame.data,
++                            draw,
++                        },
++                    );
++                })
++                .with_click(move |host, frame, right| {
++                    click_part.screen_click(
++                        host,
++                        &mut ScreenClickEvent {
++                            block: &click_block,
++                            origin: frame.origin,
++                            at: frame.at,
++                            data: frame.data,
++                            right,
++                        },
++                    )
++                })
++                .with_tooltip(move |host, frame, slot, lines| {
++                    tip_part.screen_tooltip(
++                        host,
++                        &mut ScreenTooltipEvent {
++                            block: &tip_block,
++                            origin: frame.origin,
++                            at: frame.at,
++                            data: frame.data,
++                            slot,
++                            lines,
++                        },
++                    );
++                }),
++        )
++    };
++    if let Err(error) = r.register_menu_screen(menu, Arc::new(factory)) {
++        r.refuse(&error);
++    }
++}
+diff --git a/rftoolsstorage/src/starling_tick.rs b/src/starling_tick.rs
+new file mode 100644
+index 0000000..16e2c71
+--- /dev/null
++++ b/src/starling_tick.rs
+@@ -0,0 +1,63 @@
++//! Starling's port to Sunrise's API: code written for Horizon's, which handed a block entity's
++//! slots, compound and data slots (`ModBlockEntityFields`) to a tick or a menu button to change in
++//! place, runs here on a copy of them taken from Sunrise's view; what it changed is written back and
++//! the chunk marked unsaved, as Horizon's reply did.
++use mod_api::{BlockEntityScope, BlockEntityTickEvent, ServerHost};
++
++/// The block entity as Horizon's tick had it.
++pub(crate) type OldEntity = mod_api::item::containers::ModBlockEntityFields;
++
++/// Run `body` on a copy of the ticking block entity (its host, the copy, its position).
++pub(crate) fn run(
++    event: &mut BlockEntityTickEvent<'_>,
++    body: impl FnOnce(&mut dyn ServerHost, &mut OldEntity, [i32; 3]),
++) {
++    run_scope(&mut event.subject, body);
++}
++
++/// Run `body` on a copy of the block entity `subject` lends (a tick's, a menu button's).
++pub(crate) fn run_scope(
++    subject: &mut BlockEntityScope<'_>,
++    body: impl FnOnce(&mut dyn ServerHost, &mut OldEntity, [i32; 3]),
++) {
++    let Some((handle, pos, before)) = subject.with_view(|view| {
++        let items = (0..view.item_slots() as u32)
++            .map(|slot| view.item_slot(slot).and_then(|stack| stack.to_owned()))
++            .collect();
++        let entity = OldEntity {
++            items,
++            nbt: view.nbt().clone(),
++            data: view.data_slots().to_vec(),
++        };
++        (view.handle(), view.position(), entity)
++    }) else {
++        return;
++    };
++    let mut after = before.clone();
++    body(subject.host(), &mut after, pos);
++    let mut changed = false;
++    subject.with_view(|mut view| {
++        for (key, value) in after.nbt.iter() {
++            if before.nbt.get(key) != Some(value) && view.set_nbt(key.clone(), Some(value.clone())) {
++                changed = true;
++            }
++        }
++        for (key, _) in before.nbt.iter() {
++            if after.nbt.get(key).is_none() && view.set_nbt(key.clone(), None) {
++                changed = true;
++            }
++        }
++        for (slot, stack) in after.items.iter().enumerate() {
++            if before.items.get(slot) != Some(stack) {
++                let _ = view.set_item_slot(slot as u32, stack.clone());
++                changed = true;
++            }
++        }
++        if after.data != before.data && view.set_data_slots(&after.data) {
++            changed = true;
++        }
++    });
++    if changed {
++        let _ = handle.set_changed(subject.host());
++    }
++}
+diff --git a/src/support.rs b/src/support.rs
+index 89c06c1..36c6aef 100644
+--- a/src/support.rs
++++ b/src/support.rs
+@@ -22,6 +22,8 @@
+ use std::sync::{Mutex, OnceLock};
+ use std::time::{Duration, Instant};
+ 
++use crate::starling_command::RunModCommandEvent;
++use crate::starling_screen::{Screen, ScreenEvent, ScreenDrawEvent, ScreenClickEvent};
+ use mod_api::item::containers::{ModBlockEntityFields, ModEnergyBuffer};
+ use mod_api::{
+     self, BlockDropsEvent, BlockEntityEvent, BlockEntityPart, BlockEntityRef, BlockKey, BlockPart,
+@@ -30,7 +32,7 @@ use mod_api::{
+     LevelRef, LevelSide, MenuButtonEvent, MenuContainer, MenuPart, MenuSlotRulesEvent,
+     ModContainer, OnBlockPlacedByEvent, OnDestroyedByPlayerEvent, PlayerContainerOpenEvent,
+     RegisterCommandsEvent, Registrar, RegistrationContext, RightClickBlockEvent,
+-    RunModCommandEvent, Screen, ScreenClickEvent, ScreenDrawEvent, ScreenEvent, ServerHost, Tag,
++    ServerHost, Tag,
+     Text, Transaction,
+ };
+ 
+@@ -152,6 +154,7 @@ pub(crate) fn register(registrar: &mut dyn Registrar, _cx: &RegistrationContext)
+         .block_entity_part(&kind, StorageBlock)
+         .expect("one Part per block-entity type");
+     registrar.menu_part(MENU, StorageMenu);
++    crate::starling_screen::register(registrar, MENU, StorageBlock);
+     // The block's own item: a placed storage takes back the contents a broken one
+     // put on it (`minecraft:block_entity_data`), upstream's contents-in-the-block.
+     let item = registrar.item_key(BLOCK);
+@@ -168,6 +171,7 @@ pub(crate) fn register(registrar: &mut dyn Registrar, _cx: &RegistrationContext)
+         reason = "the update is for a field a later game build may add"
+     )]
+     let container = ModContainer {
++        insert_rules: Vec::new(),
+         slots: CONTAINER_SLOTS,
+         faces: std::array::from_fn(|_| storage.clone()),
+         inputs: storage.clone(),
+@@ -271,18 +275,21 @@ impl BlockEntityPart for StorageBlock {
+         Some(Compound::new())
+     }
+ 
++
++
++}
++
++impl crate::starling_screen::StarlingScreens for StorageBlock {
+     /// The storage's menu layout (`native_screen`): the 100 slots of the grid,
+     /// then the player's inventory beside it.
+     fn screen(&self, _host: &dyn Host, _event: &mut ScreenEvent<'_>) -> Option<Screen> {
+         Some(menu_screen())
+     }
+-
+     /// The padlock, drawn over the panel; the grid and its frames are the
+     /// engine's (`own_background` is false).
+     fn screen_draw(&self, _host: &dyn ClientHost, event: &mut ScreenDrawEvent<'_>) {
+         draw_screen(event);
+     }
+-
+     /// A press on the padlock names the menu button the game sends to the
+     /// server; a press anywhere else is none of ours.
+     fn screen_click(
+@@ -296,11 +303,6 @@ impl BlockEntityPart for StorageBlock {
+         (!event.right && (x..x + width).contains(&at_x) && (y..y + height).contains(&at_y))
+             .then_some(BUTTON_LOCK)
+     }
+-
+-    /// The padlock's press, on the server (`clickMenuButton`).
+-    fn menu_button(&self, host: &mut dyn ServerHost, event: &mut MenuButtonEvent<'_>) {
+-        press_lock(host, event);
+-    }
+ }
+ 
+ /// The block's own item: a storage placed from a stack takes back the contents a
+@@ -314,7 +316,7 @@ impl ItemPart for StorageItem {
+     /// `minecraft:block_entity_data` to the new block entity: write the carried
+     /// stacks back into its slots, clamped, and clear the key so they travel once.
+     fn on_block_placed_by(&self, host: &mut dyn ServerHost, event: &mut OnBlockPlacedByEvent<'_>) {
+-        let block = event.state.block().id(&*host);
++        let block = event.state.block().id(&*host).unwrap_or_default().to_owned();
+         if block != BLOCK {
+             return;
+         }
+@@ -391,11 +393,14 @@ fn draw_screen(event: &mut ScreenDrawEvent<'_>) {
+ /// The padlock press: flip the lock of a storage that has a module, push the
+ /// new state into the menu's data slot (so the button redraws) and say what
+ /// happened on the action bar.
+-fn press_lock(host: &mut dyn ServerHost, event: &mut MenuButtonEvent<'_>) {
+-    if event.context.id != BUTTON_LOCK {
++fn press_lock(
++    host: &mut dyn ServerHost,
++    context: &mod_api::item::menu::MenuButtonContext,
++    fields: &mut ModBlockEntityFields,
++) {
++    if context.id != BUTTON_LOCK {
+         return;
+     }
+-    let fields = &mut *event.entity;
+     // A 0.2.2 block's module moves into the card slot here, so the padlock acts on
+     // it (and the open menu shows it).
+     adopt_legacy_fields(&*host, fields);
+@@ -420,7 +425,7 @@ fn press_lock(host: &mut dyn ServerHost, event: &mut MenuButtonEvent<'_>) {
+             "unlocked"
+         }
+     };
+-    action_bar(host, event.context.player, format!("{READOUT}{line}"));
++    action_bar(host, context.player, format!("{READOUT}{line}"));
+ }
+ 
+ /// Saves the lock and hands it to the open menu's padlock (the one data slot).
+@@ -438,7 +443,7 @@ pub(crate) fn on_player_container_open(
+     host: &mut dyn ServerHost,
+     event: &mut PlayerContainerOpenEvent<'_>,
+ ) {
+-    if event.menu != MENU {
++    if event.menu_type != MENU {
+         return;
+     }
+     let Some(pos) = event.pos else {
+@@ -477,6 +482,23 @@ pub(crate) struct StorageMenu;
+ 
+ #[mod_api::sunrise_part]
+ impl MenuPart for StorageMenu {
++    /// Starling's port: the padlock is the menu's one button (`clickMenuButton`'s check).
++    fn menu_button_valid(&self, _: &dyn Host, event: &mut mod_api::MenuButtonValidEvent<'_>) -> Flow {
++        if event.id == BUTTON_LOCK {
++            Flow::Cancel
++        } else {
++            Flow::Continue
++        }
++    }
++
++    /// The padlock's press, on the server (`clickMenuButton`), on the storage's block entity.
++    fn menu_button(&self, event: &mut MenuButtonEvent<'_>) {
++        let context = event.context.clone();
++        crate::starling_tick::run_scope(&mut event.subject, |host, fields, _| {
++            press_lock(host, &context, fields);
++        });
++    }
++
+     fn menu_slot_rules(&self, host: &dyn Host, event: &mut MenuSlotRulesEvent<'_>) {
+         if event.menu != MENU || event.container != MenuContainer::Main {
+             return;
+@@ -499,7 +521,7 @@ impl MenuPart for StorageMenu {
+         let stored = event
+             .context
+             .slot(MenuContainer::Main, event.slot)
+-            .map(|stack| kind_of(host, stack));
++            .map(|stack| kind_of(host, &stack));
+         event.may_place = slot_accepts(
+             locked,
+             stored.as_ref().map(|kind| kind.key.as_str()),
+@@ -549,9 +571,15 @@ pub(crate) fn on_block_drops(level: &dyn LevelHost, event: &mut BlockDropsEvent<
+     let Some(item) = ITEM_KEY.get().copied() else {
+         return Flow::Continue;
+     };
+-    for drop in event.drops.iter_mut() {
+-        if drop.stack.item() == item {
+-            let _ = drop.stack.apply_components(&patch);
++    for i in 0..event.drops.len() {
++        let Some(mut stack) = event.drops.get(i).and_then(|d| d.stack()).and_then(|s| s.project()) else {
++            continue;
++        };
++        if stack.item() == item
++            && stack.apply_components(&patch).is_ok()
++            && let Some(mut drop) = event.drops.get_mut(i)
++        {
++            let _ = drop.set_stack(stack);
+         }
+     }
+     Flow::Continue
+@@ -775,7 +803,7 @@ fn number(tag: Option<&Tag>) -> Option<i64> {
+ /// A stack's identity: its item, damage and components (upstream's
+ /// `ItemStack.isSameItemSameComponents`).
+ fn kind_of(host: &dyn Host, stack: &ItemStack) -> Kind {
+-    let item = stack.item().id(host);
++    let item = stack.item().id(host).unwrap_or_default().to_owned();
+     let key = match stack.components() {
+         Some(patch) => format!("{item}#{}#{:?}", stack.damage(), patch.as_nbt()),
+         None => format!("{item}#{}#", stack.damage()),
+@@ -817,7 +845,8 @@ fn entity_at(host: &dyn Host, pos: [i32; 3]) -> Option<BlockEntityRef> {
+ fn block_id_at(host: &dyn Host, pos: [i32; 3]) -> String {
+     host.level(host.dimension())
+         .and_then(|level| level.block(host, pos))
+-        .map_or_else(String::new, |block| block.id(host))
++        .and_then(|block| block.id(host).map(str::to_owned))
++        .unwrap_or_default()
+ }
+ 
+ /// The container's storage slots, read one by one (a mod block entity's item
+@@ -913,7 +942,7 @@ fn read_storage(
+     module: Option<&ItemStack>,
+ ) -> Storage {
+     let tier = module
+-        .and_then(|stack| module_tier(&stack.item().id(host)))
++        .and_then(|stack| module_tier(&stack.item().id(host).unwrap_or_default()))
+         .or_else(|| legacy_tier(data));
+     let mut storage = Storage::from_block(tier, false, vec![None; slots.len()]);
+     storage.locked = tier.is_some() && matches!(field(data, KEY_LOCKED), Some(Tag::Byte(1)));
+@@ -1201,7 +1230,7 @@ pub(crate) fn on_right_click_block(
+     if let HostSide::Server(host) = host {
+         match click.stack {
+             None => empty_hand(host, click.pos, click.player),
+-            Some(stack) if module_tier(&stack.item().id(host)).is_some() => {
++            Some(stack) if module_tier(&stack.item().id(host).unwrap_or_default()).is_some() => {
+                 install(host, click.pos, click.player, stack);
+             }
+             Some(stack) => insert(host, click.pos, click.player, stack),
+@@ -1386,7 +1415,7 @@ fn withdraw(host: &mut dyn ServerHost, pos: [i32; 3], uuid: u128) {
+         action_bar(host, uuid, line);
+         return;
+     };
+-    let item = stack.item().id(host);
++    let item = stack.item().id(host).unwrap_or_default().to_owned();
+     let given = stack.count();
+     let player = host.player(uuid);
+     let given_ok = match player {
+@@ -1497,7 +1526,7 @@ fn scan_found(host: &mut dyn ServerHost, pos: [i32; 3], radius: i32) -> Vec<Foun
+             };
+             let count = handler.amount(host, index);
+             if count > 0 {
+-                entries.push((resource.item().id(&*host), count));
++                entries.push((resource.item().id(&*host).unwrap_or_default().to_owned(), count));
+             }
+         }
+     }
+@@ -1522,16 +1551,16 @@ fn set_radius(host: &mut dyn ServerHost, pos: [i32; 3], wanted: i32) -> Option<i
+ pub(crate) fn on_register_commands(event: &mut RegisterCommandsEvent<'_>) {
+     event
+         .commands
+-        .push(Command::new("rftoolsstorage info <pos:block_pos>"));
++        .push(Command::new("rftoolsstorage info <pos:block_pos>").executes(crate::starling_executor));
+     event
+         .commands
+-        .push(Command::new("rftoolsstorage lock <pos:block_pos>"));
++        .push(Command::new("rftoolsstorage lock <pos:block_pos>").executes(crate::starling_executor));
+     event
+         .commands
+-        .push(Command::new("rftoolsstorage scan <pos:block_pos>"));
++        .push(Command::new("rftoolsstorage scan <pos:block_pos>").executes(crate::starling_executor));
+     event.commands.push(Command::new(
+         "rftoolsstorage radius <pos:block_pos> <radius:integer>",
+-    ));
++    ).executes(crate::starling_executor));
+ }
+ 
+ /// The `/rftoolsstorage` commands' bodies (`run_mod_command`).

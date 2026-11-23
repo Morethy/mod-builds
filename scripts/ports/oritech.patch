@@ -1,0 +1,428 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index e12d629..0a58b54 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -14,15 +14,17 @@
+ //! buffer are **declarations** on the block key, and the rest are typed `Hooks`
+ //! methods. Its `embedded-content` helper has no successor: one `.hmod` carries
+ //! the content and the code, which is what that helper existed to work around.
++mod starling_tick;
++mod starling_command;
+ pub mod runtime;
+ 
+ mod support;
+ 
++use crate::starling_command::RunModCommandEvent;
+ use mod_api::{
+-    self, BlockEntityEvent, BlockEntityPart, BlockEntityTickEvent, BlockEntityTickReply,
+-    BlockEntityTicksEvent, BlockPart, Command, CommandArgumentValue, Compound, Flow, Hooks, Host,
++    self, BlockEntityEvent, BlockEntityPart, BlockEntityTickEvent, BlockEntityTicksEvent, BlockPart, Command, CommandArgumentValue, Compound, Flow, Hooks, Host,
+     HostSide, LevelSide, LevelTickPostEvent, RegisterCommandsEvent, Registrar, RegistrationContext,
+-    RightClickBlockEvent, RunModCommandEvent, ServerHost, Text, WorldLifecycleEvent,
++    RightClickBlockEvent, ServerHost, Text, WorldLifecycleEvent,
+ };
+ 
+ #[derive(Default)]
+@@ -68,13 +70,13 @@ impl Hooks for Mod {
+             .blocks(&[support::FURNACE])
+             .build();
+         if let Err(error) = registrar.block_entity_part(&generator, GeneratorPart) {
+-            context.refuse(&error.to_string());
++            registrar.refuse(&error.to_string());
+         }
+         if let Err(error) = registrar.block_entity_part(&pulverizer, PulverizerPart) {
+-            context.refuse(&error.to_string());
++            registrar.refuse(&error.to_string());
+         }
+         if let Err(error) = registrar.block_entity_part(&furnace, FurnacePart) {
+-            context.refuse(&error.to_string());
++            registrar.refuse(&error.to_string());
+         }
+     }
+ 
+@@ -85,48 +87,11 @@ impl Hooks for Mod {
+     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+         event
+             .commands
+-            .push(Command::new("oritech info <pos:block_pos>"));
++            .push(Command::new("oritech info <pos:block_pos>").executes(crate::starling_executor));
+         event.commands.push(Command::op(
+             "oritech energy <pos:block_pos> <amount:integer>",
+             2,
+-        ));
+-    }
+-
+-    /// The command bodies. The dispatcher parses and resolves the arguments, so
+-    /// this only reads the machine and answers.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        let literals: Vec<&str> = event.command.literals.iter().map(String::as_str).collect();
+-        let line = match literals.as_slice() {
+-            ["oritech", "info"] => {
+-                let Some(CommandArgumentValue::BlockPos(pos)) = event.command.argument("pos")
+-                else {
+-                    return Flow::Continue;
+-                };
+-                support::info_line(host, *pos)
+-                    .unwrap_or_else(|| format!("{pos:?} is not a mod block entity."))
+-            }
+-            ["oritech", "energy"] => {
+-                let (
+-                    Some(CommandArgumentValue::BlockPos(pos)),
+-                    Some(CommandArgumentValue::Integer(amount)),
+-                ) = (
+-                    event.command.argument("pos"),
+-                    event.command.argument("amount"),
+-                )
+-                else {
+-                    return Flow::Continue;
+-                };
+-                support::set_energy(host, *pos, *amount)
+-                    .unwrap_or_else(|| format!("{pos:?} is not an Oritech machine."))
+-            }
+-            _ => return Flow::Continue,
+-        };
+-        let _ = host.commands().feedback(Text::literal(line));
+-        Flow::Cancel
++        ).executes(crate::starling_executor));
+     }
+ 
+     /// A right click on a machine inserts fuel or a recipe input, or reads its
+@@ -182,17 +147,19 @@ impl BlockEntityPart for GeneratorPart {
+ 
+     /// One server tick: load one fuel item when upstream would, burn one tick
+     /// for 32 FE, then queue the adjacent transfer.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        crate::starling_tick::run(event, |host, entity, tick_pos| {
+         let Some(level) = support::in_place_level(host) else {
+             return;
+         };
+-        let pos = event.pos;
+-        let mut nbt = std::mem::take(&mut event.entity.nbt);
+-        let changed = support::tick_generator(host, level, pos, &mut nbt, &mut event.entity.items);
+-        event.entity.nbt = nbt;
++        let pos = tick_pos;
++        let mut nbt = std::mem::take(&mut (*entity).nbt);
++        let changed = support::tick_generator(host, level, pos, &mut nbt, &mut (*entity).items);
++        (*entity).nbt = nbt;
+         if !changed {
+-            *event.reply = BlockEntityTickReply::Unchanged;
++            // (unchanged: nothing is written back)
+         }
++    });
+     }
+ }
+ 
+@@ -215,17 +182,19 @@ impl BlockEntityPart for PulverizerPart {
+ 
+     /// One server tick: find the matching recipe, check the output room, and let
+     /// the pure state machine spend FE and advance.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        crate::starling_tick::run(event, |host, entity, tick_pos| {
+         let Some(level) = support::in_place_level(host) else {
+             return;
+         };
+-        let pos = event.pos;
+-        let mut nbt = std::mem::take(&mut event.entity.nbt);
+-        let changed = support::tick_pulverizer(host, level, pos, &mut nbt, &mut event.entity.items);
+-        event.entity.nbt = nbt;
++        let pos = tick_pos;
++        let mut nbt = std::mem::take(&mut (*entity).nbt);
++        let changed = support::tick_pulverizer(host, level, pos, &mut nbt, &mut (*entity).items);
++        (*entity).nbt = nbt;
+         if !changed {
+-            *event.reply = BlockEntityTickReply::Unchanged;
++            // (unchanged: nothing is written back)
+         }
++    });
+     }
+ }
+ 
+@@ -249,16 +218,62 @@ impl BlockEntityPart for FurnacePart {
+     /// One server tick: a machine whose core is gone is disassembled, an
+     /// unassembled one does nothing, and an assembled one smelts one vanilla
+     /// smelting recipe at twice a furnace's speed.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        crate::starling_tick::run(event, |host, entity, tick_pos| {
+         let Some(level) = support::in_place_level(host) else {
+             return;
+         };
+-        let pos = event.pos;
+-        let mut nbt = std::mem::take(&mut event.entity.nbt);
+-        let changed = support::tick_furnace(host, level, pos, &mut nbt, &mut event.entity.items);
+-        event.entity.nbt = nbt;
++        let pos = tick_pos;
++        let mut nbt = std::mem::take(&mut (*entity).nbt);
++        let changed = support::tick_furnace(host, level, pos, &mut nbt, &mut (*entity).items);
++        (*entity).nbt = nbt;
+         if !changed {
+-            *event.reply = BlockEntityTickReply::Unchanged;
++            // (unchanged: nothing is written back)
+         }
++    });
+     }
+ }
++
++/// Starling's port: the old `run_mod_command` hook's body.
++pub(crate) fn starling_run_mod_command(
++    host: &mut dyn ServerHost,
++    event: &mut crate::starling_command::RunModCommandEvent<'_>,
++) -> Flow {
++        let literals: Vec<&str> = event.command.literals.iter().map(String::as_str).collect();
++        let line = match literals.as_slice() {
++            ["oritech", "info"] => {
++                let Some(CommandArgumentValue::BlockPos(pos)) = event.command.argument("pos")
++                else {
++                    return Flow::Continue;
++                };
++                support::info_line(host, *pos)
++                    .unwrap_or_else(|| format!("{pos:?} is not a mod block entity."))
++            }
++            ["oritech", "energy"] => {
++                let (
++                    Some(CommandArgumentValue::BlockPos(pos)),
++                    Some(CommandArgumentValue::Integer(amount)),
++                ) = (
++                    event.command.argument("pos"),
++                    event.command.argument("amount"),
++                )
++                else {
++                    return Flow::Continue;
++                };
++                support::set_energy(host, *pos, *amount)
++                    .unwrap_or_else(|| format!("{pos:?} is not an Oritech machine."))
++            }
++            _ => return Flow::Continue,
++        };
++        let _ = host.commands().feedback(Text::literal(line));
++        Flow::Cancel
++    }
++
++/// Starling's port: every declared usage runs the old hook's body.
++pub(crate) fn starling_executor(
++    host: &mut dyn ServerHost,
++    source: &mod_api::CommandSource,
++    command: &mod_api::CommandInvocation,
++) -> Option<i32> {
++    crate::starling_command::execute(host, source, command, starling_run_mod_command)
++}
+diff --git a/oritech/src/starling_command.rs b/src/starling_command.rs
+new file mode 100644
+index 0000000..894f55f
+--- /dev/null
++++ b/src/starling_command.rs
+@@ -0,0 +1,31 @@
++//! Starling's port to Sunrise's API: Horizon's `run_mod_command` hook, which got every command of
++//! the mod in one event, is a per-usage executor in Sunrise. The old event is rebuilt here around
++//! the executor's arguments, so the mod's command code runs as it was written.
++use mod_api::{CommandInvocation, CommandSource, Flow, ServerHost};
++
++/// Horizon's `RunModCommandEvent`: the parsed command and who ran it.
++pub(crate) struct RunModCommandEvent<'a> {
++    pub command: &'a CommandInvocation,
++    pub source: &'a CommandSource,
++    /// Whether an earlier mod took the command: in Sunrise each usage has its own executor, so never.
++    pub cancelled: bool,
++}
++
++/// The executor of every usage the mod declares: the old hook's body (`run`), whose `Cancel` was a
++/// command it ran and `Continue` one it did not.
++pub(crate) fn execute(
++    host: &mut dyn ServerHost,
++    source: &CommandSource,
++    command: &CommandInvocation,
++    run: fn(&mut dyn ServerHost, &mut RunModCommandEvent<'_>) -> Flow,
++) -> Option<i32> {
++    let mut event = RunModCommandEvent {
++        command,
++        source,
++        cancelled: false,
++    };
++    match run(host, &mut event) {
++        Flow::Continue => None,
++        _ => Some(1),
++    }
++}
+diff --git a/oritech/src/starling_tick.rs b/src/starling_tick.rs
+new file mode 100644
+index 0000000..4de1a43
+--- /dev/null
++++ b/src/starling_tick.rs
+@@ -0,0 +1,63 @@
++//! Starling's port to Sunrise's API: a block entity tick written for Horizon's, which handed the
++//! tick the block entity's slots, compound and data slots to change in place, runs here on a copy
++//! of them taken from the tick's view; what it changed is written back and the chunk marked
++//! unsaved, as Horizon's reply did.
++use mod_api::{BlockEntityTickEvent, Compound, ItemStack, ServerHost};
++
++/// The block entity as Horizon's tick had it.
++pub(crate) struct OldEntity {
++    pub items: Vec<Option<ItemStack>>,
++    pub nbt: Compound,
++    pub data: Vec<i32>,
++}
++
++/// Run `body` on a copy of the ticking block entity (its host, the copy, its position).
++pub(crate) fn run(
++    event: &mut BlockEntityTickEvent<'_>,
++    body: impl FnOnce(&mut dyn ServerHost, &mut OldEntity, [i32; 3]),
++) {
++    let Some((handle, pos, before)) = event.subject.with_view(|view| {
++        let items = (0..view.item_slots() as u32)
++            .map(|slot| view.item_slot(slot).and_then(|stack| stack.to_owned()))
++            .collect();
++        let entity = OldEntity {
++            items,
++            nbt: view.nbt().clone(),
++            data: view.data_slots().to_vec(),
++        };
++        (view.handle(), view.position(), entity)
++    }) else {
++        return;
++    };
++    let mut after = OldEntity {
++        items: before.items.clone(),
++        nbt: before.nbt.clone(),
++        data: before.data.clone(),
++    };
++    body(event.subject.host(), &mut after, pos);
++    let mut changed = false;
++    event.subject.with_view(|mut view| {
++        for (key, value) in after.nbt.iter() {
++            if before.nbt.get(key) != Some(value) && view.set_nbt(key.clone(), Some(value.clone())) {
++                changed = true;
++            }
++        }
++        for (key, _) in before.nbt.iter() {
++            if after.nbt.get(key).is_none() && view.set_nbt(key.clone(), None) {
++                changed = true;
++            }
++        }
++        for (slot, stack) in after.items.iter().enumerate() {
++            if before.items.get(slot) != Some(stack) {
++                let _ = view.set_item_slot(slot as u32, stack.clone());
++                changed = true;
++            }
++        }
++        if after.data != before.data && view.set_data_slots(&after.data) {
++            changed = true;
++        }
++    });
++    if changed {
++        let _ = handle.set_changed(event.subject.host());
++    }
++}
+diff --git a/src/support.rs b/src/support.rs
+index 9221d52..2acc496 100644
+--- a/src/support.rs
++++ b/src/support.rs
+@@ -104,7 +104,7 @@ fn write_string(nbt: &mut Compound, key: &str, value: &str) {
+ /// The block at `pos` in `level`, as its id: the retired bundle's
+ /// `game.res.facts().get(state).name`.
+ fn block_at(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> Option<String> {
+-    Some(level.block(host, pos)?.id(host))
++    level.block(host, pos)?.id(host).map(str::to_owned)
+ }
+ 
+ /// The level the server ticks now, for a block-entity tick that is not told its
+@@ -162,6 +162,7 @@ pub(crate) fn container(block: &str) -> Option<ModContainer> {
+         _ => return None,
+     };
+     Some(ModContainer {
++        insert_rules: Vec::new(),
+         slots,
+         faces: std::array::from_fn(|_| (0..slots).collect()),
+         inputs,
+@@ -372,7 +373,7 @@ pub(crate) fn tick_pulverizer(
+         let slot = |index: usize| {
+             items.get(index).and_then(Option::as_ref).map(|stack| {
+                 (
+-                    stack.item().id(host),
++                    stack.item().id(host).unwrap_or_default().to_owned(),
+                     i32::try_from(stack.count()).unwrap_or(i32::MAX),
+                 )
+             })
+@@ -437,7 +438,7 @@ pub(crate) fn tick_furnace(
+             let output = items
+                 .get(OUTPUT_ONE)
+                 .and_then(Option::as_ref)
+-                .map(|stack| (stack.item().id(host), count_of(stack)));
++                .map(|stack| (stack.item().id(host).unwrap_or_default().to_owned(), count_of(stack)));
+             let fits = output_fits(
+                 output.as_ref().map(|(id, count)| (id.as_str(), *count)),
+                 &recipe.result,
+@@ -516,7 +517,7 @@ fn grow_output(
+     let limit = u32::try_from(max_stack(host, &result.item).max(0)).unwrap_or(0);
+     let count = u32::try_from(result.count.max(0)).unwrap_or(0);
+     let merged = match items.get(slot).and_then(Option::as_ref) {
+-        Some(stack) if stack.item().id(host) == result.item => {
++        Some(stack) if stack.item().id(host).unwrap_or_default() == result.item => {
+             let mut stack = stack.clone();
+             stack
+                 .set_count(stack.count().saturating_add(count).min(limit))
+@@ -744,7 +745,7 @@ pub(crate) fn right_click(host: HostSide<'_>, event: &mut RightClickBlockEvent<'
+         return Flow::Cancel;
+     };
+     if name == FURNACE {
+-        let held_id = held.item().id(&*server);
++        let held_id = held.item().id(&*server).unwrap_or_default().to_owned();
+         // `MultiblockMachineController.tryPlaceNextCore`: a core in the hand
+         // fills the empty core position instead of the input slot.
+         if core_quality(&held_id).is_some() {
+@@ -770,12 +771,12 @@ pub(crate) fn right_click(host: HostSide<'_>, event: &mut RightClickBlockEvent<'
+     }
+     if name == GENERATOR {
+         if !is_fuel(burn_time(&*server, &held)) {
+-            let message = format!("{} is not a fuel", held.item().id(&*server));
++            let message = format!("{} is not a fuel", held.item().id(&*server).unwrap_or_default());
+             say(server, click.player, &message);
+             return Flow::Cancel;
+         }
+     } else if find_recipe(&*server, &held).is_none() {
+-        let message = format!("{} has no pulverizing recipe", held.item().id(&*server));
++        let message = format!("{} has no pulverizing recipe", held.item().id(&*server).unwrap_or_default());
+         say(server, click.player, &message);
+         return Flow::Cancel;
+     }
+@@ -800,7 +801,7 @@ fn place_core(
+     held: &ItemStack,
+ ) -> String {
+     let target = offset_pos(pos, CORE_OFFSET);
+-    let held_id = held.item().id(&*host);
++    let held_id = held.item().id(&*host).unwrap_or_default().to_owned();
+     match block_at(&*host, level, target) {
+         Some(occupied) if occupied != "minecraft:air" => {
+             return format!("the core position holds {occupied}");
+@@ -869,7 +870,7 @@ fn insert_held(
+     let Some(entity) = host.block_entity(level, pos) else {
+         return;
+     };
+-    let limit = u32::try_from(max_stack(&*host, &held.item().id(&*host)).max(0)).unwrap_or(0);
++    let limit = u32::try_from(max_stack(&*host, &held.item().id(&*host).unwrap_or_default()).max(0)).unwrap_or(0);
+     let current = entity.item_slot(&*host, slot as u32).ok().flatten();
+     let inserted = match &current {
+         None => held.count().min(limit),
+@@ -878,7 +879,7 @@ fn insert_held(
+     }
+     .min(held.count());
+     if inserted == 0 {
+-        let message = format!("{} is full", held.item().id(&*host));
++        let message = format!("{} is full", held.item().id(&*host).unwrap_or_default());
+         say(host, player, &message);
+         return;
+     }
+@@ -933,7 +934,7 @@ pub(crate) fn info_line(host: &mut dyn ServerHost, pos: [i32; 3]) -> Option<Stri
+             .item_slot(&*host, u32::try_from(index).ok()?)
+             .ok()
+             .flatten()
+-            .map(|stack| (stack.item().id(&*host), stack.count()))
++            .map(|stack| (stack.item().id(&*host).unwrap_or_default().to_owned(), stack.count()))
+     };
+     match name.as_str() {
+         GENERATOR => {

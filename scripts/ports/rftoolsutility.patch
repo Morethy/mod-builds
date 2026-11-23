@@ -1,0 +1,1443 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 1c2fbc1..5ab0e2e 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -14,18 +14,20 @@
+ //! The numbers — the capacity, the fill level, what a bucket click does, the craft loop, the
+ //! spawn cost — are in [`runtime`], a plain module with no `mod_api` types, so `cargo test`
+ //! alone proves them.
++use crate::starling_command::RunModCommandEvent;
+ use mod_api::{
+     self, BlockClick, BlockDropsEvent, BlockEntityPart, BlockEntityRef, BlockEntityTickEvent,
+-    BlockEntityTickReply, BlockEntityTicksEvent, BlockPart, Command, CommandArgumentValue,
+-    CommandSource, Compound, CraftingGrid, CraftingRecipeCodec, CraftingRecipeKind, Direction,
++    BlockEntityTicksEvent, BlockPart, Command, CommandArgumentValue,
++    CommandSource, Compound, CraftingGrid, CraftingRecipeKind, Direction,
+     Flow, FluidResource, FluidStack, Hand, Hooks, Host, HostBlockStates, HostSide, HostTransaction,
+     ITEM_FLUIDS, Identifier, InteractionResult, ItemKey, ItemPart, ItemPlace, ItemStack, LevelHost,
+     LevelRef, ModContainer, ModEnergyBuffer, ModFluidTanks, OnBlockPlacedByEvent, PlayerRef,
+-    RecipeInput, RegisterCommandsEvent, Registrar, RegistrationContext, RunModCommandEvent,
+-    ServerHost, ServerTickEvent, SpawnReason, Tag, Text, UseItemOnBlockEvent, UsePhase, fluid_util,
++    RecipeInput, RegisterCommandsEvent, Registrar, RegistrationContext, ServerHost, ServerTickEvent, SpawnReason, Tag, Text, UseItemOnBlockEvent, UsePhase, fluid_util,
+ };
+ use std::sync::{Mutex, OnceLock};
+ 
++mod starling_tick;
++mod starling_command;
+ pub mod runtime;
+ 
+ use runtime::{
+@@ -290,9 +292,15 @@ fn carry_machine(
+         return;
+     };
+     let patch = entity_patch(&saved, type_id);
+-    for drop in event.drops.iter_mut() {
+-        if drop.stack.item() == item {
+-            let _ = drop.stack.apply_components(&patch);
++    for i in 0..event.drops.len() {
++        let Some(mut stack) = event.drops.get(i).and_then(|d| d.stack()).and_then(|s| s.project()) else {
++            continue;
++        };
++        if stack.item() == item
++            && stack.apply_components(&patch).is_ok()
++            && let Some(mut drop) = event.drops.get_mut(i)
++        {
++            let _ = drop.set_stack(stack);
+         }
+     }
+ }
+@@ -457,7 +465,7 @@ fn write_taught(nbt: &mut Compound, taught: &[Taught]) {
+ /// A slot's contents as the runtime's planning sees them.
+ fn planned(host: &dyn Host, stack: &ItemStack) -> runtime::Stack {
+     runtime::Stack {
+-        item: stack.item().id(host),
++        item: stack.item().id(host).unwrap_or_default().to_owned(),
+         count: stack.count(),
+     }
+ }
+@@ -601,33 +609,33 @@ fn craft_one(
+ /// One server tick of the crafter (`CrafterBaseTE.tickServer`): while the energy pays for an
+ /// operation, run the taught recipes in order — a result `Int` mode puts in the input buffer is
+ /// what the next recipe of the same cycle can use (upstream's chained crafting).
+-fn crafter_tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
++fn crafter_tick(host: &mut dyn ServerHost, entity: &mut crate::starling_tick::OldEntity, tick_pos: [i32; 3]) {
+     let mut changed = false;
+-    if event.entity.items.len() < CRAFTER_SLOTS {
+-        event.entity.items.resize(CRAFTER_SLOTS, None);
++    if (*entity).items.len() < CRAFTER_SLOTS {
++        (*entity).items.resize(CRAFTER_SLOTS, None);
+         changed = true;
+     }
+-    let taught = read_taught(&event.entity.nbt);
+-    let energy = read_int(&event.entity.nbt, KEY_ENERGY).clamp(0, CRAFTER_CAPACITY);
+-    let speed = read_text(&event.entity.nbt, KEY_SPEED)
++    let taught = read_taught(&(*entity).nbt);
++    let energy = read_int(&(*entity).nbt, KEY_ENERGY).clamp(0, CRAFTER_CAPACITY);
++    let speed = read_text(&(*entity).nbt, KEY_SPEED)
+         .as_deref()
+         .and_then(Speed::parse)
+         .unwrap_or_default();
+-    let mode = read_text(&event.entity.nbt, KEY_MODE)
++    let mode = read_text(&(*entity).nbt, KEY_MODE)
+         .as_deref()
+         .and_then(CraftMode::parse)
+         .unwrap_or_default();
+-    let keep = read_text(&event.entity.nbt, KEY_KEEP).as_deref() == Some("Keep");
++    let keep = read_text(&(*entity).nbt, KEY_KEEP).as_deref() == Some("Keep");
+     let mut operations = steps(speed, energy);
+     if operations == 0 || taught.is_empty() {
+         if !changed {
+-            *event.reply = BlockEntityTickReply::Unchanged;
++            // (unchanged: nothing is written back)
+         }
+         return;
+     }
+     let Some(level) = ticking_level(&*host) else {
+         if !changed {
+-            *event.reply = BlockEntityTickReply::Unchanged;
++            // (unchanged: nothing is written back)
+         }
+         return;
+     };
+@@ -635,7 +643,7 @@ fn crafter_tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>)
+     'cycles: for _ in 0..operations {
+         let mut crafted = false;
+         for recipe in &taught {
+-            if craft_one(host, level, &mut event.entity.items, recipe, mode, keep) {
++            if craft_one(host, level, &mut (*entity).items, recipe, mode, keep) {
+                 crafted = true;
+             }
+         }
+@@ -647,14 +655,14 @@ fn crafter_tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>)
+     operations = done;
+     if operations > 0 {
+         write_int(
+-            &mut event.entity.nbt,
++            &mut (*entity).nbt,
+             KEY_ENERGY,
+             energy.saturating_sub(spend(operations)),
+         );
+         changed = true;
+     }
+     if !changed {
+-        *event.reply = BlockEntityTickReply::Unchanged;
++        // (unchanged: nothing is written back)
+     }
+ }
+ 
+@@ -687,7 +695,7 @@ fn crafter_readout(
+                 let stack = items.get(slot)?.as_ref()?;
+                 Some(format!(
+                     "{slot}={}x{}",
+-                    stack.item().id(host),
++                    stack.item().id(host).unwrap_or_default(),
+                     stack.count()
+                 ))
+             })
+@@ -715,6 +723,7 @@ fn crafter_container() -> ModContainer {
+     let outputs: Vec<usize> = (BUFFER_OUT..BUFFER_OUT + BUFFER_OUT_SLOTS).collect();
+     let reachable: Vec<usize> = inputs.iter().chain(&outputs).copied().collect();
+     ModContainer {
++        insert_rules: Vec::new(),
+         slots: CRAFTER_SLOTS,
+         faces: std::array::from_fn(|_| reachable.clone()),
+         inputs,
+@@ -750,8 +759,8 @@ impl BlockEntityPart for CrafterPart {
+     }
+ 
+     /// One server tick of the craft loop.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        crafter_tick(host, event);
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        crate::starling_tick::run(event, |host, entity, pos| crafter_tick(host, entity, pos));
+     }
+ }
+ 
+@@ -856,9 +865,6 @@ struct SpawnerRecipeKind;
+ impl CraftingRecipeKind for SpawnerRecipeKind {
+     type Value = SpawnerValue;
+ 
+-    fn codec(&self) -> Option<CraftingRecipeCodec<Self::Value>> {
+-        Some(CraftingRecipeCodec::wire())
+-    }
+ 
+     fn decode(&self, json: &str) -> Result<Self::Value, String> {
+         let value: mod_api::serde_json::Value =
+@@ -872,12 +878,12 @@ impl CraftingRecipeKind for SpawnerRecipeKind {
+ 
+     /// A spawner recipe is not craftable in a grid (`SpawnerRecipe.canCraftInDimensions` is
+     /// false and `matches` always refuses).
+-    fn matches(&self, _: &Self::Value, _: CraftingGrid) -> bool {
++    fn matches(&self, _context: &dyn mod_api::LoopContext, _: &Self::Value, _: CraftingGrid) -> bool {
+         false
+     }
+ 
+     /// …and makes nothing (`SpawnerRecipe.assemble` returns `ItemStack.EMPTY`).
+-    fn assemble(&self, _: &Self::Value, _: CraftingGrid) -> Option<ItemStack> {
++    fn assemble(&self, _context: &dyn mod_api::LoopContext, _: &Self::Value, _: CraftingGrid) -> Option<ItemStack> {
+         None
+     }
+ }
+@@ -926,30 +932,30 @@ fn facing_of(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> Option<String>
+ /// if (data.getMatter(i) < mobData.getItem(i).getAmount()) return;`) and clears them once the
+ /// mob exists, so the matter is what gates the spawn; the port's stores are filled by
+ /// `/rftoolsutility matter` (a matter beamer's send, whose block is a later slice).
+-fn spawner_tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-    let pos = event.pos;
+-    let Some(mob) = read_text(&event.entity.nbt, KEY_MOB) else {
+-        *event.reply = BlockEntityTickReply::Unchanged;
++fn spawner_tick(host: &mut dyn ServerHost, entity: &mut crate::starling_tick::OldEntity, tick_pos: [i32; 3]) {
++    let pos = tick_pos;
++    let Some(mob) = read_text(&(*entity).nbt, KEY_MOB) else {
++        // (unchanged: nothing is written back)
+         return;
+     };
+-    let cost = read_int(&event.entity.nbt, KEY_COST);
+-    let energy = read_int(&event.entity.nbt, KEY_ENERGY).clamp(0, SPAWNER_CAPACITY);
+-    let needs = read_matter(&event.entity.nbt, KEY_NEEDS).unwrap_or([0.0; 3]);
+-    let matter = read_matter(&event.entity.nbt, KEY_MATTER).unwrap_or([0.0; 3]);
++    let cost = read_int(&(*entity).nbt, KEY_COST);
++    let energy = read_int(&(*entity).nbt, KEY_ENERGY).clamp(0, SPAWNER_CAPACITY);
++    let needs = read_matter(&(*entity).nbt, KEY_NEEDS).unwrap_or([0.0; 3]);
++    let matter = read_matter(&(*entity).nbt, KEY_MATTER).unwrap_or([0.0; 3]);
+     let Some((left, left_matter)) = spawn_cycle(energy, cost, needs, matter) else {
+-        *event.reply = BlockEntityTickReply::Unchanged;
++        // (unchanged: nothing is written back)
+         return;
+     };
+     let Some(level) = ticking_level(&*host) else {
+-        *event.reply = BlockEntityTickReply::Unchanged;
++        // (unchanged: nothing is written back)
+         return;
+     };
+     let Some(facing) = facing_of(&*host, level, pos) else {
+-        *event.reply = BlockEntityTickReply::Unchanged;
++        // (unchanged: nothing is written back)
+         return;
+     };
+     let Some(at) = spawn_at(pos, &facing) else {
+-        *event.reply = BlockEntityTickReply::Unchanged;
++        // (unchanged: nothing is written back)
+         return;
+     };
+     // `EntityType.spawn` with the `SPAWNER` reason: the type makes the mob, finalizes it and
+@@ -959,13 +965,13 @@ fn spawner_tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>)
+         .spawn_mob(host, &mob, at, SpawnReason::Spawner)
+         .is_none()
+     {
+-        *event.reply = BlockEntityTickReply::Unchanged;
++        // (unchanged: nothing is written back)
+         return;
+     }
+-    write_int(&mut event.entity.nbt, KEY_ENERGY, left);
+-    write_matter(&mut event.entity.nbt, KEY_MATTER, left_matter);
+-    let spawned = read_int(&event.entity.nbt, KEY_SPAWNED).saturating_add(1);
+-    write_int(&mut event.entity.nbt, KEY_SPAWNED, spawned);
++    write_int(&mut (*entity).nbt, KEY_ENERGY, left);
++    write_matter(&mut (*entity).nbt, KEY_MATTER, left_matter);
++    let spawned = read_int(&(*entity).nbt, KEY_SPAWNED).saturating_add(1);
++    write_int(&mut (*entity).nbt, KEY_SPAWNED, spawned);
+ }
+ 
+ /// Three float amounts as the readout prints them: `a,b,c`, or `-` for an amount the machine
+@@ -1027,8 +1033,8 @@ impl BlockEntityPart for SpawnerPart {
+     }
+ 
+     /// One server tick: spawn one mob if the buffer pays for it.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        spawner_tick(host, event);
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        crate::starling_tick::run(event, |host, entity, pos| spawner_tick(host, entity, pos));
+     }
+ }
+ 
+@@ -1241,46 +1247,46 @@ fn link_beamer(
+ /// One server tick of the beamer (`MatterBeamerTileEntity.tickServer`): with a redstone signal
+ /// and a send tick, move the material its linked spawner's recipe takes into the store that
+ /// material feeds, and pay the FE — one block at a time, and only when the send happened.
+-fn beamer_tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-    let pos = event.pos;
+-    if event.entity.items.get(BEAMER_SLOT).is_none() {
+-        event.entity.items.resize(BEAMER_SLOT + 1, None);
++fn beamer_tick(host: &mut dyn ServerHost, entity: &mut crate::starling_tick::OldEntity, tick_pos: [i32; 3]) {
++    let pos = tick_pos;
++    if (*entity).items.get(BEAMER_SLOT).is_none() {
++        (*entity).items.resize(BEAMER_SLOT + 1, None);
+     }
+     let Some(level) = ticking_level(&*host) else {
+-        *event.reply = BlockEntityTickReply::Unchanged;
++        // (unchanged: nothing is written back)
+         return;
+     };
+     // Every tick, before the send clock: a beamer without a signal is dark.
+     if !level.has_neighbor_signal(&*host, pos) {
+         glow(host, pos, false);
+-        *event.reply = BlockEntityTickReply::Unchanged;
++        // (unchanged: nothing is written back)
+         return;
+     }
+     if !level.game_time(&*host).is_some_and(beam_due) {
+-        *event.reply = BlockEntityTickReply::Unchanged;
++        // (unchanged: nothing is written back)
+         return;
+     }
+-    let Some(dest) = read_pos(&event.entity.nbt, KEY_DEST) else {
+-        *event.reply = BlockEntityTickReply::Unchanged;
++    let Some(dest) = read_pos(&(*entity).nbt, KEY_DEST) else {
++        // (unchanged: nothing is written back)
+         return;
+     };
+     let Some(spawner) = machine_at(&*host, level, dest, SPAWNER) else {
+         // The destination is gone or is not a spawner: upstream's `setDestination(null)`.
+-        remove(&mut event.entity.nbt, KEY_DEST);
++        remove(&mut (*entity).nbt, KEY_DEST);
+         glow(host, pos, false);
+         return;
+     };
+     let Some(spawner_data) = spawner.data(&*host) else {
+-        *event.reply = BlockEntityTickReply::Unchanged;
++        // (unchanged: nothing is written back)
+         return;
+     };
+-    let Some(item) = event.entity.items.get(BEAMER_SLOT).and_then(Option::as_ref) else {
++    let Some(item) = (*entity).items.get(BEAMER_SLOT).and_then(Option::as_ref) else {
+         glow(host, pos, false);
+         return;
+     };
+-    let item_id = item.item().id(&*host);
++    let item_id = item.item().id(&*host).unwrap_or_default().to_owned();
+     let count = i32::try_from(item.count()).unwrap_or(i32::MAX);
+-    let energy = read_int(&event.entity.nbt, KEY_ENERGY).clamp(0, BEAMER_CAPACITY);
++    let energy = read_int(&(*entity).nbt, KEY_ENERGY).clamp(0, BEAMER_CAPACITY);
+     // The mob's recipe is the table's own data (`SpawnerRecipes.getMobData`), read when the
+     // send is due rather than cached, so a reloaded recipe table is seen.
+     let recipe = read_text(&spawner_data, KEY_MOB)
+@@ -1296,7 +1302,7 @@ fn beamer_tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>)
+         )
+     });
+     let Some(send) = send else {
+-        *event.reply = BlockEntityTickReply::Unchanged;
++        // (unchanged: nothing is written back)
+         return;
+     };
+     // The store goes on the spawner first: only an answered send pays (upstream consumes the
+@@ -1306,18 +1312,18 @@ fn beamer_tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>)
+     let mut next = spawner_data.clone();
+     write_matter(&mut next, KEY_MATTER, stores);
+     if spawner.replace_data(host, next).is_err() {
+-        *event.reply = BlockEntityTickReply::Unchanged;
++        // (unchanged: nothing is written back)
+         return;
+     }
+-    write_int(&mut event.entity.nbt, KEY_ENERGY, energy - send.rf);
++    write_int(&mut (*entity).nbt, KEY_ENERGY, energy - send.rf);
+     let left = count - send.blocks;
+     if left <= 0 {
+-        event.entity.items[BEAMER_SLOT] = None;
+-    } else if let Some(stack) = event.entity.items[BEAMER_SLOT].as_mut() {
++        (*entity).items[BEAMER_SLOT] = None;
++    } else if let Some(stack) = (*entity).items[BEAMER_SLOT].as_mut() {
+         let _ = stack.set_count(left as u32);
+     }
+-    let sent = read_int(&event.entity.nbt, KEY_SENT).saturating_add(1);
+-    write_int(&mut event.entity.nbt, KEY_SENT, sent);
++    let sent = read_int(&(*entity).nbt, KEY_SENT).saturating_add(1);
++    write_int(&mut (*entity).nbt, KEY_SENT, sent);
+     glow(host, pos, true);
+ }
+ 
+@@ -1337,6 +1343,7 @@ fn beamer_energy() -> ModEnergyBuffer {
+ /// into it and takes nothing out.
+ fn beamer_container() -> ModContainer {
+     ModContainer {
++        insert_rules: Vec::new(),
+         slots: BEAMER_SLOT + 1,
+         faces: std::array::from_fn(|_| vec![BEAMER_SLOT]),
+         inputs: vec![BEAMER_SLOT],
+@@ -1359,8 +1366,8 @@ impl BlockEntityPart for BeamerPart {
+     }
+ 
+     /// One server tick: at most one send, every 20 ticks.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        beamer_tick(host, event);
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        crate::starling_tick::run(event, |host, entity, pos| beamer_tick(host, entity, pos));
+     }
+ }
+ 
+@@ -1373,7 +1380,7 @@ impl BlockEntityPart for BeamerPart {
+ /// is not the place to read it.
+ fn tank_at(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> Option<Tank> {
+     let block = level.block(&*host, pos)?;
+-    if block.id(&*host) != TANK {
++    if block.id(&*host) != Some(TANK) {
+         return None;
+     }
+     let entity = host.block_entity(level, pos)?;
+@@ -1387,7 +1394,7 @@ fn tank_entity(
+     pos: [i32; 3],
+ ) -> Option<BlockEntityRef> {
+     let block = level.block(&*host, pos)?;
+-    (block.id(&*host) == TANK)
++    (block.id(&*host) == Some(TANK))
+         .then(|| host.block_entity(level, pos))
+         .flatten()
+ }
+@@ -1498,7 +1505,7 @@ fn bucket_move(
+     // The container the hand becomes is written on the next tick (see `PENDING_SWAP`).
+     let expected = click
+         .stack
+-        .map(|stack| stack.item().id(&*host))
++        .map(|stack| stack.item().id(&*host).unwrap_or_default().to_owned())
+         .unwrap_or_default();
+     // One swap per hand: a click delivered twice for one action must not stack two swaps.
+     PENDING_SWAP
+@@ -1550,10 +1557,12 @@ impl BlockEntityPart for TankPart {
+     /// tank's `onContentsChanged`; the pin's tank is written by pipes and by the hand alike, so
+     /// the tick is the one place that sees every write. This part writes nothing into the block
+     /// entity's own payload, so it answers `Unchanged` and leaves the chunk alone.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        *event.reply = BlockEntityTickReply::Unchanged;
+-        let tank = tank_of(&event.entity.nbt);
+-        mirror_level(host, event.pos, &tank);
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        crate::starling_tick::run(event, |host, entity, tick_pos| {
++        // (unchanged: nothing is written back)
++        let tank = tank_of(&(*entity).nbt);
++        mirror_level(host, tick_pos, &tank);
++    });
+     }
+ }
+ 
+@@ -1606,7 +1615,7 @@ impl Hooks for Mod {
+         // Only our own duplicate declaration can refuse here, and without the part the block
+         // would sit inert: refuse the mod's registration rather than load half a tank.
+         if let Err(error) = r.block_entity_part(&kind, TankPart) {
+-            cx.refuse(&format!(
++            r.refuse(&format!(
+                 "rftoolsutility: the tank part was refused: {error}"
+             ));
+             return;
+@@ -1639,7 +1648,7 @@ impl Hooks for Mod {
+                 .blocks(&[tier.block()])
+                 .build();
+             if let Err(error) = r.block_entity_part(&crafter_kind, CrafterPart) {
+-                cx.refuse(&format!(
++                r.refuse(&format!(
+                     "rftoolsutility: the {} part was refused: {error}",
+                     tier.kind()
+                 ));
+@@ -1657,7 +1666,7 @@ impl Hooks for Mod {
+         let _ = SPAWNER_ITEM.set(spawner_item);
+         let spawner_kind = r.block_entity_type(SPAWNER_TYPE).blocks(&[SPAWNER]).build();
+         if let Err(error) = r.block_entity_part(&spawner_kind, SpawnerPart) {
+-            cx.refuse(&format!(
++            r.refuse(&format!(
+                 "rftoolsutility: the spawner part was refused: {error}"
+             ));
+             return;
+@@ -1673,7 +1682,7 @@ impl Hooks for Mod {
+         let _ = BEAMER_ITEM.set(beamer_item);
+         let beamer_kind = r.block_entity_type(BEAMER_TYPE).blocks(&[BEAMER]).build();
+         if let Err(error) = r.block_entity_part(&beamer_kind, BeamerPart) {
+-            cx.refuse(&format!(
++            r.refuse(&format!(
+                 "rftoolsutility: the matter beamer part was refused: {error}"
+             ));
+             return;
+@@ -1699,7 +1708,7 @@ impl Hooks for Mod {
+                 let Some(stack) = event.click.stack else {
+                     return Flow::Continue;
+                 };
+-                let held = stack.item().id(client);
++                let held = stack.item().id(client).unwrap_or_default();
+                 if matches!(
+                     bucket_click(&held, &Tank::new()),
+                     Click::Fill { .. } | Click::Refused
+@@ -1720,7 +1729,7 @@ impl Hooks for Mod {
+         let Some(stack) = click.stack else {
+             return Flow::Continue;
+         };
+-        let held = stack.item().id(&*host);
++        let held = stack.item().id(&*host).unwrap_or_default().to_owned();
+         let Some(tank) = tank_at(host, level, click.pos) else {
+             return Flow::Continue;
+         };
+@@ -1767,8 +1776,8 @@ impl Hooks for Mod {
+             };
+             let now = host
+                 .living(player.entity())
+-                .and_then(|living| living.hand_item(&*host, swap.hand))
+-                .map(|stack| stack.item().id(&*host));
++                .and_then(|living| living.with_hand_item(&*host, swap.hand, |stack| stack.project()).flatten())
++                .map(|stack| stack.item().id(&*host).unwrap_or_default().to_owned());
+             if now.as_deref() != Some(swap.expected.as_str()) {
+                 continue;
+             }
+@@ -1821,11 +1830,17 @@ impl Hooks for Mod {
+             return Flow::Continue;
+         };
+         let patch = entity_patch(&saved, TANK_TYPE_ID);
+-        for drop in event.drops.iter_mut() {
+-            if drop.stack.item() == *item {
+-                let _ = drop.stack.apply_components(&patch);
+-            }
++        for i in 0..event.drops.len() {
++        let Some(mut stack) = event.drops.get(i).and_then(|d| d.stack()).and_then(|s| s.project()) else {
++            continue;
++        };
++        if stack.item() == *item
++            && stack.apply_components(&patch).is_ok()
++            && let Some(mut drop) = event.drops.get_mut(i)
++        {
++            let _ = drop.set_stack(stack);
+         }
++    }
+         Flow::Continue
+     }
+ 
+@@ -1836,429 +1851,126 @@ impl Hooks for Mod {
+     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+         event.commands.push(Command::new(
+             "rftoolsutility info <pos:block_pos> [nonce:word]",
+-        ));
++        ).executes(crate::starling_executor));
+         event.commands.push(Command::op(
+             "rftoolsutility tank <pos:block_pos> <fluid:id> <mb:integer>",
+             2,
+-        ));
++        ).executes(crate::starling_executor));
+         event.commands.push(Command::new(
+             "rftoolsutility crafter <pos:block_pos> [nonce:word]",
+-        ));
++        ).executes(crate::starling_executor));
+         event.commands.push(Command::op(
+             "rftoolsutility recipe <pos:block_pos> <index:integer> <recipe:id>",
+             2,
+-        ));
++        ).executes(crate::starling_executor));
+         event.commands.push(Command::op(
+             "rftoolsutility buffer <pos:block_pos> <slot:integer> <item:id> <count:integer>",
+             2,
+-        ));
++        ).executes(crate::starling_executor));
+         event.commands.push(Command::op(
+             "rftoolsutility energy <pos:block_pos> <amount:integer>",
+             2,
+-        ));
++        ).executes(crate::starling_executor));
+         event.commands.push(Command::op(
+             "rftoolsutility setting <pos:block_pos> <key:word> <value:word>",
+             2,
+-        ));
++        ).executes(crate::starling_executor));
+         event.commands.push(Command::new(
+             "rftoolsutility spawner <pos:block_pos> [nonce:word]",
+-        ));
++        ).executes(crate::starling_executor));
+         event.commands.push(Command::op(
+             "rftoolsutility mob <pos:block_pos> <mob:id>",
+             2,
+-        ));
++        ).executes(crate::starling_executor));
+         event.commands.push(Command::op(
+             "rftoolsutility matter <pos:block_pos> <m0:number> <m1:number> <m2:number>",
+             2,
+-        ));
++        ).executes(crate::starling_executor));
+         event.commands.push(Command::new(
+             "rftoolsutility beamer <pos:block_pos> [nonce:word]",
+-        ));
++        ).executes(crate::starling_executor));
+         event.commands.push(Command::op(
+             "rftoolsutility link <pos:block_pos> <dest:block_pos>",
+             2,
+-        ));
++        ).executes(crate::starling_executor));
+         event
+             .commands
+-            .push(Command::new("rftoolsutility recipes [nonce:word]"));
++            .push(Command::new("rftoolsutility recipes [nonce:word]").executes(crate::starling_executor));
+     }
++}
+ 
+-    /// Run the `/rftoolsutility` commands a player types.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        let invocation = event.command;
+-        let literals: Vec<&str> = invocation.literals.iter().map(String::as_str).collect();
+-        let known = matches!(
+-            literals.as_slice(),
+-            [
+-                "rftoolsutility",
+-                "info"
+-                    | "tank"
+-                    | "crafter"
+-                    | "recipe"
+-                    | "buffer"
+-                    | "energy"
+-                    | "setting"
+-                    | "spawner"
+-                    | "mob"
+-                    | "matter"
+-                    | "beamer"
+-                    | "link"
+-                    | "recipes"
+-            ]
+-        );
+-        if !known {
+-            return Flow::Continue;
+-        }
+-        // `recipes` names no machine: it counts the mob recipes the game loaded, so the
+-        // harness can prove the carried family is in force (upstream has no such command; its
+-        // GUI lists them).
+-        if literals.as_slice() == ["rftoolsutility", "recipes"] {
+-            let nonce = match invocation.argument("nonce") {
+-                Some(CommandArgumentValue::String(word)) => Some(word.as_str()),
+-                _ => None,
+-            };
+-            let recipes = spawner_recipes(&*host);
+-            let cost = |mob: &str| {
+-                recipe_for(&recipes, mob)
+-                    .map_or_else(|| "none".to_owned(), |recipe| recipe.power.to_string())
+-            };
+-            let suffix = nonce.map_or(String::new(), |nonce| format!(" nonce={nonce}"));
+-            feedback(
+-                host,
+-                &format!(
+-                    "/rftoolsutility: {} spawner recipes, zombie={} blaze={}{suffix}",
+-                    recipes.len(),
+-                    cost("minecraft:zombie"),
+-                    cost("minecraft:blaze")
+-                ),
+-            );
+-            return Flow::Cancel;
+-        }
+-        let Some(CommandArgumentValue::BlockPos(pos)) = invocation.argument("pos") else {
+-            feedback(
+-                host,
+-                "Usage: /rftoolsutility info|tank|crafter|recipe|buffer|energy|setting|spawner|mob|matter <pos> …",
+-            );
+-            return Flow::Cancel;
+-        };
+-        let pos = *pos;
+-        let Some(level) = host
+-            .levels()
+-            .list_levels()
+-            .into_iter()
+-            .find(|level| level.dimension() == invocation.dimension)
+-        else {
+-            feedback(host, "No machine there.");
+-            return Flow::Cancel;
+-        };
+-        match literals.as_slice() {
+-            ["rftoolsutility", "info"] => {
+-                let Some(tank) = tank_at(host, level, pos) else {
+-                    feedback(host, "No tank there.");
+-                    return Flow::Cancel;
+-                };
+-                // The harness passes a nonce so it can tell its own reply from an older one
+-                // still in the client's chat.
+-                let nonce = match invocation.argument("nonce") {
+-                    Some(CommandArgumentValue::String(word)) => Some(word.as_str()),
+-                    _ => None,
+-                };
+-                let held = held_of(host, event.source);
+-                let time = level.game_time(&*host).unwrap_or(0);
+-                feedback(host, &readout(pos, &tank, held, time, nonce));
+-            }
+-            ["rftoolsutility", "tank"] => {
+-                // `<fluid:id>` is a free identifier, which the engine delivers as a `String`
+-                // (`resource:<registry>` would deliver an `Id`); accept either so the usage and
+-                // the dispatcher cannot disagree.
+-                let fluid = match invocation.argument("fluid") {
+-                    Some(CommandArgumentValue::String(fluid)) => fluid.clone(),
+-                    Some(CommandArgumentValue::Id(fluid)) => fluid.to_string(),
+-                    _ => {
+-                        feedback(host, "Usage: /rftoolsutility tank <pos> <fluid> <mb>");
+-                        return Flow::Cancel;
++// ---------------------------------------------------------------------------
++// The crafter's harness controls
++// ---------------------------------------------------------------------------
++
++/// The machine of `kind` at `pos`, when the block there is that machine.
++fn machine_at(
++    host: &dyn Host,
++    level: LevelRef,
++    pos: [i32; 3],
++    kind: &str,
++) -> Option<BlockEntityRef> {
++    let block = level.block(host, pos)?;
++    (block.id(host) == Some(kind))
++        .then(|| host.block_entity(level, pos))
++        .flatten()
++}
++
++/// The crafter at `pos` and its tier, when the block there is one of the three crafter tiers.
++fn crafter_at(
++    host: &dyn Host,
++    level: LevelRef,
++    pos: [i32; 3],
++) -> Option<(BlockEntityRef, CrafterTier)> {
++    let block = level.block(host, pos)?;
++    let tier = CrafterTier::from_block(block.id(host).unwrap_or_default())?;
++    host.block_entity(level, pos).map(|entity| (entity, tier))
++}
++
++/// The crafter's 41 slots, read one by one (`block_entity_item_slot`). A slot the entity cannot
++/// answer reads as empty.
++fn crafter_slots(host: &dyn ServerHost, entity: BlockEntityRef) -> Vec<Option<ItemStack>> {
++    (0..CRAFTER_SLOTS as u32)
++        .map(|slot| entity.item_slot(host, slot).ok().flatten())
++        .collect()
++}
++
++/// The item ids a recipe's cell accepts, sorted so a saved grid loads back the same way; none
++/// for an ingredient the engine cannot enumerate (a component predicate).
++fn accepted(ingredient: &mod_api::Ingredient) -> Option<Vec<String>> {
++    let mut ids: Vec<String> = if ingredient.items.is_empty() {
++        ingredient.order.clone()
++    } else {
++        ingredient.items.iter().cloned().collect()
++    };
++    ids.sort_unstable();
++    ids.dedup();
++    (!ids.is_empty()).then_some(ids)
++}
++
++/// The nine cells of a crafting recipe's grid. A shaped recipe's pattern is mapped cell by cell
++/// (its ingredient list is the pattern's cells row by row, empty cells left out); a shapeless
++/// recipe's ingredients go in order. None for a special crafting recipe (no grid) or an
++/// ingredient that cannot be enumerated.
++fn recipe_cells(recipe: &mod_api::Recipe) -> Option<[Vec<String>; 9]> {
++    let mut cells: [Vec<String>; 9] = std::array::from_fn(|_| Vec::new());
++    let pattern = recipe.json.get("pattern").and_then(|p| p.as_array());
++    match pattern {
++        Some(rows) => {
++            let mut ingredient = recipe.ingredients.iter();
++            for (row, line) in rows.iter().enumerate().take(3) {
++                let line = line.as_str()?;
++                for (column, cell) in line.chars().enumerate().take(3) {
++                    if cell == ' ' {
++                        continue;
+                     }
+-                };
+-                let Some(CommandArgumentValue::Integer(mb)) = invocation.argument("mb") else {
+-                    feedback(host, "Usage: /rftoolsutility tank <pos> <fluid> <mb>");
+-                    return Flow::Cancel;
+-                };
+-                let Some(entity) = tank_entity(host, level, pos) else {
+-                    feedback(host, "No tank there.");
+-                    return Flow::Cancel;
+-                };
+-                let Some(mut data) = entity.data(&*host) else {
+-                    feedback(host, "No tank there.");
+-                    return Flow::Cancel;
+-                };
+-                // A harness control, not a player action: it replaces the contents, clamped to
+-                // the capacity, instead of merging with what the tank holds.
+-                let tank = command_tank(&fluid, *mb);
+-                write_tank(&mut data, &tank);
+-                if entity.replace_data(host, data).is_err() {
+-                    feedback(host, "No tank there.");
+-                    return Flow::Cancel;
++                    cells[row * 3 + column] = accepted(ingredient.next()?)?;
+                 }
+-                mirror_level(host, pos, &tank);
+-                feedback(
+-                    host,
+-                    &format!(
+-                        "Tank at {pos:?}: {} {}/{CAPACITY} mB.",
+-                        tank.fluid.as_deref().unwrap_or("empty"),
+-                        tank.amount
+-                    ),
+-                );
+-            }
+-            ["rftoolsutility", "crafter"] => {
+-                let Some((entity, _tier)) = crafter_at(host, level, pos) else {
+-                    feedback(host, "No crafter there.");
+-                    return Flow::Cancel;
+-                };
+-                let Some(data) = entity.data(&*host) else {
+-                    feedback(host, "No crafter there.");
+-                    return Flow::Cancel;
+-                };
+-                let nonce = match invocation.argument("nonce") {
+-                    Some(CommandArgumentValue::String(word)) => Some(word.as_str()),
+-                    _ => None,
+-                };
+-                let items = crafter_slots(host, entity);
+-                let line = crafter_readout(&*host, pos, &items, &data, nonce);
+-                feedback(host, &line);
+-            }
+-            ["rftoolsutility", "recipe"] => {
+-                let Some(CommandArgumentValue::Integer(index)) = invocation.argument("index")
+-                else {
+-                    feedback(host, "Usage: /rftoolsutility recipe <pos> <index> <recipe>");
+-                    return Flow::Cancel;
+-                };
+-                let id = match invocation.argument("recipe") {
+-                    Some(CommandArgumentValue::String(id)) => id.clone(),
+-                    Some(CommandArgumentValue::Id(id)) => id.to_string(),
+-                    _ => {
+-                        feedback(host, "Usage: /rftoolsutility recipe <pos> <index> <recipe>");
+-                        return Flow::Cancel;
+-                    }
+-                };
+-                let line = teach(host, level, pos, *index, &id);
+-                feedback(host, &line);
+             }
+-            ["rftoolsutility", "buffer"] => {
+-                let (
+-                    Some(CommandArgumentValue::Integer(slot)),
+-                    Some(CommandArgumentValue::Integer(count)),
+-                ) = (invocation.argument("slot"), invocation.argument("count"))
+-                else {
+-                    feedback(
+-                        host,
+-                        "Usage: /rftoolsutility buffer <pos> <slot> <item> <count>",
+-                    );
+-                    return Flow::Cancel;
+-                };
+-                let item = match invocation.argument("item") {
+-                    Some(CommandArgumentValue::String(item)) => item.clone(),
+-                    Some(CommandArgumentValue::Id(item)) => item.to_string(),
+-                    _ => {
+-                        feedback(
+-                            host,
+-                            "Usage: /rftoolsutility buffer <pos> <slot> <item> <count>",
+-                        );
+-                        return Flow::Cancel;
+-                    }
+-                };
+-                let line = set_slot(host, level, pos, *slot, &item, *count);
+-                feedback(host, &line);
+-            }
+-            ["rftoolsutility", "energy"] => {
+-                let Some(CommandArgumentValue::Integer(amount)) = invocation.argument("amount")
+-                else {
+-                    feedback(host, "Usage: /rftoolsutility energy <pos> <amount>");
+-                    return Flow::Cancel;
+-                };
+-                let line = set_energy(host, level, pos, *amount);
+-                feedback(host, &line);
+-            }
+-            ["rftoolsutility", "setting"] => {
+-                let (
+-                    Some(CommandArgumentValue::String(key)),
+-                    Some(CommandArgumentValue::String(value)),
+-                ) = (invocation.argument("key"), invocation.argument("value"))
+-                else {
+-                    feedback(
+-                        host,
+-                        "Usage: /rftoolsutility setting <pos> speed|mode|keep <value>",
+-                    );
+-                    return Flow::Cancel;
+-                };
+-                let line = set_setting(host, level, pos, key, value);
+-                feedback(host, &line);
+-            }
+-            ["rftoolsutility", "spawner"] => {
+-                let Some(entity) = machine_at(&*host, level, pos, SPAWNER) else {
+-                    feedback(host, "No spawner there.");
+-                    return Flow::Cancel;
+-                };
+-                let Some(data) = entity.data(&*host) else {
+-                    feedback(host, "No spawner there.");
+-                    return Flow::Cancel;
+-                };
+-                let nonce = match invocation.argument("nonce") {
+-                    Some(CommandArgumentValue::String(word)) => Some(word.as_str()),
+-                    _ => None,
+-                };
+-                let line = spawner_readout(pos, &data, nonce);
+-                feedback(host, &line);
+-            }
+-            ["rftoolsutility", "mob"] => {
+-                // `<mob:id>` is a free identifier, which the engine delivers as a `String`
+-                // (the same finding the tank command recorded); accept either form.
+-                let mob = match invocation.argument("mob") {
+-                    Some(CommandArgumentValue::String(mob)) => mob.clone(),
+-                    Some(CommandArgumentValue::Id(mob)) => mob.to_string(),
+-                    _ => {
+-                        feedback(host, "Usage: /rftoolsutility mob <pos> <mob>");
+-                        return Flow::Cancel;
+-                    }
+-                };
+-                let line = set_mob(host, level, pos, &mob);
+-                feedback(host, &line);
+-            }
+-            ["rftoolsutility", "matter"] => {
+-                // `<m0:number>` arrives as a double (the SDK's `Number`); the machine keeps
+-                // floats, the same width the recipe's own amounts use.
+-                let (
+-                    Some(CommandArgumentValue::Number(m0)),
+-                    Some(CommandArgumentValue::Number(m1)),
+-                    Some(CommandArgumentValue::Number(m2)),
+-                ) = (
+-                    invocation.argument("m0"),
+-                    invocation.argument("m1"),
+-                    invocation.argument("m2"),
+-                )
+-                else {
+-                    feedback(host, "Usage: /rftoolsutility matter <pos> <m0> <m1> <m2>");
+-                    return Flow::Cancel;
+-                };
+-                let line = feed_matter(host, level, pos, [*m0 as f32, *m1 as f32, *m2 as f32]);
+-                feedback(host, &line);
+-            }
+-            ["rftoolsutility", "beamer"] => {
+-                let Some(entity) = machine_at(&*host, level, pos, BEAMER) else {
+-                    feedback(host, "No matter beamer there.");
+-                    return Flow::Cancel;
+-                };
+-                let Some(data) = entity.data(&*host) else {
+-                    feedback(host, "No matter beamer there.");
+-                    return Flow::Cancel;
+-                };
+-                let nonce = match invocation.argument("nonce") {
+-                    Some(CommandArgumentValue::String(word)) => Some(word.as_str()),
+-                    _ => None,
+-                };
+-                let slot = entity
+-                    .item_slot(&*host, BEAMER_SLOT as u32)
+-                    .ok()
+-                    .flatten()
+-                    .map(|stack| (stack.item().id(&*host), stack.count() as i32));
+-                let line = beamer_readout(
+-                    pos,
+-                    &data,
+-                    slot.as_ref().map(|(item, count)| (item.as_str(), *count)),
+-                    lit_of(&*host, level, pos),
+-                    nonce,
+-                );
+-                feedback(host, &line);
+-            }
+-            ["rftoolsutility", "link"] => {
+-                let Some(CommandArgumentValue::BlockPos(dest)) = invocation.argument("dest") else {
+-                    feedback(host, "Usage: /rftoolsutility link <pos> <dest>");
+-                    return Flow::Cancel;
+-                };
+-                let line = link_beamer(host, level, pos, *dest);
+-                feedback(host, &line);
+-            }
+-            _ => return Flow::Continue,
+-        }
+-        Flow::Cancel
+-    }
+-}
+-
+-// ---------------------------------------------------------------------------
+-// The crafter's harness controls
+-// ---------------------------------------------------------------------------
+-
+-/// The machine of `kind` at `pos`, when the block there is that machine.
+-fn machine_at(
+-    host: &dyn Host,
+-    level: LevelRef,
+-    pos: [i32; 3],
+-    kind: &str,
+-) -> Option<BlockEntityRef> {
+-    let block = level.block(host, pos)?;
+-    (block.id(host) == kind)
+-        .then(|| host.block_entity(level, pos))
+-        .flatten()
+-}
+-
+-/// The crafter at `pos` and its tier, when the block there is one of the three crafter tiers.
+-fn crafter_at(
+-    host: &dyn Host,
+-    level: LevelRef,
+-    pos: [i32; 3],
+-) -> Option<(BlockEntityRef, CrafterTier)> {
+-    let block = level.block(host, pos)?;
+-    let tier = CrafterTier::from_block(&block.id(host))?;
+-    host.block_entity(level, pos).map(|entity| (entity, tier))
+-}
+-
+-/// The crafter's 41 slots, read one by one (`block_entity_item_slot`). A slot the entity cannot
+-/// answer reads as empty.
+-fn crafter_slots(host: &dyn ServerHost, entity: BlockEntityRef) -> Vec<Option<ItemStack>> {
+-    (0..CRAFTER_SLOTS as u32)
+-        .map(|slot| entity.item_slot(host, slot).ok().flatten())
+-        .collect()
+-}
+-
+-/// The item ids a recipe's cell accepts, sorted so a saved grid loads back the same way; none
+-/// for an ingredient the engine cannot enumerate (a component predicate).
+-fn accepted(ingredient: &mod_api::Ingredient) -> Option<Vec<String>> {
+-    let mut ids: Vec<String> = if ingredient.items.is_empty() {
+-        ingredient.order.clone()
+-    } else {
+-        ingredient.items.iter().cloned().collect()
+-    };
+-    ids.sort_unstable();
+-    ids.dedup();
+-    (!ids.is_empty()).then_some(ids)
+-}
+-
+-/// The nine cells of a crafting recipe's grid. A shaped recipe's pattern is mapped cell by cell
+-/// (its ingredient list is the pattern's cells row by row, empty cells left out); a shapeless
+-/// recipe's ingredients go in order. None for a special crafting recipe (no grid) or an
+-/// ingredient that cannot be enumerated.
+-fn recipe_cells(recipe: &mod_api::Recipe) -> Option<[Vec<String>; 9]> {
+-    let mut cells: [Vec<String>; 9] = std::array::from_fn(|_| Vec::new());
+-    let pattern = recipe.json.get("pattern").and_then(|p| p.as_array());
+-    match pattern {
+-        Some(rows) => {
+-            let mut ingredient = recipe.ingredients.iter();
+-            for (row, line) in rows.iter().enumerate().take(3) {
+-                let line = line.as_str()?;
+-                for (column, cell) in line.chars().enumerate().take(3) {
+-                    if cell == ' ' {
+-                        continue;
+-                    }
+-                    cells[row * 3 + column] = accepted(ingredient.next()?)?;
+-                }
+-            }
+-        }
+-        None => {
+-            for (cell, ingredient) in cells.iter_mut().zip(&recipe.ingredients) {
+-                *cell = accepted(ingredient)?;
++        }
++        None => {
++            for (cell, ingredient) in cells.iter_mut().zip(&recipe.ingredients) {
++                *cell = accepted(ingredient)?;
+             }
+         }
+     }
+@@ -2600,8 +2312,8 @@ fn held_of(host: &mut dyn ServerHost, source: &CommandSource) -> Option<(String,
+     };
+     let stack = host
+         .living(player.entity())?
+-        .hand_item(&*host, Hand::Main)?;
+-    Some((stack.item().id(&*host), stack.count()))
++        .with_hand_item(&*host, Hand::Main, |stack| stack.project()).flatten()?;
++    Some((stack.item().id(&*host).unwrap_or_default().to_owned(), stack.count()))
+ }
+ 
+ /// The command's success feedback, routed to its originating source (the swapped-in player, the
+@@ -3222,3 +2934,314 @@ mod tests {
+         );
+     }
+ }
++
++/// Starling's port: the old `run_mod_command` hook's body.
++pub(crate) fn starling_run_mod_command(
++    host: &mut dyn ServerHost,
++    event: &mut crate::starling_command::RunModCommandEvent<'_>,
++) -> Flow {
++        let invocation = event.command;
++        let literals: Vec<&str> = invocation.literals.iter().map(String::as_str).collect();
++        let known = matches!(
++            literals.as_slice(),
++            [
++                "rftoolsutility",
++                "info"
++                    | "tank"
++                    | "crafter"
++                    | "recipe"
++                    | "buffer"
++                    | "energy"
++                    | "setting"
++                    | "spawner"
++                    | "mob"
++                    | "matter"
++                    | "beamer"
++                    | "link"
++                    | "recipes"
++            ]
++        );
++        if !known {
++            return Flow::Continue;
++        }
++        // `recipes` names no machine: it counts the mob recipes the game loaded, so the
++        // harness can prove the carried family is in force (upstream has no such command; its
++        // GUI lists them).
++        if literals.as_slice() == ["rftoolsutility", "recipes"] {
++            let nonce = match invocation.argument("nonce") {
++                Some(CommandArgumentValue::String(word)) => Some(word.as_str()),
++                _ => None,
++            };
++            let recipes = spawner_recipes(&*host);
++            let cost = |mob: &str| {
++                recipe_for(&recipes, mob)
++                    .map_or_else(|| "none".to_owned(), |recipe| recipe.power.to_string())
++            };
++            let suffix = nonce.map_or(String::new(), |nonce| format!(" nonce={nonce}"));
++            feedback(
++                host,
++                &format!(
++                    "/rftoolsutility: {} spawner recipes, zombie={} blaze={}{suffix}",
++                    recipes.len(),
++                    cost("minecraft:zombie"),
++                    cost("minecraft:blaze")
++                ),
++            );
++            return Flow::Cancel;
++        }
++        let Some(CommandArgumentValue::BlockPos(pos)) = invocation.argument("pos") else {
++            feedback(
++                host,
++                "Usage: /rftoolsutility info|tank|crafter|recipe|buffer|energy|setting|spawner|mob|matter <pos> …",
++            );
++            return Flow::Cancel;
++        };
++        let pos = *pos;
++        let Some(level) = host
++            .levels()
++            .list_levels()
++            .into_iter()
++            .find(|level| level.dimension() == invocation.dimension)
++        else {
++            feedback(host, "No machine there.");
++            return Flow::Cancel;
++        };
++        match literals.as_slice() {
++            ["rftoolsutility", "info"] => {
++                let Some(tank) = tank_at(host, level, pos) else {
++                    feedback(host, "No tank there.");
++                    return Flow::Cancel;
++                };
++                // The harness passes a nonce so it can tell its own reply from an older one
++                // still in the client's chat.
++                let nonce = match invocation.argument("nonce") {
++                    Some(CommandArgumentValue::String(word)) => Some(word.as_str()),
++                    _ => None,
++                };
++                let held = held_of(host, event.source);
++                let time = level.game_time(&*host).unwrap_or(0);
++                feedback(host, &readout(pos, &tank, held, time, nonce));
++            }
++            ["rftoolsutility", "tank"] => {
++                // `<fluid:id>` is a free identifier, which the engine delivers as a `String`
++                // (`resource:<registry>` would deliver an `Id`); accept either so the usage and
++                // the dispatcher cannot disagree.
++                let fluid = match invocation.argument("fluid") {
++                    Some(CommandArgumentValue::String(fluid)) => fluid.clone(),
++                    Some(CommandArgumentValue::Id(fluid)) => fluid.to_string(),
++                    _ => {
++                        feedback(host, "Usage: /rftoolsutility tank <pos> <fluid> <mb>");
++                        return Flow::Cancel;
++                    }
++                };
++                let Some(CommandArgumentValue::Integer(mb)) = invocation.argument("mb") else {
++                    feedback(host, "Usage: /rftoolsutility tank <pos> <fluid> <mb>");
++                    return Flow::Cancel;
++                };
++                let Some(entity) = tank_entity(host, level, pos) else {
++                    feedback(host, "No tank there.");
++                    return Flow::Cancel;
++                };
++                let Some(mut data) = entity.data(&*host) else {
++                    feedback(host, "No tank there.");
++                    return Flow::Cancel;
++                };
++                // A harness control, not a player action: it replaces the contents, clamped to
++                // the capacity, instead of merging with what the tank holds.
++                let tank = command_tank(&fluid, *mb);
++                write_tank(&mut data, &tank);
++                if entity.replace_data(host, data).is_err() {
++                    feedback(host, "No tank there.");
++                    return Flow::Cancel;
++                }
++                mirror_level(host, pos, &tank);
++                feedback(
++                    host,
++                    &format!(
++                        "Tank at {pos:?}: {} {}/{CAPACITY} mB.",
++                        tank.fluid.as_deref().unwrap_or("empty"),
++                        tank.amount
++                    ),
++                );
++            }
++            ["rftoolsutility", "crafter"] => {
++                let Some((entity, _tier)) = crafter_at(host, level, pos) else {
++                    feedback(host, "No crafter there.");
++                    return Flow::Cancel;
++                };
++                let Some(data) = entity.data(&*host) else {
++                    feedback(host, "No crafter there.");
++                    return Flow::Cancel;
++                };
++                let nonce = match invocation.argument("nonce") {
++                    Some(CommandArgumentValue::String(word)) => Some(word.as_str()),
++                    _ => None,
++                };
++                let items = crafter_slots(host, entity);
++                let line = crafter_readout(&*host, pos, &items, &data, nonce);
++                feedback(host, &line);
++            }
++            ["rftoolsutility", "recipe"] => {
++                let Some(CommandArgumentValue::Integer(index)) = invocation.argument("index")
++                else {
++                    feedback(host, "Usage: /rftoolsutility recipe <pos> <index> <recipe>");
++                    return Flow::Cancel;
++                };
++                let id = match invocation.argument("recipe") {
++                    Some(CommandArgumentValue::String(id)) => id.clone(),
++                    Some(CommandArgumentValue::Id(id)) => id.to_string(),
++                    _ => {
++                        feedback(host, "Usage: /rftoolsutility recipe <pos> <index> <recipe>");
++                        return Flow::Cancel;
++                    }
++                };
++                let line = teach(host, level, pos, *index, &id);
++                feedback(host, &line);
++            }
++            ["rftoolsutility", "buffer"] => {
++                let (
++                    Some(CommandArgumentValue::Integer(slot)),
++                    Some(CommandArgumentValue::Integer(count)),
++                ) = (invocation.argument("slot"), invocation.argument("count"))
++                else {
++                    feedback(
++                        host,
++                        "Usage: /rftoolsutility buffer <pos> <slot> <item> <count>",
++                    );
++                    return Flow::Cancel;
++                };
++                let item = match invocation.argument("item") {
++                    Some(CommandArgumentValue::String(item)) => item.clone(),
++                    Some(CommandArgumentValue::Id(item)) => item.to_string(),
++                    _ => {
++                        feedback(
++                            host,
++                            "Usage: /rftoolsutility buffer <pos> <slot> <item> <count>",
++                        );
++                        return Flow::Cancel;
++                    }
++                };
++                let line = set_slot(host, level, pos, *slot, &item, *count);
++                feedback(host, &line);
++            }
++            ["rftoolsutility", "energy"] => {
++                let Some(CommandArgumentValue::Integer(amount)) = invocation.argument("amount")
++                else {
++                    feedback(host, "Usage: /rftoolsutility energy <pos> <amount>");
++                    return Flow::Cancel;
++                };
++                let line = set_energy(host, level, pos, *amount);
++                feedback(host, &line);
++            }
++            ["rftoolsutility", "setting"] => {
++                let (
++                    Some(CommandArgumentValue::String(key)),
++                    Some(CommandArgumentValue::String(value)),
++                ) = (invocation.argument("key"), invocation.argument("value"))
++                else {
++                    feedback(
++                        host,
++                        "Usage: /rftoolsutility setting <pos> speed|mode|keep <value>",
++                    );
++                    return Flow::Cancel;
++                };
++                let line = set_setting(host, level, pos, key, value);
++                feedback(host, &line);
++            }
++            ["rftoolsutility", "spawner"] => {
++                let Some(entity) = machine_at(&*host, level, pos, SPAWNER) else {
++                    feedback(host, "No spawner there.");
++                    return Flow::Cancel;
++                };
++                let Some(data) = entity.data(&*host) else {
++                    feedback(host, "No spawner there.");
++                    return Flow::Cancel;
++                };
++                let nonce = match invocation.argument("nonce") {
++                    Some(CommandArgumentValue::String(word)) => Some(word.as_str()),
++                    _ => None,
++                };
++                let line = spawner_readout(pos, &data, nonce);
++                feedback(host, &line);
++            }
++            ["rftoolsutility", "mob"] => {
++                // `<mob:id>` is a free identifier, which the engine delivers as a `String`
++                // (the same finding the tank command recorded); accept either form.
++                let mob = match invocation.argument("mob") {
++                    Some(CommandArgumentValue::String(mob)) => mob.clone(),
++                    Some(CommandArgumentValue::Id(mob)) => mob.to_string(),
++                    _ => {
++                        feedback(host, "Usage: /rftoolsutility mob <pos> <mob>");
++                        return Flow::Cancel;
++                    }
++                };
++                let line = set_mob(host, level, pos, &mob);
++                feedback(host, &line);
++            }
++            ["rftoolsutility", "matter"] => {
++                // `<m0:number>` arrives as a double (the SDK's `Number`); the machine keeps
++                // floats, the same width the recipe's own amounts use.
++                let (
++                    Some(CommandArgumentValue::Number(m0)),
++                    Some(CommandArgumentValue::Number(m1)),
++                    Some(CommandArgumentValue::Number(m2)),
++                ) = (
++                    invocation.argument("m0"),
++                    invocation.argument("m1"),
++                    invocation.argument("m2"),
++                )
++                else {
++                    feedback(host, "Usage: /rftoolsutility matter <pos> <m0> <m1> <m2>");
++                    return Flow::Cancel;
++                };
++                let line = feed_matter(host, level, pos, [*m0 as f32, *m1 as f32, *m2 as f32]);
++                feedback(host, &line);
++            }
++            ["rftoolsutility", "beamer"] => {
++                let Some(entity) = machine_at(&*host, level, pos, BEAMER) else {
++                    feedback(host, "No matter beamer there.");
++                    return Flow::Cancel;
++                };
++                let Some(data) = entity.data(&*host) else {
++                    feedback(host, "No matter beamer there.");
++                    return Flow::Cancel;
++                };
++                let nonce = match invocation.argument("nonce") {
++                    Some(CommandArgumentValue::String(word)) => Some(word.as_str()),
++                    _ => None,
++                };
++                let slot = entity
++                    .item_slot(&*host, BEAMER_SLOT as u32)
++                    .ok()
++                    .flatten()
++                    .map(|stack| (stack.item().id(&*host).unwrap_or_default().to_owned(), stack.count() as i32));
++                let line = beamer_readout(
++                    pos,
++                    &data,
++                    slot.as_ref().map(|(item, count)| (item.as_str(), *count)),
++                    lit_of(&*host, level, pos),
++                    nonce,
++                );
++                feedback(host, &line);
++            }
++            ["rftoolsutility", "link"] => {
++                let Some(CommandArgumentValue::BlockPos(dest)) = invocation.argument("dest") else {
++                    feedback(host, "Usage: /rftoolsutility link <pos> <dest>");
++                    return Flow::Cancel;
++                };
++                let line = link_beamer(host, level, pos, *dest);
++                feedback(host, &line);
++            }
++            _ => return Flow::Continue,
++        }
++        Flow::Cancel
++    }
++
++/// Starling's port: every declared usage runs the old hook's body.
++pub(crate) fn starling_executor(
++    host: &mut dyn ServerHost,
++    source: &mod_api::CommandSource,
++    command: &mod_api::CommandInvocation,
++) -> Option<i32> {
++    crate::starling_command::execute(host, source, command, starling_run_mod_command)
++}
+diff --git a/rftoolsutility/src/starling_command.rs b/src/starling_command.rs
+new file mode 100644
+index 0000000..894f55f
+--- /dev/null
++++ b/src/starling_command.rs
+@@ -0,0 +1,31 @@
++//! Starling's port to Sunrise's API: Horizon's `run_mod_command` hook, which got every command of
++//! the mod in one event, is a per-usage executor in Sunrise. The old event is rebuilt here around
++//! the executor's arguments, so the mod's command code runs as it was written.
++use mod_api::{CommandInvocation, CommandSource, Flow, ServerHost};
++
++/// Horizon's `RunModCommandEvent`: the parsed command and who ran it.
++pub(crate) struct RunModCommandEvent<'a> {
++    pub command: &'a CommandInvocation,
++    pub source: &'a CommandSource,
++    /// Whether an earlier mod took the command: in Sunrise each usage has its own executor, so never.
++    pub cancelled: bool,
++}
++
++/// The executor of every usage the mod declares: the old hook's body (`run`), whose `Cancel` was a
++/// command it ran and `Continue` one it did not.
++pub(crate) fn execute(
++    host: &mut dyn ServerHost,
++    source: &CommandSource,
++    command: &CommandInvocation,
++    run: fn(&mut dyn ServerHost, &mut RunModCommandEvent<'_>) -> Flow,
++) -> Option<i32> {
++    let mut event = RunModCommandEvent {
++        command,
++        source,
++        cancelled: false,
++    };
++    match run(host, &mut event) {
++        Flow::Continue => None,
++        _ => Some(1),
++    }
++}
+diff --git a/rftoolsutility/src/starling_tick.rs b/src/starling_tick.rs
+new file mode 100644
+index 0000000..16e2c71
+--- /dev/null
++++ b/src/starling_tick.rs
+@@ -0,0 +1,63 @@
++//! Starling's port to Sunrise's API: code written for Horizon's, which handed a block entity's
++//! slots, compound and data slots (`ModBlockEntityFields`) to a tick or a menu button to change in
++//! place, runs here on a copy of them taken from Sunrise's view; what it changed is written back and
++//! the chunk marked unsaved, as Horizon's reply did.
++use mod_api::{BlockEntityScope, BlockEntityTickEvent, ServerHost};
++
++/// The block entity as Horizon's tick had it.
++pub(crate) type OldEntity = mod_api::item::containers::ModBlockEntityFields;
++
++/// Run `body` on a copy of the ticking block entity (its host, the copy, its position).
++pub(crate) fn run(
++    event: &mut BlockEntityTickEvent<'_>,
++    body: impl FnOnce(&mut dyn ServerHost, &mut OldEntity, [i32; 3]),
++) {
++    run_scope(&mut event.subject, body);
++}
++
++/// Run `body` on a copy of the block entity `subject` lends (a tick's, a menu button's).
++pub(crate) fn run_scope(
++    subject: &mut BlockEntityScope<'_>,
++    body: impl FnOnce(&mut dyn ServerHost, &mut OldEntity, [i32; 3]),
++) {
++    let Some((handle, pos, before)) = subject.with_view(|view| {
++        let items = (0..view.item_slots() as u32)
++            .map(|slot| view.item_slot(slot).and_then(|stack| stack.to_owned()))
++            .collect();
++        let entity = OldEntity {
++            items,
++            nbt: view.nbt().clone(),
++            data: view.data_slots().to_vec(),
++        };
++        (view.handle(), view.position(), entity)
++    }) else {
++        return;
++    };
++    let mut after = before.clone();
++    body(subject.host(), &mut after, pos);
++    let mut changed = false;
++    subject.with_view(|mut view| {
++        for (key, value) in after.nbt.iter() {
++            if before.nbt.get(key) != Some(value) && view.set_nbt(key.clone(), Some(value.clone())) {
++                changed = true;
++            }
++        }
++        for (key, _) in before.nbt.iter() {
++            if after.nbt.get(key).is_none() && view.set_nbt(key.clone(), None) {
++                changed = true;
++            }
++        }
++        for (slot, stack) in after.items.iter().enumerate() {
++            if before.items.get(slot) != Some(stack) {
++                let _ = view.set_item_slot(slot as u32, stack.clone());
++                changed = true;
++            }
++        }
++        if after.data != before.data && view.set_data_slots(&after.data) {
++            changed = true;
++        }
++    });
++    if changed {
++        let _ = handle.set_changed(subject.host());
++    }
++}
