@@ -1,0 +1,404 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index e661844..6aa9f43 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -15,10 +15,10 @@ use std::collections::BTreeSet;
+ 
+ use mod_api::{
+     self, BlockEntityPart, BlockEntityRef, BlockEntityTickEvent, BlockEntityTicksEvent, BlockPart,
+-    BlockUpdateFlags, Capability, Command, CommandArgumentValue, Compound, Direction, Flow, Hand,
++    BlockUpdateFlags, Capability, Command, CommandArgumentValue, Compound, Direction, Hand,
+     Hooks, HostTransaction, ITEMS, Identifier, InteractionResult, ItemPlace, ItemResource,
+     ItemStack, LevelRef, RegisterCommandsEvent, Registrar, RegistrationContext, ResourceHandler,
+-    RunModCommandEvent, ServerHost, Tag, Text, UseItemOnEvent, move_resources,
++    ServerHost, Tag, Text, UseItemOnEvent, resource_util::move_resources,
+ };
+ 
+ use runtime::{
+@@ -98,7 +98,7 @@ fn in_place_level(host: &mut dyn ServerHost) -> Option<LevelRef> {
+ /// The pipe block entity at `pos`, if the block there is ours.
+ fn pipe_at(host: &mut dyn ServerHost, level: LevelRef, pos: Pos) -> Option<BlockEntityRef> {
+     let block = level.block(host, pos)?;
+-    (block.id(host) == PIPE)
++    (block.id(host) == Some(PIPE))
+         .then(|| host.block_entity(level, pos))
+         .flatten()
+ }
+@@ -126,7 +126,7 @@ fn neighbour(
+     let beside = step(pos, face);
+     if !attachments.has(face)
+         && let Some(block) = level.block(host, beside)
+-        && block.id(host) == PIPE
++        && block.id(host) == Some(PIPE)
+     {
+         return Neighbour::Pipe;
+     }
+@@ -327,7 +327,7 @@ fn run_extractors(host: &mut dyn ServerHost, level: LevelRef, pos: Pos, own: &At
+             let Some((_, to)) = targets.iter().find(|(target, _)| *target == index) else {
+                 return 0;
+             };
+-            host.transaction(|host, tx| move_resources(host, &from, to, |_| true, remaining, tx))
++            host.transaction(|host, tx| move_resources(host, &from, to, |_| true, remaining, Some(tx)))
+                 .unwrap_or(0)
+         });
+     }
+@@ -393,7 +393,7 @@ fn run_attractors(host: &mut dyn ServerHost, level: LevelRef, pos: Pos, own: &At
+             ) else {
+                 return 0;
+             };
+-            host.transaction(|host, tx| move_resources(host, &from, to, |_| true, remaining, tx))
++            host.transaction(|host, tx| move_resources(host, &from, to, |_| true, remaining, Some(tx)))
+                 .unwrap_or(0)
+         });
+     }
+@@ -401,12 +401,18 @@ fn run_attractors(host: &mut dyn ServerHost, level: LevelRef, pos: Pos, own: &At
+ 
+ /// One server tick of a pipe: recompute its six connections, then let each attachment that falls
+ /// on this tick move its batch — the extractors out of their sides, the attractors into theirs.
+-fn pipe_tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
++fn pipe_tick(event: &mut BlockEntityTickEvent<'_>) {
++    let Some((pos, nbt)) = event
++        .subject
++        .with_view(|view| (view.position(), view.nbt().clone()))
++    else {
++        return;
++    };
++    let host = event.subject.host();
+     let Some(level) = in_place_level(host) else {
+         return;
+     };
+-    let pos = event.pos;
+-    let own = read_attachments(&event.entity.nbt);
++    let own = read_attachments(&nbt);
+     let bits = connection_bits(neighbours(host, level, pos, &own));
+     show_connections(host, level, pos, bits);
+     // The transfer reads the saved mask, so the tick's nbt snapshot is taken before any
+@@ -482,7 +488,7 @@ impl BlockPart for Pipe {
+         let click = event.click;
+         let stack = click.stack?;
+         let held = stack.item().id(host);
+-        let kind = match held.as_str() {
++        let kind = match held.unwrap_or_default() {
+             EXTRACTOR => AttachmentKind::Extractor,
+             ATTRACTOR => AttachmentKind::Attractor,
+             _ => return None,
+@@ -548,8 +554,8 @@ impl BlockEntityPart for Pipe {
+         event.ticks = true;
+     }
+ 
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        pipe_tick(host, event);
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        pipe_tick(event);
+     }
+ }
+ 
+@@ -570,170 +576,175 @@ impl Hooks for Mod {
+     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+         event
+             .commands
+-            .push(Command::new("moderndynamics info <pos:block_pos>"));
+-        event.commands.push(Command::op(
+-            "moderndynamics attach <pos:block_pos> <side:word> [kind:word]",
+-            ADMIN_LEVEL,
+-        ));
+-        event.commands.push(Command::op(
+-            "moderndynamics detach <pos:block_pos> <side:word>",
+-            ADMIN_LEVEL,
+-        ));
++            .push(Command::new("moderndynamics info <pos:block_pos>").executes(run_command));
++        event.commands.push(
++            Command::op(
++                "moderndynamics attach <pos:block_pos> <side:word> [kind:word]",
++                ADMIN_LEVEL,
++            )
++            .executes(run_command),
++        );
++        event.commands.push(
++            Command::op(
++                "moderndynamics detach <pos:block_pos> <side:word>",
++                ADMIN_LEVEL,
++            )
++            .executes(run_command),
++        );
+     }
++}
+ 
+-    /// Run the `/moderndynamics` commands a player types: the connections, the attachments and
+-    /// the extraction cadence (the harness readout; upstream's screen is a gap).
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        let invocation = event.command;
+-        let words: Vec<&str> = invocation.literals.iter().map(String::as_str).collect();
+-        if words.first() != Some(&"moderndynamics") {
+-            return Flow::Continue;
+-        }
+-        let Some(action) = words.get(1).copied() else {
+-            return Flow::Continue;
+-        };
+-        if !matches!(action, "info" | "attach" | "detach") {
+-            return Flow::Continue;
+-        }
+-        let Some(CommandArgumentValue::BlockPos(pos)) = invocation.argument("pos") else {
++/// Run the `/moderndynamics` commands a player types: the connections, the attachments and
++/// the extraction cadence (the harness readout; upstream's screen is a gap).
++fn run_command(
++    host: &mut dyn ServerHost,
++    source: &mod_api::CommandSource,
++    invocation: &mod_api::CommandInvocation,
++) -> Option<i32> {
++    let words: Vec<&str> = invocation.literals.iter().map(String::as_str).collect();
++    if words.first() != Some(&"moderndynamics") {
++        return None;
++    }
++    let Some(action) = words.get(1).copied() else {
++        return None;
++    };
++    if !matches!(action, "info" | "attach" | "detach") {
++        return None;
++    }
++    let Some(CommandArgumentValue::BlockPos(pos)) = invocation.argument("pos") else {
++        feedback(
++            host,
++            "Usage: /moderndynamics info <x> <y> <z> or attach|detach <x> <y> <z> <side>",
++        );
++        return Some(1);
++    };
++    let pos = *pos;
++    let level = host
++        .levels()
++        .list_levels()
++        .into_iter()
++        .find(|level| level.dimension() == invocation.dimension);
++    let Some(level) = level else {
++        feedback(host, "Modern Dynamics: no item pipe there.");
++        return Some(1);
++    };
++    match action {
++        "info" => {
++            let Some(entity) = pipe_at(host, level, pos) else {
++                feedback(host, "Modern Dynamics: no item pipe there.");
++                return Some(1);
++            };
++            let Some(data) = entity.data(host) else {
++                feedback(host, "Modern Dynamics: no item pipe there.");
++                return Some(1);
++            };
++            let attachments = read_attachments(&data);
++            let connected = face_list(|face| {
++                level.block_property(host, pos, FACE_NAMES[face]).as_deref() == Some("true")
++            });
+             feedback(
+                 host,
+-                "Usage: /moderndynamics info <x> <y> <z> or attach|detach <x> <y> <z> <side>",
++                &format!(
++                    "Item Pipe at {},{},{}: links {connected}",
++                    pos[0], pos[1], pos[2]
++                ),
+             );
+-            return Flow::Cancel;
+-        };
+-        let pos = *pos;
+-        let level = host
+-            .levels()
+-            .list_levels()
+-            .into_iter()
+-            .find(|level| level.dimension() == invocation.dimension);
+-        let Some(level) = level else {
+-            feedback(host, "Modern Dynamics: no item pipe there.");
+-            return Flow::Cancel;
+-        };
+-        match action {
+-            "info" => {
+-                let Some(entity) = pipe_at(host, level, pos) else {
+-                    feedback(host, "Modern Dynamics: no item pipe there.");
+-                    return Flow::Cancel;
+-                };
+-                let Some(data) = entity.data(host) else {
+-                    feedback(host, "Modern Dynamics: no item pipe there.");
+-                    return Flow::Cancel;
+-                };
+-                let attachments = read_attachments(&data);
+-                let connected = face_list(|face| {
+-                    level.block_property(host, pos, FACE_NAMES[face]).as_deref() == Some("true")
+-                });
++            feedback(
++                host,
++                &format!(
++                    "Item Pipe at {},{},{}: extractors {}; attractors {}; {} items every {} ticks",
++                    pos[0],
++                    pos[1],
++                    pos[2],
++                    face_list(|face| attachments.kind(face) == Some(AttachmentKind::Extractor)),
++                    face_list(|face| attachments.kind(face) == Some(AttachmentKind::Attractor)),
++                    ITEMS_PER_OPERATION,
++                    OPERATION_TICK_DELAY
++                ),
++            );
++        }
++        _ => {
++            // Defence in depth: the tree already refuses a usage below its level, but a
++            // merged command tree is not a guarantee this body should rely on.
++            if !may_administer(source.permission().level()) {
+                 feedback(
+                     host,
+                     &format!(
+-                        "Item Pipe at {},{},{}: links {connected}",
+-                        pos[0], pos[1], pos[2]
++                        "Modern Dynamics: /moderndynamics {action} needs an operator (permission level {ADMIN_LEVEL})."
+                     ),
+                 );
++                return Some(1);
++            }
++            let Some(CommandArgumentValue::String(side)) = invocation.argument("side") else {
+                 feedback(
+                     host,
+-                    &format!(
+-                        "Item Pipe at {},{},{}: extractors {}; attractors {}; {} items every {} ticks",
+-                        pos[0],
+-                        pos[1],
+-                        pos[2],
+-                        face_list(|face| attachments.kind(face) == Some(AttachmentKind::Extractor)),
+-                        face_list(|face| attachments.kind(face) == Some(AttachmentKind::Attractor)),
+-                        ITEMS_PER_OPERATION,
+-                        OPERATION_TICK_DELAY
+-                    ),
++                    "Usage: /moderndynamics attach <x> <y> <z> <side> [extractor|attractor], detach <x> <y> <z> <side>",
+                 );
+-            }
+-            _ => {
+-                // Defence in depth: the tree already refuses a usage below its level, but a
+-                // merged command tree is not a guarantee this body should rely on.
+-                if !may_administer(event.source.permission().level()) {
+-                    feedback(
+-                        host,
+-                        &format!(
+-                            "Modern Dynamics: /moderndynamics {action} needs an operator (permission level {ADMIN_LEVEL})."
+-                        ),
+-                    );
+-                    return Flow::Cancel;
+-                }
+-                let Some(CommandArgumentValue::String(side)) = invocation.argument("side") else {
+-                    feedback(
+-                        host,
+-                        "Usage: /moderndynamics attach <x> <y> <z> <side> [extractor|attractor], detach <x> <y> <z> <side>",
+-                    );
+-                    return Flow::Cancel;
+-                };
+-                let Some(face) = face_named(&side.to_lowercase()) else {
+-                    feedback(
+-                        host,
+-                        &format!("Unknown side '{side}': down, up, north, south, west or east."),
+-                    );
+-                    return Flow::Cancel;
+-                };
+-                // `attach` without a kind is the extractor, as the extractor-only slice's
+-                // form always meant; `detach` clears whatever the side carries.
+-                let kind = if action == "attach" {
+-                    match invocation.argument("kind") {
+-                        None => Some(AttachmentKind::Extractor),
+-                        Some(CommandArgumentValue::String(word)) => {
+-                            let named = AttachmentKind::named(&word.to_lowercase());
+-                            if named.is_none() {
+-                                feedback(
+-                                    host,
+-                                    &format!(
+-                                        "Unknown attachment '{word}': extractor or attractor."
+-                                    ),
+-                                );
+-                                return Flow::Cancel;
+-                            }
+-                            named
+-                        }
+-                        Some(_) => {
++                return Some(1);
++            };
++            let Some(face) = face_named(&side.to_lowercase()) else {
++                feedback(
++                    host,
++                    &format!("Unknown side '{side}': down, up, north, south, west or east."),
++                );
++                return Some(1);
++            };
++            // `attach` without a kind is the extractor, as the extractor-only slice's
++            // form always meant; `detach` clears whatever the side carries.
++            let kind = if action == "attach" {
++                match invocation.argument("kind") {
++                    None => Some(AttachmentKind::Extractor),
++                    Some(CommandArgumentValue::String(word)) => {
++                        let named = AttachmentKind::named(&word.to_lowercase());
++                        if named.is_none() {
+                             feedback(
+                                 host,
+-                                "Usage: /moderndynamics attach <x> <y> <z> <side> [extractor|attractor]",
++                                &format!(
++                                    "Unknown attachment '{word}': extractor or attractor."
++                                ),
+                             );
+-                            return Flow::Cancel;
++                            return Some(1);
+                         }
++                        named
++                    }
++                    Some(_) => {
++                        feedback(
++                            host,
++                            "Usage: /moderndynamics attach <x> <y> <z> <side> [extractor|attractor]",
++                        );
++                        return Some(1);
+                     }
+-                } else {
+-                    None
+-                };
+-                if !set_attachment_command(host, level, pos, face, kind, attach_payer(event)) {
+-                    feedback(
+-                        host,
+-                        "Modern Dynamics: no item pipe there, or the attachment item is not in hand.",
+-                    );
+-                    return Flow::Cancel;
+                 }
++            } else {
++                None
++            };
++            if !set_attachment_command(host, level, pos, face, kind, attach_payer(source)) {
+                 feedback(
+                     host,
+-                    &format!(
+-                        "Item Pipe: {} on the {} side {}",
+-                        kind.unwrap_or(AttachmentKind::Extractor).name(),
+-                        FACE_NAMES[face],
+-                        if kind.is_some() { "on" } else { "off" }
+-                    ),
++                    "Modern Dynamics: no item pipe there, or the attachment item is not in hand.",
+                 );
++                return Some(1);
+             }
++            feedback(
++                host,
++                &format!(
++                    "Item Pipe: {} on the {} side {}",
++                    kind.unwrap_or(AttachmentKind::Extractor).name(),
++                    FACE_NAMES[face],
++                    if kind.is_some() { "on" } else { "off" }
++                ),
++            );
+         }
+-        Flow::Cancel
+     }
++    Some(1)
+ }
+ 
+ /// Who pays for an `/moderndynamics attach`: the acting player's main hand, or nobody when the
+ /// source has no hand (the console, a command block, a function). The administrative path is an
+ /// operator's, so its write is the write `/setblock` makes; the item is still the player's cost
+ /// when a player is the one attaching, exactly as the right-click path charges it.
+-fn attach_payer(event: &RunModCommandEvent<'_>) -> Option<u128> {
+-    match event.source {
++fn attach_payer(source: &mod_api::CommandSource) -> Option<u128> {
++    match source {
+         mod_api::CommandSource::Player { player, .. } => Some(player.uuid()),
+         _ => None,
+     }

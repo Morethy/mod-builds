@@ -1,0 +1,140 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 15c4f5b..ef47dd1 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -28,7 +28,7 @@ pub mod support;
+ 
+ use mod_api::{
+     self, Flow, Hooks, HostSide, LevelTickPostEvent, RegisterCommandsEvent, Registrar,
+-    RegistrationContext, RunModCommandEvent, ServerHost, WorldLifecycleEvent,
++    RegistrationContext, ServerHost, WorldLifecycleEvent,
+ };
+ 
+ /// The mod keeps no state of its own: the open gateways live in `support`'s list, so
+@@ -49,15 +49,6 @@ impl Hooks for Mod {
+         support::declare_commands(event.commands);
+     }
+ 
+-    /// Run one of the commands above and take it.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        support::run_command(host, event)
+-    }
+-
+     /// After a level's tick: advance every gateway open in that level (the level is in
+     /// place, which the spawn, teleport and removal helpers need).
+     fn level_tick_post(&self, host: HostSide<'_>, event: &mut LevelTickPostEvent) {
+diff --git a/src/support.rs b/src/support.rs
+index e95b17b..f412062 100644
+--- a/src/support.rs
++++ b/src/support.rs
+@@ -18,7 +18,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
+ use mod_api::{
+     Command, CommandArgument, CommandArgumentValue, Compound, Flow, Host, HostSide,
+     HostTransaction, Identifier, InteractionResult, ItemPart, ItemPlace, ItemResource, ItemStack,
+-    LevelRef, LevelTickPostEvent, PermissionLevel, Registrar, RemovalReason, RunModCommandEvent,
++    LevelRef, LevelTickPostEvent, PermissionLevel, Registrar, RemovalReason,
+     ServerHost, Tag, Text, UseOnEvent, WorldEpoch, WorldLifecycleEvent, WorldPhase,
+ };
+ 
+@@ -315,7 +315,7 @@ pub fn level_tick(host: HostSide<'_>, event: &mut LevelTickPostEvent) {
+ }
+ 
+ fn tick_level(host: &mut dyn ServerHost, level: LevelRef) {
+-    let Some(dimension) = level.dimension().id(&*host) else {
++    let Some(dimension) = level.dimension().id(&*host).map(str::to_owned) else {
+         return;
+     };
+     let world = level.epoch();
+@@ -336,14 +336,19 @@ fn tick_level(host: &mut dyn ServerHost, level: LevelRef) {
+     for index in selected {
+         let gate_pos = guard[index].gate.pos();
+         let leash_sq = guard[index].gate.def().rules.leash_range_sq();
+-        let nearby = level.online_players(host).is_some_and(|players| {
+-            players.iter().any(|player| {
+-                player
++        let nearby = level
++            .visit_online_players(host, &mut |player| {
++                if player
+                     .entity()
+                     .position(host)
+                     .is_some_and(|pos| distance_sq(pos, gate_pos) <= leash_sq)
++                {
++                    core::ops::ControlFlow::Break(())
++                } else {
++                    core::ops::ControlFlow::Continue(())
++                }
+             })
+-        });
++            .is_ok_and(|flow| flow.is_break());
+         let effects = {
+             let distance = |id: u32| {
+                 host.entity(id)
+@@ -466,30 +471,38 @@ fn note(host: &mut dyn ServerHost, line: impl Into<String>) {
+ // ---------------------------------------------------------------------------
+ 
+ /// `/gateways …` in the server's command tree, at upstream's `GAMEMASTERS` level.
+-pub fn declare_commands(commands: &mut Vec<Command>) {
+-    commands.push(Command::op(OPEN_USAGE, 2));
+-    commands.push(Command::op(LIST_USAGE, 2));
++pub fn declare_commands(commands: &mut Vec<mod_api::CommandRegistration>) {
++    commands.push(Command::op(OPEN_USAGE, 2).executes(run_command));
++    commands.push(Command::op(LIST_USAGE, 2).executes(run_command));
+ }
+ 
+ /// Run a parsed `/gateways` line, or leave it alone.
+-pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>) -> Flow {
+-    let Some(sub) = subcommand(&event.command.literals) else {
+-        return Flow::Continue;
++pub fn run_command(
++    host: &mut dyn ServerHost,
++    source: &mod_api::CommandSource,
++    command: &mod_api::CommandInvocation,
++) -> Option<i32> {
++    let Some(sub) = subcommand(&command.literals) else {
++        return None;
+     };
+-    if event.source.permission() < PermissionLevel::Gamemasters {
++    if source.permission() < PermissionLevel::Gamemasters {
+         note(host, PERMISSION_LINE);
+-        return Flow::Cancel;
++        return Some(1);
+     }
+     match sub {
+         Sub::List => note(host, list_line()),
+-        Sub::Open => open_command(host, event),
++        Sub::Open => open_command(host, source, command),
+     }
+-    Flow::Cancel
++    Some(1)
+ }
+ 
+ /// `/gateways open <x> <y> <z> <type>` — upstream's `/open_gateway <pos> <type>`.
+-fn open_command(host: &mut dyn ServerHost, event: &RunModCommandEvent<'_>) {
+-    let Some((at, id)) = open_arguments(&event.command.arguments) else {
++fn open_command(
++    host: &mut dyn ServerHost,
++    source: &mod_api::CommandSource,
++    command: &mod_api::CommandInvocation,
++) {
++    let Some((at, id)) = open_arguments(&command.arguments) else {
+         note(host, USAGE_LINE);
+         return;
+     };
+@@ -497,11 +510,11 @@ fn open_command(host: &mut dyn ServerHost, event: &RunModCommandEvent<'_>) {
+         note(host, format!("Unknown Gateway: {id}"));
+         return;
+     };
+-    let summoner = match &event.source {
++    let summoner = match source {
+         mod_api::CommandSource::Player { player, .. } => player.uuid(),
+         _ => 0,
+     };
+-    let Some(dimension) = event.command.dimension.id(&*host) else {
++    let Some(dimension) = command.dimension.id(&*host).map(str::to_owned) else {
+         note(host, NO_LEVEL_LINE);
+         return;
+     };

@@ -1,0 +1,411 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index b04cf98..2508e9b 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -31,7 +31,7 @@ pub mod support;
+ 
+ use mod_api::{
+     self, ExplosionDetonateEvent, Flow, Hooks, RegisterCommandsEvent, Registrar,
+-    RegistrationContext, RunModCommandEvent, ServerHost, ServerStoppingEvent, ServerTickEvent,
++    RegistrationContext, ServerHost, ServerStoppingEvent, ServerTickEvent,
+     WorldLifecycleEvent,
+ };
+ 
+@@ -53,15 +53,6 @@ impl Hooks for Mod {
+         support::declare_commands(event.commands);
+     }
+ 
+-    /// Run one of the commands above and take it.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        support::run_command(host, event)
+-    }
+-
+     /// A player broke a chest: commit its last changes and empty its slots, so the store's only
+     /// copy does not spill.
+     fn break_block(
+diff --git a/src/support.rs b/src/support.rs
+index 7f7ef39..dc33a46 100644
+--- a/src/support.rs
++++ b/src/support.rs
+@@ -25,7 +25,7 @@ use mod_api::{
+     BlockEntityPart, BlockEntityRef, BlockEntityTickEvent, BlockEntityTicksEvent, BlockPart,
+     BlockState, Command, CommandArgumentValue, CommandInvocation, CommandSource, Compound, Flow,
+     GameMode, Hand, Host, HostTransaction, Identifier, ItemKey, ItemPlace, ItemResource, ItemStack,
+-    LevelRef, ModContainer, PlayerRef, Registrar, RunModCommandEvent, ServerHost, ServerTickEvent,
++    LevelRef, ModContainer, PlayerRef, Registrar, ServerHost, ServerTickEvent,
+     ServerTickPhase, Tag, Text, WorldLifecycleEvent, WorldPhase,
+ };
+ 
+@@ -71,7 +71,7 @@ impl StoredItem {
+     fn of(host: &dyn Host, stack: &ItemStack) -> Option<Self> {
+         let nbt = stack.to_nbt(host)?;
+         Some(Self {
+-            id: stack.item().id(host),
++            id: stack.item().id(host)?.to_owned(),
+             count: stack.count(),
+             nbt,
+         })
+@@ -435,21 +435,23 @@ fn container() -> ModContainer {
+         inputs: (0..SLOTS).collect(),
+         outputs: (0..SLOTS).collect(),
+         menu: Some(MENU.to_owned()),
++        insert_rules: Vec::new(),
+     }
+ }
+ 
+ /// `/dimstorage channel|info|put|take`.
+-pub fn declare_commands(commands: &mut Vec<Command>) {
+-    commands.push(Command::new(
+-        "dimstorage channel <pos:block_pos> <channel:integer>",
+-    ));
+-    commands.push(Command::new("dimstorage info <pos:block_pos>"));
+-    commands.push(Command::new(
+-        "dimstorage put <pos:block_pos> <count:integer>",
+-    ));
+-    commands.push(Command::new(
+-        "dimstorage take <pos:block_pos> <slot:integer> <count:integer>",
+-    ));
++pub fn declare_commands(commands: &mut Vec<mod_api::CommandRegistration>) {
++    commands.push(
++        Command::new("dimstorage channel <pos:block_pos> <channel:integer>").executes(run_command),
++    );
++    commands.push(Command::new("dimstorage info <pos:block_pos>").executes(run_command));
++    commands.push(
++        Command::new("dimstorage put <pos:block_pos> <count:integer>").executes(run_command),
++    );
++    commands.push(
++        Command::new("dimstorage take <pos:block_pos> <slot:integer> <count:integer>")
++            .executes(run_command),
++    );
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -594,8 +596,8 @@ impl BlockEntityPart for ChestEntity {
+         event.ticks = true;
+     }
+ 
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        tick_chest(host, event);
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        tick_chest(event);
+     }
+ }
+ 
+@@ -638,13 +640,24 @@ fn register_mirror(
+ }
+ 
+ /// One server tick of a chest: apply a queued frequency, then merge its slots with the store.
+-fn tick_chest(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
++fn tick_chest(event: &mut BlockEntityTickEvent<'_>) {
++    // The tick no longer hands over the payload: copy the compound and the slots out of the
++    // view, run the merge on the copies, and write back what moved.
++    let Some((pos, handle, old_nbt, items)) = event.subject.with_view(|view| {
++        let items: Vec<Option<ItemStack>> = (0..view.item_slots() as u32)
++            .map(|slot| view.item_slot(slot).and_then(|stack| stack.to_owned()))
++            .collect();
++        (view.position(), view.handle(), view.nbt().clone(), items)
++    }) else {
++        return;
++    };
++    let mut nbt = old_nbt.clone();
++    let host = event.subject.host();
+     ensure_world(host);
+-    let pos = event.pos;
+     let dimension = host.dimension().to_owned();
+-    let mut frequency = be_frequency(&mut event.entity.nbt);
+-    let uid = be_uid(&mut event.entity.nbt);
+-    let current = stored_slots(&*host, &event.entity.items);
++    let mut frequency = be_frequency(&mut nbt);
++    let uid = be_uid(&mut nbt);
++    let current = stored_slots(&*host, &items);
+     let mut out = current.clone();
+     {
+         let mut guard = core();
+@@ -669,7 +682,7 @@ fn tick_chest(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+                 }
+                 state.snapshots.insert(uid, items.clone());
+                 out = items;
+-                set_be_frequency(&mut event.entity.nbt, &wanted);
++                set_be_frequency(&mut nbt, &wanted);
+                 frequency = wanted;
+             }
+         }
+@@ -682,8 +695,22 @@ fn tick_chest(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+         state.snapshots.insert(uid, synced.items.clone());
+         out = synced.items;
+     }
+-    if out != current {
+-        event.entity.items = stacks(&*host, &out);
++    let new_items = (out != current).then(|| stacks(&*host, &out));
++    let mut changed = new_items.is_some();
++    event.subject.with_view(|mut view| {
++        for (key, value) in nbt.iter() {
++            if old_nbt.get(key) != Some(value) && view.set_nbt(key.clone(), Some(value.clone())) {
++                changed = true;
++            }
++        }
++        if let Some(items) = new_items {
++            for (slot, stack) in items.into_iter().enumerate() {
++                let _ = view.set_item_slot(slot as u32, stack);
++            }
++        }
++    });
++    if changed {
++        let _ = handle.set_changed(event.subject.host());
+     }
+ }
+ 
+@@ -828,8 +855,11 @@ pub fn explosion_detonate(
+ /// and `/dimstorage take <pos> <slot> <count>`. The channel form queues the change for the chest's
+ /// next tick, as the block entity is not in the world here. This is a port-owned fallback for the
+ /// deferred frequency screen.
+-pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>) -> Flow {
+-    let invocation = event.command;
++pub fn run_command(
++    host: &mut dyn ServerHost,
++    source: &CommandSource,
++    invocation: &CommandInvocation,
++) -> Option<i32> {
+     let literals: Vec<&str> = invocation.literals.iter().map(String::as_str).collect();
+     match literals.as_slice() {
+         ["dimstorage", "channel"] => {
+@@ -837,15 +867,15 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
+                 (block_pos(invocation, "pos"), integer(invocation, "channel"))
+             else {
+                 say(host, "Usage: /dimstorage channel <x> <y> <z> <channel>");
+-                return Flow::Cancel;
++                return Some(1);
+             };
+-            if !reach(host, event.source, pos) {
++            if !reach(host, source, pos) {
+                 say(host, "That chest is out of reach.");
+-                return Flow::Cancel;
++                return Some(1);
+             }
+             if !chest_there(host, pos) {
+                 say(host, "No dimensional chest there.");
+-                return Flow::Cancel;
++                return Some(1);
+             }
+             let frequency = Frequency::public(channel);
+             let dimension = host.dimension().to_owned();
+@@ -865,11 +895,11 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
+         ["dimstorage", "info"] => {
+             let Some(pos) = block_pos(invocation, "pos") else {
+                 say(host, "Usage: /dimstorage info <x> <y> <z>");
+-                return Flow::Cancel;
++                return Some(1);
+             };
+-            if !reach(host, event.source, pos) {
++            if !reach(host, source, pos) {
+                 say(host, "That chest is out of reach.");
+-                return Flow::Cancel;
++                return Some(1);
+             }
+             let line = readout(host, pos);
+             say(host, &line);
+@@ -879,40 +909,40 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
+                 (block_pos(invocation, "pos"), integer(invocation, "count"))
+             else {
+                 say(host, "Usage: /dimstorage put <x> <y> <z> <count>");
+-                return Flow::Cancel;
++                return Some(1);
+             };
+-            if !reach(host, event.source, pos) {
++            if !reach(host, source, pos) {
+                 say(host, "That chest is out of reach.");
+-                return Flow::Cancel;
++                return Some(1);
+             }
+             let Ok(count) = u32::try_from(count) else {
+                 say(host, "The count must be a positive integer.");
+-                return Flow::Cancel;
++                return Some(1);
+             };
+             let Some(frequency) = chest_frequency(host, pos) else {
+                 say(host, "No dimensional chest there.");
+-                return Flow::Cancel;
++                return Some(1);
+             };
+-            let Some(player) = source_player(event.source) else {
++            let Some(player) = source_player(source) else {
+                 say(host, "Hold the stack to store.");
+-                return Flow::Cancel;
++                return Some(1);
+             };
+             let hand = ItemPlace::PlayerHand {
+                 player: player.uuid(),
+                 hand: Hand::Main,
+             };
+-            let Some(held) = hand.stack(host) else {
++            let Some(held) = hand.with_stack(host, |stack| stack.project()).flatten() else {
+                 say(host, "Hold the stack to store.");
+-                return Flow::Cancel;
++                return Some(1);
+             };
+             let take = count.min(held.count());
+             if take == 0 {
+                 say(host, "There is nothing to store.");
+-                return Flow::Cancel;
++                return Some(1);
+             }
+             let Some(stored) = StoredItem::of(&*host, &held) else {
+                 say(host, "The held stack could not be taken.");
+-                return Flow::Cancel;
++                return Some(1);
+             };
+             // Deposit on a copy first, so the amount the hand really gives decides what the store
+             // takes: a hand that gives less is deposited again for what it gave.
+@@ -921,7 +951,7 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
+             let moved = take - left;
+             if moved == 0 {
+                 say(host, "The dimensional chest is full.");
+-                return Flow::Cancel;
++                return Some(1);
+             }
+             let resource = ItemResource::of(&held);
+             let took = host
+@@ -929,7 +959,7 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
+                 .unwrap_or(0);
+             if took == 0 {
+                 say(host, "The held stack could not be taken.");
+-                return Flow::Cancel;
++                return Some(1);
+             }
+             {
+                 let mut guard = core();
+@@ -937,7 +967,7 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
+                 settle(&mut state.store, &frequency, &scratch, &stored, took, moved);
+                 state.dirty = true;
+             }
+-            let line = format!("Stored {took} x {}.", held.item().id(&*host));
++            let line = format!("Stored {took} x {}.", held.item().id(&*host).unwrap_or_default());
+             say(host, &line);
+         }
+         ["dimstorage", "take"] => {
+@@ -947,19 +977,19 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
+                 integer(invocation, "count"),
+             ) else {
+                 say(host, "Usage: /dimstorage take <x> <y> <z> <slot> <count>");
+-                return Flow::Cancel;
++                return Some(1);
+             };
+-            if !reach(host, event.source, pos) {
++            if !reach(host, source, pos) {
+                 say(host, "That chest is out of reach.");
+-                return Flow::Cancel;
++                return Some(1);
+             }
+             let (Ok(slot), Ok(count)) = (usize::try_from(slot), u32::try_from(count)) else {
+                 say(host, "The slot and count must be positive integers.");
+-                return Flow::Cancel;
++                return Some(1);
+             };
+             let Some(frequency) = chest_frequency(host, pos) else {
+                 say(host, "No dimensional chest there.");
+-                return Flow::Cancel;
++                return Some(1);
+             };
+             let stored = {
+                 let guard = core();
+@@ -969,15 +999,15 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
+             };
+             let Some(stored) = stored else {
+                 say(host, "That slot is empty.");
+-                return Flow::Cancel;
++                return Some(1);
+             };
+             let Some(stack) = stored.to_stack(&*host) else {
+                 say(host, "The stored item is not known to this game.");
+-                return Flow::Cancel;
++                return Some(1);
+             };
+-            let Some(player) = source_player(event.source) else {
++            let Some(player) = source_player(source) else {
+                 say(host, "There is no room in the inventory.");
+-                return Flow::Cancel;
++                return Some(1);
+             };
+             if !take_allowed(
+                 player.game_mode(&*host) != Some(GameMode::Spectator),
+@@ -988,18 +1018,18 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
+                     host,
+                     "A spectator cannot withdraw from a dimensional chest.",
+                 );
+-                return Flow::Cancel;
++                return Some(1);
+             }
+             let wanted = count.min(stack.count());
+             let room = room_for(&*host, player, &stack);
+             let give = wanted.min(room);
+             if give == 0 {
+                 say(host, "There is no room in the inventory.");
+-                return Flow::Cancel;
++                return Some(1);
+             }
+             let Some(stack) = ItemStack::new(stack.item(), give) else {
+                 say(host, "There is no room in the inventory.");
+-                return Flow::Cancel;
++                return Some(1);
+             };
+             // The withdrawal is reserved in the authoritative store *before* the items are handed
+             // out, and given back if the hand cannot take them: the old order gave the stack first
+@@ -1016,7 +1046,7 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
+             };
+             let Some(taken) = reserved else {
+                 say(host, "That slot is empty.");
+-                return Flow::Cancel;
++                return Some(1);
+             };
+             if player.give_stack(host, stack).is_err() {
+                 let mut guard = core();
+@@ -1024,7 +1054,7 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
+                 state.store.deposit(&frequency, &taken, MAX_STACK);
+                 state.dirty = true;
+                 say(host, "There is no room in the inventory.");
+-                return Flow::Cancel;
++                return Some(1);
+             }
+             say(host, &format!("Withdrew {give} x {}.", stored.id));
+         }
+@@ -1035,7 +1065,7 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
+             );
+         }
+     }
+-    Flow::Cancel
++    Some(1)
+ }
+ 
+ /// A copy of the store, so a command can try an insert before touching the world.
+@@ -1134,7 +1164,17 @@ fn say(host: &mut dyn ServerHost, line: &str) {
+ /// How many of `stack` fit into the player's main inventory, as `/give` adds them: matching
+ /// stacks first, then empty slots. Zero means a give would have dropped the items.
+ fn room_for(host: &dyn Host, player: PlayerRef, stack: &ItemStack) -> u32 {
+-    let Some(slots) = player.inventory_slots(host) else {
++    let Some(slots) = player.with_inventory(host, |view| {
++        view.iter()
++            .filter(|(slot, _)| *slot < MAIN_SLOTS)
++            .map(|(slot, other)| other.project().map(|other| (slot, other)))
++            .collect::<Option<Vec<(u32, ItemStack)>>>()
++    }) else {
++        return 0;
++    };
++    // A main-inventory stack that cannot be handed to a mod: no room is promised, as when the
++    // whole read failed.
++    let Some(slots) = slots else {
+         return 0;
+     };
+     let max = host.max_stack_size(stack.item()).unwrap_or(MAX_STACK);
+@@ -1155,7 +1195,7 @@ fn room_for(host: &dyn Host, player: PlayerRef, stack: &ItemStack) -> u32 {
+ 
+ /// A stack's identity without its count: the id and its saved compound.
+ fn kind_of(host: &dyn Host, stack: &ItemStack) -> (String, Option<Compound>) {
+-    let id = stack.item().id(host);
++    let id = stack.item().id(host).unwrap_or_default().to_owned();
+     let nbt = stack.to_nbt(host).map(|mut nbt| {
+         nbt.remove(&"count".into());
+         nbt

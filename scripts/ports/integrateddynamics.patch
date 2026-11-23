@@ -1,0 +1,264 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 739e15f..99fa1ec 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -23,7 +23,7 @@ use mod_api::{
+     self, BlockChangedEvent, BlockEntityEvent, BlockEntityPart, BlockEntityTickEvent,
+     BlockEntityTicksEvent, BlockPart, BlockSignalEvent, ChunkUnloadEvent, Flow, Hooks, Host,
+     HostSide, IsSignalSourceEvent, LevelHost, LevelTickPostEvent, LevelUnloadEvent,
+-    RegisterCommandsEvent, Registrar, RegistrationContext, RunModCommandEvent, ServerHost,
++    RegisterCommandsEvent, Registrar, RegistrationContext, ServerHost,
+     UseItemOnEvent,
+ };
+ 
+@@ -87,8 +87,8 @@ impl BlockEntityPart for CableEntity {
+         event.ticks = true;
+     }
+ 
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        support::on_block_entity_tick(host, event);
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        support::on_block_entity_tick(event);
+     }
+ }
+ 
+@@ -142,12 +142,4 @@ impl Hooks for Mod {
+     fn register_commands(&self, host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+         support::on_register_commands(host, event);
+     }
+-
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        support::on_run_mod_command(host, event)
+-    }
+ }
+diff --git a/src/support.rs b/src/support.rs
+index 166a57f..b9aa1b9 100644
+--- a/src/support.rs
++++ b/src/support.rs
+@@ -20,7 +20,7 @@ use mod_api::{
+     BlockChangedEvent, BlockEntityEvent, BlockEntityTickEvent, BlockKey, BlockSignalEvent,
+     BlockState, Command, CommandArgumentValue, CommandInvocation, Compound, Direction, Flow, Host,
+     HostTransaction, InteractionResult, IsSignalSourceEvent, ItemPlace, ItemResource, LevelHost,
+-    LevelRef, LevelSide, LightLayer, NeighbourUpdate, RegisterCommandsEvent, RunModCommandEvent,
++    LevelRef, LevelSide, LightLayer, NeighbourUpdate, RegisterCommandsEvent,
+     ServerHost, Tag, Text, UseItemOnEvent,
+ };
+ 
+@@ -182,7 +182,7 @@ fn parts_at(host: &dyn Host, level: LevelRef, pos: Pos) -> Option<PartSlots> {
+ fn is_cable(host: &dyn Host, level: LevelRef, pos: Pos) -> bool {
+     level
+         .block(host, pos)
+-        .is_some_and(|block| block.id(host) == CABLE)
++        .is_some_and(|block| block.id(host) == Some(CABLE))
+ }
+ 
+ /// The part property of `face` (`part_down` … `part_east`).
+@@ -271,12 +271,12 @@ pub(crate) fn on_block_entity(
+ /// One cable tick: queue the cable for the level tick's end. The tick itself
+ /// writes nothing; the network is recomputed where the block entity is back in
+ /// the world.
+-pub(crate) fn on_block_entity_tick(
+-    host: &mut dyn ServerHost,
+-    event: &mut BlockEntityTickEvent<'_>,
+-) {
+-    let dimension = host.dimension();
+-    with_state(|state| state.queued.insert((dimension, event.pos)));
++pub(crate) fn on_block_entity_tick(event: &mut BlockEntityTickEvent<'_>) {
++    let Some(pos) = event.subject.with_view(|view| view.position()) else {
++        return;
++    };
++    let dimension = event.subject.host().dimension();
++    with_state(|state| state.queued.insert((dimension, pos)));
+ }
+ 
+ /// After the level's tick: recompute every queued cable network. The channel is
+@@ -475,7 +475,7 @@ pub(crate) fn on_use_item_on(
+     let click = event.click;
+     let stack = click.stack?;
+     let held = stack.item().id(host);
+-    let part = match held.as_str() {
++    let part = match held.unwrap_or_default() {
+         crate::READER => Part::Reader,
+         crate::WRITER => Part::Writer,
+         crate::WORLD_READER => Part::WorldReader,
+@@ -533,16 +533,12 @@ pub(crate) fn on_register_commands(
+ ) {
+     event
+         .commands
+-        .push(Command::new("integrateddynamics info <pos:block_pos>"));
+-    event.commands.push(Command::new(
+-        "integrateddynamics part <pos:block_pos> <face:word> <part:word>",
+-    ));
+-    event.commands.push(Command::new(
+-        "integrateddynamics aspect <pos:block_pos> <face:word> <aspect:word>",
+-    ));
++        .push(Command::new("integrateddynamics info <pos:block_pos>").executes(on_run_mod_command));
++    event.commands.push(Command::new("integrateddynamics part <pos:block_pos> <face:word> <part:word>").executes(on_run_mod_command));
++    event.commands.push(Command::new("integrateddynamics aspect <pos:block_pos> <face:word> <aspect:word>").executes(on_run_mod_command));
+     event
+         .commands
+-        .push(Command::new("integrateddynamics probe <pos:block_pos>"));
++        .push(Command::new("integrateddynamics probe <pos:block_pos>").executes(on_run_mod_command));
+ }
+ 
+ /// Run `/integrateddynamics info <x> <y> <z>` (the harness readout: parts,
+@@ -552,35 +548,35 @@ pub(crate) fn on_register_commands(
+ /// Reader's aspect, since `ctl interact` reaches only a visible face and the
+ /// part screen is a gap), or `/integrateddynamics probe <x> <y> <z>` (the
+ /// strongest signal reaching a position).
+-pub(crate) fn on_run_mod_command(
++fn on_run_mod_command(
+     host: &mut dyn ServerHost,
+-    event: &mut RunModCommandEvent<'_>,
+-) -> Flow {
+-    let invocation = event.command;
++    source: &mod_api::CommandSource,
++    invocation: &mod_api::CommandInvocation,
++) -> Option<i32> {
+     let mut literals = invocation.literals.iter().map(String::as_str);
+     if literals.next() != Some("integrateddynamics") {
+-        return Flow::Continue;
++        return None;
+     }
+     let Some(subcommand) = literals.next() else {
+-        return Flow::Continue;
++        return None;
+     };
+-    let Some(dimension) = invocation.dimension.id(host) else {
++    let Some(dimension) = invocation.dimension.id(host).map(str::to_owned) else {
+         reply(host, "Integrated Dynamics: that dimension is not known.");
+-        return Flow::Cancel;
++        return Some(1);
+     };
+     let Some(level) = host.level(&dimension) else {
+         reply(host, "Integrated Dynamics: that dimension is not loaded.");
+-        return Flow::Cancel;
++        return Some(1);
+     };
+     let Some(pos) = block_pos(invocation, "pos") else {
+         reply(host, "Usage: /integrateddynamics <subcommand> <x> <y> <z>");
+-        return Flow::Cancel;
++        return Some(1);
+     };
+     match subcommand {
+         "info" => {
+             let Some(parts) = parts_at(host, level, pos) else {
+                 reply(host, "Integrated Dynamics: no Logic Cable there.");
+-                return Flow::Cancel;
++                return Some(1);
+             };
+             let [x, y, z] = pos;
+             reply(
+@@ -611,26 +607,26 @@ pub(crate) fn on_run_mod_command(
+                     host,
+                     "Integrated Dynamics: unknown face (down|up|north|south|west|east)",
+                 );
+-                return Flow::Cancel;
++                return Some(1);
+             };
+             let Some(part) = word(invocation, "part").and_then(Part::from_name) else {
+                 reply(
+                     host,
+                     "Integrated Dynamics: unknown part (none|reader|writer|world_reader)",
+                 );
+-                return Flow::Cancel;
++                return Some(1);
+             };
+             // This command edits a cable at any loaded coordinates with no part cost: it is a
+             // harness path for a click the test client cannot aim, so it requires the operator
+             // level. An ordinary player places parts with the item (`use_item_on`), which pays
+             // the item and needs reach.
+-            if event.source.permission().level() < 2 {
++            if source.permission().level() < 2 {
+                 reply(
+                     host,
+                     "Integrated Dynamics: /integrateddynamics part needs operator permission; \
+                      place a part by right-clicking the cable with it.",
+                 );
+-                return Flow::Cancel;
++                return Some(1);
+             }
+             // The write helpers act in the level in place, so a part is only set
+             // in the level this command runs in (not through `execute in`).
+@@ -639,7 +635,7 @@ pub(crate) fn on_run_mod_command(
+                     host,
+                     "Integrated Dynamics: run this command in the cable's dimension.",
+                 );
+-                return Flow::Cancel;
++                return Some(1);
+             }
+             let is_cable = level
+                 .block_state(host, pos)
+@@ -647,7 +643,7 @@ pub(crate) fn on_run_mod_command(
+                 .is_some();
+             if !is_cable {
+                 reply(host, "Integrated Dynamics: no Logic Cable there.");
+-                return Flow::Cancel;
++                return Some(1);
+             }
+             if host.set_block_property(pos, &face_property(face), part.name()) {
+                 // A face that changes part starts without an aspect, so a world reader placed
+@@ -674,7 +670,7 @@ pub(crate) fn on_run_mod_command(
+                     host,
+                     "Integrated Dynamics: unknown face (down|up|north|south|west|east)",
+                 );
+-                return Flow::Cancel;
++                return Some(1);
+             };
+             let names: Vec<&str> = WorldAspect::ALL
+                 .iter()
+@@ -685,27 +681,27 @@ pub(crate) fn on_run_mod_command(
+                     host,
+                     &format!("Integrated Dynamics: unknown aspect ({})", names.join("|")),
+                 );
+-                return Flow::Cancel;
++                return Some(1);
+             };
+             // The same harness contract as `/integrateddynamics part`: it configures a
+             // part without its screen, so it needs the operator level.
+-            if event.source.permission().level() < 2 {
++            if source.permission().level() < 2 {
+                 reply(
+                     host,
+                     "Integrated Dynamics: /integrateddynamics aspect needs operator permission.",
+                 );
+-                return Flow::Cancel;
++                return Some(1);
+             }
+             if dimension != host.dimension() {
+                 reply(
+                     host,
+                     "Integrated Dynamics: run this command in the cable's dimension.",
+                 );
+-                return Flow::Cancel;
++                return Some(1);
+             }
+             let Some(parts) = parts_at(host, level, pos) else {
+                 reply(host, "Integrated Dynamics: no Logic Cable there.");
+-                return Flow::Cancel;
++                return Some(1);
+             };
+             if parts.get(face) != Some(Part::WorldReader) {
+                 reply(
+@@ -715,7 +711,7 @@ pub(crate) fn on_run_mod_command(
+                         FACE_NAMES[face]
+                     ),
+                 );
+-                return Flow::Cancel;
++                return Some(1);
+             }
+             let [x, y, z] = pos;
+             if set_aspect(host, level, pos, face, aspect.name()) {
+@@ -744,7 +740,7 @@ pub(crate) fn on_run_mod_command(
+             "Usage: /integrateddynamics info <x> <y> <z> | part <x> <y> <z> <face> <part> | aspect <x> <y> <z> <face> <aspect> | probe <x> <y> <z>",
+         ),
+     }
+-    Flow::Cancel
++    Some(1)
+ }
+ 
+ /// The channel value saved in a cable block entity, 0 when there is none.

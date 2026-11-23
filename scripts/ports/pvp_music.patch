@@ -1,0 +1,76 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 6af5afa..1833f21 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -40,7 +40,8 @@ impl mod_api::Hooks for Mod {
+         for target in event.targets.iter() {
+             let kind = target
+                 .kind(host)
+-                .map(|k| k.id(host))
++                .and_then(|k| k.id(host))
++                .map(|name| name.to_string())
+                 .unwrap_or_else(|| "unknown".to_string());
+             state::record_attack(game_time, kind, target.id());
+         }
+@@ -118,34 +119,37 @@ fn mobs_around(host: &dyn ClientHost, player: &EntityRef) -> Vec<MobFacts> {
+     let Some(level) = player.level(host) else {
+         return Vec::new();
+     };
+-    let Some(list) = level.entities_in(
++    let mut mobs = Vec::new();
++    let visited = level.visit_entities_in(
+         host,
+         [pos[0] - MOB_REACH, pos[1] - MOB_REACH, pos[2] - MOB_REACH],
+         [pos[0] + MOB_REACH, pos[1] + MOB_REACH, pos[2] + MOB_REACH],
+-    ) else {
++        &mut |entity| {
++            if entity.id() == player.id() {
++                return core::ops::ControlFlow::Continue(());
++            }
++            // Living entities only: the state machine cares about health.
++            let Some(living) = living(host, entity) else {
++                return core::ops::ControlFlow::Continue(());
++            };
++            let health = living.health(host).unwrap_or(0.0);
++            let kind = entity
++                .kind(host)
++                .and_then(|k| k.id(host))
++                .map(|name| name.to_string())
++                .unwrap_or_else(|| "unknown".to_string());
++            let position = entity.position(host).unwrap_or([0.0; 3]);
++            mobs.push(MobFacts {
++                id: entity.id(),
++                kind,
++                position,
++                health,
++            });
++            core::ops::ControlFlow::Continue(())
++        },
++    );
++    if visited.is_err() {
+         return Vec::new();
+-    };
+-    let mut mobs = Vec::new();
+-    for entity in list {
+-        if entity.id() == player.id() {
+-            continue;
+-        }
+-        // Living entities only: the state machine cares about health.
+-        let Some(living) = living(host, entity) else {
+-            continue;
+-        };
+-        let health = living.health(host).unwrap_or(0.0);
+-        let kind = entity
+-            .kind(host)
+-            .map(|k| k.id(host))
+-            .unwrap_or_else(|| "unknown".to_string());
+-        let position = entity.position(host).unwrap_or([0.0; 3]);
+-        mobs.push(MobFacts {
+-            id: entity.id(),
+-            kind,
+-            position,
+-            health,
+-        });
+     }
+     mobs
+ }

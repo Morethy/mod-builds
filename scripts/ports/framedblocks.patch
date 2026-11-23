@@ -1,0 +1,172 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 84a0737..1175318 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -17,10 +17,10 @@ use std::sync::Mutex;
+ use mod_api::{
+     self, BlockEntityDrawContext, BlockEntityEvent, BlockEntityPart, BlockEntitySubmitEvent,
+     BlockEntityUpdateTagEvent, BlockKey, BlockPart, BlockState, ClientHost, Command,
+-    CommandArgument, CommandArgumentValue, Compound, CubeFace, Flow, Hand, Hooks, Identifier,
++    CommandArgument, CommandArgumentValue, Compound, CubeFace, Hand, Hooks, Identifier,
+     InteractionResult, ItemPart, ItemStack, LevelRef, LevelSide, LivingRef, LootDropsEvent,
+     OnBlockPlacedByEvent, OnDestroyedByPlayerEvent, PlayerRef, RegisterCommandsEvent, Registrar,
+-    RegistrationContext, RunModCommandEvent, ServerHost, ServerTickEvent, ServerTickPhase, Tag,
++    RegistrationContext, ServerHost, ServerTickEvent, ServerTickPhase, Tag,
+     Text, UseItemOnEvent,
+ };
+ 
+@@ -61,37 +61,10 @@ impl Hooks for Mod {
+     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+         // One usage with an optional trailing state: the readout, and the write that a state
+         // after the position turns it into (an optional argument is what the tree takes last).
+-        event.commands.push(Command::new(
+-            "framedblocks camo <x:integer> <y:integer> <z:integer> [state:text]",
+-        ));
+-    }
+-
+-    /// Answers the readout from the server's block entity, so it proves the camo is stored and
+-    /// not only drawn.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        if event.cancelled || !is_camo_command(&event.command.literals) {
+-            return Flow::Continue;
+-        }
+-        let Some(pos) = camo_position(&event.command.arguments) else {
+-            return Flow::Continue;
+-        };
+-        let Some(dimension) = event.command.dimension.id(host) else {
+-            return Flow::Continue;
+-        };
+-        let Some(level) = host.level(&dimension) else {
+-            return Flow::Continue;
+-        };
+-        let line = match camo_state_argument(&event.command.arguments) {
+-            Some(state) => set_camo(host, level, pos, &state),
+-            None => describe_camo(host, level, pos),
+-        };
+-        // Routed to the command's source, as vanilla's own feedback is.
+-        let _ = host.commands().feedback(Text::literal(line));
+-        Flow::Cancel
++        event.commands.push(
++            Command::new("framedblocks camo <x:integer> <y:integer> <z:integer> [state:text]")
++                .executes(|host, _source, command| run_camo_command(host, command)),
++        );
+     }
+ 
+     /// The camo item a player's break of the frame gives back, beside the frame's own loot.
+@@ -260,7 +233,10 @@ impl ItemPart for FrameItem {
+         let Some(living) = host.living(placer.entity()) else {
+             return;
+         };
+-        let Some(offhand) = living.hand_item(&*host, Hand::Off) else {
++        let Some(offhand) = living
++            .with_hand_item(&*host, Hand::Off, |stack| stack.project())
++            .flatten()
++        else {
+             return;
+         };
+         let Plan::Apply { state, item } = camo_plan(host, Some(&offhand), None) else {
+@@ -275,6 +251,33 @@ impl ItemPart for FrameItem {
+     }
+ }
+ 
++/// Answers the readout from the server's block entity, so it proves the camo is stored and
++/// not only drawn.
++fn run_camo_command(
++    host: &mut dyn ServerHost,
++    command: &mod_api::CommandInvocation,
++) -> Option<i32> {
++    if !is_camo_command(&command.literals) {
++        return None;
++    }
++    let Some(pos) = camo_position(&command.arguments) else {
++        return None;
++    };
++    let Some(dimension) = command.dimension.id(host).map(str::to_owned) else {
++        return None;
++    };
++    let Some(level) = host.level(&dimension) else {
++        return None;
++    };
++    let line = match camo_state_argument(&command.arguments) {
++        Some(state) => set_camo(host, level, pos, &state),
++        None => describe_camo(host, level, pos),
++    };
++    // Routed to the command's source, as vanilla's own feedback is.
++    let _ = host.commands().feedback(Text::literal(line));
++    Some(1)
++}
++
+ /// What the glue does with a click, in owned strings: [`runtime::camo_action`] borrows its
+ /// inputs, and a camo state is a fresh string from the registry.
+ enum Plan {
+@@ -293,7 +296,7 @@ fn camo_plan(host: &dyn ServerHost, stack: Option<&ItemStack>, camo: Option<&str
+     let Some(stack) = stack else {
+         return Plan::None;
+     };
+-    let item_id = stack.item().id(host);
++    let item_id = stack.item().id(host).unwrap_or_default();
+     if item_id == FRAMED_HAMMER {
+         return match runtime::camo_action(Held::Hammer, camo) {
+             CamoAction::Remove => Plan::Remove,
+@@ -308,10 +311,10 @@ fn camo_plan(host: &dyn ServerHost, stack: Option<&ItemStack>, camo: Option<&str
+     let Some(block_key) = host.item_block(stack.item()) else {
+         return Plan::None;
+     };
+-    let block_id = block_key.id(host);
++    let block_id = block_key.id(host).unwrap_or_default();
+     let held = Held::BlockItem {
+-        block: &block_id,
+-        item: &item_id,
++        block: block_id,
++        item: item_id,
+     };
+     // A camo set before this slice was a bare block id, which is still a state (the block's
+     // default), so the rules test the block part of whatever is stored.
+@@ -331,7 +334,7 @@ fn camo_plan(host: &dyn ServerHost, stack: Option<&ItemStack>, camo: Option<&str
+ fn default_state(host: &dyn ServerHost, block: BlockKey) -> String {
+     host.block_state_default(block)
+         .and_then(|state| host.block_state_string(state))
+-        .unwrap_or_else(|| block.id(host))
++        .unwrap_or_else(|| block.id(host).unwrap_or_default().to_owned())
+ }
+ 
+ /// The literal path of `/framedblocks camo`, without its arguments.
+@@ -383,8 +386,9 @@ fn set_camo(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3], state: &s
+     let item = host
+         .block_key(camo.block())
+         .and_then(|block| host.block_item(block))
+-        .map(|item| item.id(host))
+-        .unwrap_or_default();
++        .and_then(|item| item.id(host))
++        .unwrap_or_default()
++        .to_owned();
+     if !write_camo(host, level, pos, &canonical, &item) {
+         return format!("framedblocks camo {x} {y} {z} = no framed block there");
+     }
+@@ -399,7 +403,7 @@ fn describe_camo(host: &dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> Strin
+     };
+     let ours = entity
+         .kind(host)
+-        .is_some_and(|kind| kind.id(host) == FRAMED_CUBE);
++        .is_some_and(|kind| kind.id(host).as_deref() == Some(FRAMED_CUBE));
+     if !ours {
+         return format!("framedblocks camo {x} {y} {z} = another block entity");
+     }
+@@ -526,10 +530,11 @@ fn consume_one(
+ /// `Inventory.add`: the camo item goes into a free main-inventory slot, and the camo stays when
+ /// there is none (`AbstractBlockCamoContainerFactory.removeCamo`).
+ fn give_back(host: &mut dyn ServerHost, player: PlayerRef, stack: ItemStack) -> bool {
+-    let Some(slots) = player.inventory_slots(&*host) else {
++    let Some(occupied) = player.with_inventory(&*host, |view| {
++        view.iter().map(|(slot, _)| slot).collect::<Vec<u32>>()
++    }) else {
+         return false;
+     };
+-    let occupied: Vec<u32> = slots.into_iter().map(|(slot, _)| slot).collect();
+     let Some(slot) = free_main_slot(&occupied) else {
+         return false;
+     };

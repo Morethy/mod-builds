@@ -1,0 +1,108 @@
+diff --git a/src/glue.rs b/src/glue.rs
+index d81135f..c47a6c3 100644
+--- a/src/glue.rs
++++ b/src/glue.rs
+@@ -125,7 +125,7 @@ pub(crate) fn stored(stack: &ItemStack) -> StoredTime {
+ 
+ /// Writes the account into the stack's component, as upstream's
+ /// `StoredTimeComponent` (one `{stored, total}` compound).
+-pub(crate) fn set_stored(stack: &mut ItemStack, time: StoredTime) -> bool {
++pub(crate) fn set_stored(stack: &mut mod_api::ItemComponentEditor<'_>, time: StoredTime) -> bool {
+     let mut data = Compound::new();
+     data.insert("stored".into(), Tag::Int(time.stored));
+     data.insert("total".into(), Tag::Int(time.total));
+@@ -157,7 +157,9 @@ pub(crate) fn account_in_slot(
+     player: u128,
+     slot: i32,
+ ) -> Option<StoredTime> {
+-    let stack = ItemPlace::PlayerSlot { player, slot }.stack(host)?;
++    let stack = ItemPlace::PlayerSlot { player, slot }
++        .with_stack(host, |stack| stack.project())
++        .flatten()?;
+     Some(stored(&stack))
+ }
+ 
+@@ -174,7 +176,7 @@ pub(crate) fn store_in_slot(
+         let wrote = place.edit(host, tx, |stack| {
+             set_stored(stack, time);
+         });
+-        Ok::<bool, ()>(wrote)
++        Ok::<bool, ()>(wrote.is_ok())
+     })
+     .unwrap_or(false)
+ }
+@@ -219,7 +221,7 @@ pub(crate) fn family_at(
+     pos: [i32; 3],
+ ) -> Option<Family> {
+     let block = level.block(host, pos)?;
+-    crate::runtime::accelerated_family(&block.id(&*host))
++    crate::runtime::accelerated_family(block.id(&*host).unwrap_or_default())
+ }
+ 
+ /// Whether the block at `pos` is in `#tiab:un_acceleratable`.
+diff --git a/src/lib.rs b/src/lib.rs
+index 38e3f52..471a0a7 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -113,7 +113,7 @@ impl Hooks for Mod {
+     /// Before content loads: declare the bottle's `tiab:stored_time` component,
+     /// which the carried item names as a default.
+     fn component_types(&self, _context: &RegistrationContext, event: &mut ComponentTypesEvent<'_>) {
+-        event.types.push(STORED_TIME.to_owned());
++        event.register(STORED_TIME.into());
+     }
+ 
+     /// The bottle's registry key and the Part that hears its own moments.
+@@ -126,17 +126,25 @@ impl Hooks for Mod {
+     /// `/tiab time add|remove <player> <seconds>` (upstream's permission level
+     /// 2) and `/tiab info <x> <y> <z> <n>`, the harness readout.
+     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+-        event.commands.push(Command::op(
+-            "tiab time add <player:player> <seconds:integer>",
+-            glue::PERMISSION,
+-        ));
+-        event.commands.push(Command::op(
+-            "tiab time remove <player:player> <seconds:integer>",
+-            glue::PERMISSION,
+-        ));
++        // The bodies run in `player_command`, before the dispatcher; the usages only declare
++        // the tree, so their executors answer failure as an unhandled usage did.
++        event.commands.push(
++            Command::op(
++                "tiab time add <player:player> <seconds:integer>",
++                glue::PERMISSION,
++            )
++            .executes(|_, _, _| None),
++        );
++        event.commands.push(
++            Command::op(
++                "tiab time remove <player:player> <seconds:integer>",
++                glue::PERMISSION,
++            )
++            .executes(|_, _, _| None),
++        );
+         event
+             .commands
+-            .push(Command::new("tiab info <pos:block_pos> <n:integer>"));
++            .push(Command::new("tiab info <pos:block_pos> <n:integer>").executes(|_, _, _| None));
+     }
+ 
+     /// The command bodies. The API has no inventory write for another player,
+@@ -266,7 +274,7 @@ impl Hooks for Mod {
+         // this port can drive are the furnace's and the campfire's timers (notes.md gap 2).
+         let acceleratable = level
+             .block(&*host, pos)
+-            .is_some_and(|block| accelerated_family(&block.id(&*host)).is_some());
++            .is_some_and(|block| accelerated_family(block.id(&*host).unwrap_or_default()).is_some());
+         if !acceleratable || un_acceleratable(host, level, pos) {
+             return Flow::Continue;
+         }
+@@ -279,7 +287,7 @@ impl Hooks for Mod {
+             player: uuid,
+             hand: event.click.hand,
+         };
+-        let Some(held) = place.stack(host) else {
++        let Some(held) = place.with_stack(host, |stack| stack.project()).flatten() else {
+             return Flow::Continue;
+         };
+         let time = stored(&held);

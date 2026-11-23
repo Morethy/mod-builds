@@ -1,0 +1,156 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index e7d3687..875bd3a 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -20,8 +20,8 @@ pub mod runtime;
+ pub mod support;
+ 
+ use mod_api::{
+-    self, ClientHost, ClientLevelLoadEvent, Flow, Hooks, MusicEvent, MusicLayersEvent,
+-    RegisterCommandsEvent, Registrar, RegistrationContext, RunModCommandEvent, ServerHost,
++    self, ClientHost, ClientLevelLoadEvent, Hooks, MusicEvent, MusicLayersEvent,
++    RegisterCommandsEvent, Registrar, RegistrationContext, ServerHost,
+ };
+ 
+ /// The mod keeps its state in `support`'s statics, which outlive this value.
+@@ -58,13 +58,4 @@ impl Hooks for Mod {
+     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+         support::declare_commands(event.commands);
+     }
+-
+-    /// A player ran one of the commands above: answer it and take it.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        support::run_command(host, event)
+-    }
+ }
+diff --git a/src/support.rs b/src/support.rs
+index 5720006..f062b8d 100644
+--- a/src/support.rs
++++ b/src/support.rs
+@@ -14,7 +14,6 @@ use std::sync::atomic::Ordering;
+ use mod_api::ClientHost;
+ use mod_api::Command;
+ use mod_api::CommandArgumentValue;
+-use mod_api::Flow;
+ use mod_api::Heightmap;
+ use mod_api::Host;
+ use mod_api::LevelRef;
+@@ -22,7 +21,8 @@ use mod_api::MusicEvent;
+ use mod_api::MusicLayer;
+ use mod_api::MusicLayersEvent;
+ use mod_api::Registrar;
+-use mod_api::RunModCommandEvent;
++use mod_api::CommandInvocation;
++use mod_api::CommandRegistration;
+ use mod_api::ServerHost;
+ use mod_api::SettingSpec;
+ use mod_api::Text;
+@@ -188,7 +188,7 @@ pub fn declare_settings(registrar: &mut dyn Registrar) {
+ fn is_air(host: &dyn ClientHost, level: LevelRef, pos: [i32; 3]) -> bool {
+     level.block(host, pos).is_some_and(|block| {
+         matches!(
+-            block.id(host).as_str(),
++            block.id(host).unwrap_or_default(),
+             "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+         )
+     })
+@@ -403,45 +403,57 @@ pub fn status_line() -> String {
+ /// able to do any of that, so the server refuses them below game-master permission. The
+ /// engine itself is not upstream gameplay either: its own controls are its config GUI, which
+ /// is not ported.
+-pub fn declare_commands(commands: &mut Vec<Command>) {
++pub fn declare_commands(commands: &mut Vec<CommandRegistration>) {
+     // The optional tag is what 0.1.0's handler read off the raw line; a typed
+     // command has to declare it or the word never reaches the handler.
+-    commands.push(Command::op("ambientsounds status [tag:word]", 2));
+-    commands.push(Command::op("ambientsounds engine <state:word>", 2));
+-    commands.push(Command::op("ambientsounds volume <value:word>", 2));
+-    commands.push(Command::op("ambientsounds rescan", 2));
++    commands.push(
++        Command::op("ambientsounds status [tag:word]", 2)
++            .executes(|host, _source, command| run_command(host, command)),
++    );
++    commands.push(
++        Command::op("ambientsounds engine <state:word>", 2)
++            .executes(|host, _source, command| run_command(host, command)),
++    );
++    commands.push(
++        Command::op("ambientsounds volume <value:word>", 2)
++            .executes(|host, _source, command| run_command(host, command)),
++    );
++    commands.push(
++        Command::op("ambientsounds rescan", 2)
++            .executes(|host, _source, command| run_command(host, command)),
++    );
+ }
+ 
+ /// A `word` argument of the invocation.
+-fn argument<'a>(event: &'a RunModCommandEvent<'_>, name: &str) -> Option<&'a str> {
+-    match event.command.argument(name) {
++fn argument<'a>(command: &'a CommandInvocation, name: &str) -> Option<&'a str> {
++    match command.argument(name) {
+         Some(CommandArgumentValue::String(word)) => Some(word.as_str()),
+         _ => None,
+     }
+ }
+ 
+ /// `/ambientsounds ...`: answer the harness and take the command.
+-pub fn run_command(host: &mut dyn ServerHost, event: &RunModCommandEvent<'_>) -> Flow {
+-    if event.command.literals.first().map(String::as_str) != Some(MOD_ID) {
+-        return Flow::Continue;
++pub fn run_command(host: &mut dyn ServerHost, command: &CommandInvocation) -> Option<i32> {
++    if command.literals.first().map(String::as_str) != Some(MOD_ID) {
++        return None;
+     }
+-    let Some(subcommand) = event.command.literals.get(1).map(String::as_str) else {
+-        return Flow::Continue;
++    let Some(subcommand) = command.literals.get(1).map(String::as_str) else {
++        return None;
+     };
+     match subcommand {
+         "status" => {
+             // `status <tag>` echoes the tag back, so a caller reading the chat
+             // window can tell its own reply from an earlier one.
+-            let tag = argument(event, "tag").unwrap_or("-");
++            let tag = argument(command, "tag").unwrap_or("-");
+             let line = format!("{} seq={tag}", status_line());
+             let _ = host.commands().feedback(Text::literal(line));
+         }
+         "engine" => {
+-            let Some(on) = argument(event, "state").and_then(engine_setting) else {
++            let Some(on) = argument(command, "state").and_then(engine_setting) else {
+                 let _ = host
+                     .commands()
+                     .feedback(Text::literal("usage: /ambientsounds engine <on|off>"));
+-                return Flow::Cancel;
++                return Some(1);
+             };
+             engine().set_enabled(on);
+             host.set_setting(MOD_ID, "engine", if on { "true" } else { "false" });
+@@ -451,11 +463,11 @@ pub fn run_command(host: &mut dyn ServerHost, event: &RunModCommandEvent<'_>) ->
+             )));
+         }
+         "volume" => {
+-            let Some(volume) = argument(event, "value").and_then(volume_setting) else {
++            let Some(volume) = argument(command, "value").and_then(volume_setting) else {
+                 let _ = host
+                     .commands()
+                     .feedback(Text::literal("usage: /ambientsounds volume <0..1>"));
+-                return Flow::Cancel;
++                return Some(1);
+             };
+             engine().set_volume(volume);
+             host.set_setting(MOD_ID, "volume", &format!("{volume:.2}"));
+@@ -478,7 +490,7 @@ pub fn run_command(host: &mut dyn ServerHost, event: &RunModCommandEvent<'_>) ->
+             )));
+         }
+     }
+-    Flow::Cancel
++    Some(1)
+ }
+ 
+ #[cfg(test)]

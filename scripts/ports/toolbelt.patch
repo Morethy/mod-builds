@@ -1,0 +1,402 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index da3f961..19e0493 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -19,8 +19,8 @@ use mod_api::{
+     self, AnvilUpdateEvent, Command, CommandArgumentValue, CommandInvocation, CommandSource,
+     Component, ComponentTypesEvent, ENTITY_ITEMS, Flow, Hand, Hooks, HostSide, HostTransaction,
+     InteractionResult, ItemPart, ItemPlace, ItemResource, ItemStack, MenuClickedEvent,
+-    MenuClosedEvent, MenuReplace, PlayerRef, RegisterCommandsEvent, Registrar, RegistrationContext,
+-    RightClickBlockEvent, RunModCommandEvent, ServerHost, ServerTickEvent, ServerTickPhase, Tag,
++    MenuClosedEvent, MenuPart, MenuReplace, PlayerRef, RegisterCommandsEvent, Registrar, RegistrationContext,
++    RightClickBlockEvent, ServerHost, ServerTickEvent, ServerTickPhase, Tag,
+     Text, UseItemEvent,
+ };
+ 
+@@ -225,6 +225,14 @@ impl Hooks for Mod {
+         // The pouch is the anvil's upgrade material: plain content this package
+         // carries, so its key is requested here and validated with the belt's.
+         registrar.item_key(POUCH_ITEM);
++        // The belt's menu is the one-row menu `open_menu` opens; a click in another mod's is
++        // no open belt of ours (the window is checked).
++        registrar.menu_part(
++            "minecraft:generic_9x1",
++            BeltClicks {
++                state: Arc::clone(&self.state),
++            },
++        );
+     }
+ 
+     /// A belt in an anvil's left slot with a pouch in the right one becomes a
+@@ -271,9 +279,7 @@ impl Hooks for Mod {
+     /// components.
+     fn component_types(&self, _context: &RegistrationContext, event: &mut ComponentTypesEvent<'_>) {
+         for id in [BELT_SIZE, BELT_CONTENTS] {
+-            if !event.types.iter().any(|known| known == id) {
+-                event.types.push(id.to_owned());
+-            }
++            event.register(id.to_owned());
+         }
+     }
+ 
+@@ -305,37 +311,69 @@ impl Hooks for Mod {
+         }
+     }
+ 
++    /// The belt menu closed (or another menu replaced it): forget its state.
++    fn menu_closed(&self, _host: &mut dyn ServerHost, event: &mut MenuClosedEvent) {
++        locked(&self.state).forget_open(event.uuid, event.window);
++    }
++
++    /// Declares `/toolbelt put|take|info|menu|help`, at game-master level as the
++    /// retired slice declared them.
++    fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
++        for usage in [
++            format!("{ROOT} put <item:item> [count:integer]"),
++            format!("{ROOT} take <slot:integer> [count:integer]"),
++            format!("{ROOT} info"),
++            format!("{ROOT} menu"),
++            format!("{ROOT} help"),
++        ] {
++            let state = Arc::clone(&self.state);
++            event.commands.push(
++                Command::op(&usage, 2).executes(move |host, source, command| {
++                    run_command(host, &state, source, command)
++                }),
++            );
++        }
++    }
++}
++
++/// The clicks of an open belt menu.
++struct BeltClicks {
++    state: Arc<Mutex<State>>,
++}
++
++#[mod_api::sunrise_part]
++impl MenuPart for BeltClicks {
+     /// A click in an open belt menu: that belt slot's stack goes to the player,
+     /// and only what the player's inventory actually took leaves the belt.
+-    fn menu_clicked(&self, host: &mut dyn ServerHost, event: &mut MenuClickedEvent) {
++    fn menu_clicked(&self, host: &mut dyn ServerHost, event: &mut MenuClickedEvent<'_>) -> Flow {
+         let Some(open) = locked(&self.state).open_of(event.uuid) else {
+-            return;
++            return Flow::Continue;
+         };
+         if open.window != event.window {
+-            return;
++            return Flow::Continue;
+         }
+         let Some(index) = belt_slot(event.slot, open.size) else {
+-            return;
++            return Flow::Continue;
+         };
+         let Ok(belt_slot) = i32::try_from(open.slot) else {
+-            return;
++            return Flow::Continue;
+         };
+         let Some(player) = host.player(event.uuid) else {
+-            return;
++            return Flow::Continue;
+         };
+         let Some(belt) = inventory_stack(host, player, open.slot) else {
+-            return;
++            return Flow::Continue;
+         };
+         if !is_belt(&*host, &belt) {
+-            return;
++            return Flow::Continue;
+         }
+         let mut slots = read_slots(&*host, &belt, open.size);
+         let Some(offered) = slots.get(index).cloned().flatten() else {
+-            return;
++            return Flow::Continue;
+         };
+         let placed = give_to_player(host, player, &offered);
+         if placed == 0 {
+-            return;
++            return Flow::Continue;
+         }
+         take_slot(&mut slots, index, placed);
+         let place = ItemPlace::PlayerSlot {
+@@ -348,67 +386,50 @@ impl Hooks for Mod {
+             // The game refused the belt write, so the player has the tool and
+             // the belt still holds it: take it back rather than duplicate it.
+             take_from_player(host, player, &offered, placed);
+-            return;
++            return Flow::Continue;
+         }
+         refresh_menu(host, &self.state, event.uuid, open);
++        Flow::Continue
+     }
++}
+ 
+-    /// The belt menu closed (or another menu replaced it): forget its state.
+-    fn menu_closed(&self, _host: &mut dyn ServerHost, event: &mut MenuClosedEvent) {
+-        locked(&self.state).forget_open(event.uuid, event.window);
+-    }
+-
+-    /// Declares `/toolbelt put|take|info|menu|help`, at game-master level as the
+-    /// retired slice declared them.
+-    fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+-        for usage in [
+-            format!("{ROOT} put <item:item> [count:integer]"),
+-            format!("{ROOT} take <slot:integer> [count:integer]"),
+-            format!("{ROOT} info"),
+-            format!("{ROOT} menu"),
+-            format!("{ROOT} help"),
+-        ] {
+-            event.commands.push(Command::op(&usage, 2));
+-        }
+-    }
+-
+-    /// Runs a `/toolbelt` usage for the player who typed it. The dispatcher has
+-    /// already parsed and resolved the arguments, so this reads them typed
+-    /// instead of re-parsing a line.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        let CommandSource::Player { player, .. } = *event.source else {
+-            return Flow::Continue;
+-        };
+-        let Some(action) = action_of(event.command, &*host) else {
+-            return Flow::Continue;
+-        };
+-        let lines = match action {
+-            Action::Help => HELP.iter().map(|line| (*line).to_owned()).collect(),
+-            Action::Info => vec![info_line(host, player)],
+-            Action::Menu => {
+-                let slot = held_slot(host, player);
+-                let opened = open_menu(host, &self.state, player, slot);
+-                vec![
+-                    if opened {
+-                        "Tool Belt menu opened."
+-                    } else {
+-                        "Hold the belt first."
+-                    }
+-                    .to_owned(),
+-                ]
+-            }
+-            Action::Put { item, count } => vec![put(host, player, &item, count)],
+-            Action::Take { slot, count } => vec![take(host, player, slot, count)],
+-        };
+-        for line in lines {
+-            let _ = player.tell(host, Text::literal(line));
++/// Runs a `/toolbelt` usage for the player who typed it. The dispatcher has
++/// already parsed and resolved the arguments, so this reads them typed
++/// instead of re-parsing a line.
++fn run_command(
++    host: &mut dyn ServerHost,
++    state: &Mutex<State>,
++    source: &CommandSource,
++    command: &CommandInvocation,
++) -> Option<i32> {
++    let CommandSource::Player { player, .. } = *source else {
++        return None;
++    };
++    let Some(action) = action_of(command, &*host) else {
++        return None;
++    };
++    let lines = match action {
++        Action::Help => HELP.iter().map(|line| (*line).to_owned()).collect(),
++        Action::Info => vec![info_line(host, player)],
++        Action::Menu => {
++            let slot = held_slot(host, player);
++            let opened = open_menu(host, state, player, slot);
++            vec![
++                if opened {
++                    "Tool Belt menu opened."
++                } else {
++                    "Hold the belt first."
++                }
++                .to_owned(),
++            ]
+         }
+-        Flow::Cancel
++        Action::Put { item, count } => vec![put(host, player, &item, count)],
++        Action::Take { slot, count } => vec![take(host, player, slot, count)],
++    };
++    for line in lines {
++        let _ = player.tell(host, Text::literal(line));
+     }
++    Some(1)
+ }
+ 
+ /// The belt's own item part: what a right click with the belt does.
+@@ -471,7 +492,7 @@ fn clicked(
+ 
+ /// Whether `stack` is the belt.
+ fn is_belt(host: &dyn mod_api::Host, stack: &ItemStack) -> bool {
+-    stack.item().id(host) == BELT_ITEM
++    stack.item().id(host) == Some(BELT_ITEM)
+ }
+ 
+ /// An item's own stack limit, with a refused read reading as vanilla's 64.
+@@ -492,7 +513,7 @@ fn belt_size(belt: &ItemStack) -> u8 {
+ /// stacks only merge when item, damage and components all agree).
+ fn describe(host: &dyn mod_api::Host, stack: &ItemStack) -> BeltStack {
+     BeltStack {
+-        item: stack.item().id(host),
++        item: stack.item().id(host).unwrap_or_default().to_owned(),
+         count: stack.count(),
+         max_stack: max_stack(host, stack.item()),
+         variant: variant_of(stack),
+@@ -521,29 +542,29 @@ fn allowed(host: &dyn mod_api::Host, stack: &ItemStack) -> bool {
+ /// and vanilla's result (none for those inputs) is replaced by it. A belt already
+ /// at nine slots is cancelled, so the anvil offers nothing, as upstream does.
+ fn anvil_upgrade(host: &dyn mod_api::Host, event: &mut AnvilUpdateEvent<'_>) -> Flow {
+-    let update = &mut *event.update;
+-    if !is_belt(host, &update.left) {
++    let inputs = event.inputs;
++    if !is_belt(host, inputs.left) {
+         return Flow::Continue;
+     }
+-    let Some(right) = update.right.as_ref() else {
++    let Some(right) = inputs.right else {
+         return Flow::Continue;
+     };
+-    if !is_upgrade_material(&right.item().id(host)) {
++    if !is_upgrade_material(right.item().id(host).unwrap_or_default()) {
+         return Flow::Continue;
+     }
+-    let size = belt_size(&update.left);
++    let size = belt_size(inputs.left);
+     let (Some(cost), Some(next)) = (upgrade_cost(size), upgraded_size(size)) else {
+         return Flow::Cancel;
+     };
+     // The upgraded stack is the input itself with a larger size: the stored
+     // slots stay where they are, which is exactly what growing keeps.
+-    let mut upgraded = update.left.clone();
++    let mut upgraded = inputs.left.clone();
+     if upgraded.set(&SizeComponent, i32::from(next)).is_err() {
+         return Flow::Continue;
+     }
+-    update.output = Some(upgraded);
+-    update.xp_cost = cost;
+-    update.material_cost = 1;
++    event.edits.output = mod_api::item::menu::StackResult::Set(Some(upgraded));
++    event.edits.xp_cost = cost;
++    event.edits.material_cost = 1;
+     Flow::Continue
+ }
+ 
+@@ -552,7 +573,7 @@ fn anvil_upgrade(host: &dyn mod_api::Host, event: &mut AnvilUpdateEvent<'_>) ->
+ /// patch. Such a stack never enters a belt: Horizon lets a belt sit in a shulker box, so accepting
+ /// a box as "non-stackable" would let a player build unbounded belt-box-belt nesting.
+ fn carries_a_container(host: &dyn mod_api::Host, stack: &ItemStack) -> bool {
+-    let id = stack.item().id(host);
++    let id = stack.item().id(host).unwrap_or_default();
+     id.ends_with("_shulker_box")
+         || id == BUNDLE_ITEM
+         || host
+@@ -753,10 +774,8 @@ fn held_slot(host: &mut dyn ServerHost, player: PlayerRef) -> usize {
+ fn inventory_stack(host: &mut dyn ServerHost, player: PlayerRef, slot: usize) -> Option<ItemStack> {
+     let wanted = u32::try_from(slot).ok()?;
+     player
+-        .inventory_slots(&*host)?
+-        .into_iter()
+-        .find(|(index, _)| *index == wanted)
+-        .map(|(_, stack)| stack)
++        .with_inventory(&*host, |view| view.get(wanted).and_then(|stack| stack.project()))
++        .flatten()
+ }
+ 
+ /// Whether the player is sneaking (`Player.isSecondaryUseActive`).
+@@ -766,7 +785,9 @@ fn sneaking(host: &mut dyn ServerHost, player: PlayerRef) -> bool {
+ 
+ /// A player's stack in one hand.
+ fn hand_item(host: &mut dyn ServerHost, player: PlayerRef, hand: Hand) -> Option<ItemStack> {
+-    host.living(player.entity())?.hand_item(&*host, hand)
++    host.living(player.entity())?
++        .with_hand_item(&*host, hand, |stack| stack.project())
++        .flatten()
+ }
+ 
+ /// Writes a player's hand: the game's own equip write, so the client is told as
+@@ -810,7 +831,7 @@ fn give_to_player(host: &mut dyn ServerHost, player: PlayerRef, stack: &ItemStac
+             if moved >= asked {
+                 break;
+             }
+-            moved += handler.insert(host, tx, index, &resource, asked - moved);
++            moved += handler.insert_at(host, tx, index, &resource, asked - moved);
+         }
+         Ok::<u32, ()>(moved)
+     })
+@@ -835,7 +856,7 @@ fn take_from_player(
+             if moved >= amount {
+                 break;
+             }
+-            moved += handler.extract(host, tx, index, &resource, amount - moved);
++            moved += handler.extract_at(host, tx, index, &resource, amount - moved);
+         }
+         Ok::<u32, ()>(moved)
+     })
+@@ -875,7 +896,8 @@ fn write_at(host: &mut dyn ServerHost, place: &ItemPlace, built: ItemStack) -> b
+             if let Some(entries) = entries {
+                 let _ = stack.set(&ContentsComponent, entries);
+             }
+-        }))
++        })
++        .is_ok())
+     })
+     .unwrap_or(false)
+ }
+@@ -1017,7 +1039,9 @@ fn action_of(invocation: &CommandInvocation, host: &dyn mod_api::Host) -> Option
+         Some("put") => {
+             let item = item_argument!(invocation.argument("item")?)?
+                 .item()
+-                .id(host);
++                .id(host)
++                .unwrap_or_default()
++                .to_owned();
+             let count = match invocation.argument("count") {
+                 None => 1,
+                 Some(CommandArgumentValue::Integer(count)) => u32::try_from(*count).unwrap_or(0),
+@@ -1072,7 +1096,11 @@ fn info_line(host: &mut dyn ServerHost, player: PlayerRef) -> String {
+         .filter_map(|(index, stack)| {
+             stack
+                 .as_ref()
+-                .map(|stack| format!("{index}:{}({})", stack.item().id(&*host), stack.count()))
++                .map(|stack| format!(
++                    "{index}:{}({})",
++                    stack.item().id(&*host).unwrap_or_default(),
++                    stack.count()
++                ))
+         })
+         .collect::<Vec<_>>()
+         .join(",");
+@@ -1092,7 +1120,13 @@ fn put(host: &mut dyn ServerHost, player: PlayerRef, item: &str, count: u32) ->
+     if count == 0 {
+         return "Count must be at least 1.".to_owned();
+     }
+-    let places = player.inventory_slots(&*host).unwrap_or_default();
++    let places: Vec<(u32, ItemStack)> = player
++        .with_inventory(&*host, |view| {
++            view.iter()
++                .filter_map(|(slot, stack)| Some((slot, stack.project()?)))
++                .collect()
++        })
++        .unwrap_or_default();
+     let mut belt = belt;
+     let mut remaining = count;
+     let mut taken: Vec<ItemStack> = Vec::new();
+@@ -1100,7 +1134,7 @@ fn put(host: &mut dyn ServerHost, player: PlayerRef, item: &str, count: u32) ->
+         if remaining == 0 {
+             break;
+         }
+-        if stack.item().id(&*host) != item || place_of(*slot).is_none() {
++        if stack.item().id(&*host) != Some(item) || place_of(*slot).is_none() {
+             continue;
+         }
+         let wanted = remaining.min(stack.count());
+@@ -1151,7 +1185,7 @@ fn take(host: &mut dyn ServerHost, player: PlayerRef, slot: usize, count: u32) -
+     let Some(offered) = peek_from(&*host, &belt, slot, count) else {
+         return format!("Belt slot {slot} is empty.");
+     };
+-    let item = offered.item().id(&*host);
++    let item = offered.item().id(&*host).unwrap_or_default().to_owned();
+     let placed = give_to_player(host, player, &offered);
+     if placed == 0 {
+         return format!("No room for {item}; it stays in slot {slot}.");

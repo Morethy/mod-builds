@@ -1,0 +1,156 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index e4daf3a..4def008 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -22,8 +22,8 @@
+ //! another. See `notes.md` gaps 1 and 6.
+ use mod_api::{
+     self, ClientHost, Command, CommandArgument, CommandArgumentValue, CommandSource, Component,
+-    ComponentTypesEvent, Flow, Hand, Hooks, Identifier, ItemPart, ItemStack, PlayerRef,
+-    RegisterCommandsEvent, Registrar, RegistrationContext, RunModCommandEvent, ServerHost, Tag,
++    ComponentTypesEvent, Hand, Hooks, Identifier, ItemPart, ItemStack, PlayerRef,
++    RegisterCommandsEvent, Registrar, RegistrationContext, ServerHost, Tag,
+     Text, TooltipEvent,
+ };
+ 
+@@ -63,7 +63,7 @@ impl Hooks for Mod {
+     /// Registers the item component an assembled gear carries, before content (and so the
+     /// items' stack codecs) loads — `RegisterEvent`, as the retired `component_types` hook did.
+     fn component_types(&self, _context: &RegistrationContext, event: &mut ComponentTypesEvent<'_>) {
+-        event.types.push(COMPONENT.to_owned());
++        event.register(COMPONENT.into());
+     }
+ 
+     /// `/silentgear assemble|stats|help`, at operator level 2 as the retired port declared them.
+@@ -73,41 +73,39 @@ impl Hooks for Mod {
+             "silentgear stats",
+             "silentgear help",
+         ] {
+-            event.commands.push(Command::op(usage, 2));
++            event.commands.push(Command::op(usage, 2).executes(run_command));
+         }
+     }
+ 
+-    /// Runs one of the usages above. The readouts are byte-for-byte the retired port's, so the
+-    /// scenario in `tools/e2e.sh` asserts the same text it always did.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        if event.cancelled {
+-            return Flow::Continue;
+-        }
+-        let action = action_of(&event.command.literals, &event.command.arguments);
+-        if action == Action::Unknown {
+-            return Flow::Continue;
+-        }
+-        let Some(player) = command_player(event.source) else {
+-            let _ = host.commands().feedback(Text::literal(NEEDS_PLAYER));
+-            return Flow::Cancel;
+-        };
+-        let lines: Vec<String> = match action {
+-            Action::Help => help_lines().into_iter().map(str::to_owned).collect(),
+-            Action::Stats => vec![stats_text(&*host, player)],
+-            Action::Assemble { gear, head, rod } => {
+-                vec![assemble_command(host, player, &gear, &head, &rod).unwrap_or_else(|line| line)]
+-            }
+-            Action::Unknown => return Flow::Continue,
+-        };
+-        for line in lines {
+-            let _ = host.commands().feedback(Text::literal(line));
++}
++
++/// Runs one of the usages above: the executor of each. The readouts are byte-for-byte the retired
++/// port's, so the scenario in `tools/e2e.sh` asserts the same text it always did.
++fn run_command(
++    host: &mut dyn ServerHost,
++    source: &CommandSource,
++    command: &mod_api::CommandInvocation,
++) -> Option<i32> {
++    let action = action_of(&command.literals, &command.arguments);
++    if action == Action::Unknown {
++        return None;
++    }
++    let Some(player) = command_player(source) else {
++        let _ = host.commands().feedback(Text::literal(NEEDS_PLAYER));
++        return Some(1);
++    };
++    let lines: Vec<String> = match action {
++        Action::Help => help_lines().into_iter().map(str::to_owned).collect(),
++        Action::Stats => vec![stats_text(&*host, player)],
++        Action::Assemble { gear, head, rod } => {
++            vec![assemble_command(host, player, &gear, &head, &rod).unwrap_or_else(|line| line)]
+         }
+-        Flow::Cancel
++        Action::Unknown => return None,
++    };
++    for line in lines {
++        let _ = host.commands().feedback(Text::literal(line));
+     }
++    Some(1)
+ }
+ 
+ /// `Item.appendHoverText`: the assembled gear's stat line, read from the component on the stack.
+@@ -280,14 +278,16 @@ fn stats_text(host: &dyn ServerHost, player: PlayerRef) -> String {
+     };
+     match gear_record(&held) {
+         Some(record) => stats_line_with_damage(&record, held.damage()),
+-        None => format!("{} is not assembled Silent Gear.", held.item().id(host)),
++        None => format!("{} is not assembled Silent Gear.", held.item().id(host).unwrap_or_default()),
+     }
+ }
+ 
+ /// The stack in the player's main hand.
+ fn held_item(host: &dyn ServerHost, player: PlayerRef) -> Option<ItemStack> {
+     let living = host.living(player.entity())?;
+-    living.hand_item(host, Hand::Main)
++    living
++        .with_hand_item(host, Hand::Main, |stack| stack.project())
++        .flatten()
+ }
+ 
+ /// Builds the pickaxe from the blueprint and the parts in the player's inventory: one of each is
+@@ -375,14 +375,14 @@ fn material_id(short: &str) -> String {
+ 
+ /// The player's main inventory and off hand as `(slot, item id)`.
+ fn carried_items(host: &dyn ServerHost, player: PlayerRef) -> Vec<(u32, String)> {
+-    let Some(slots) = player.inventory_slots(host) else {
+-        return Vec::new();
+-    };
+-    slots
+-        .into_iter()
+-        .filter(|(slot, _)| carried_slot(*slot))
+-        .map(|(slot, stack)| (slot, stack.item().id(host)))
+-        .collect()
++    player
++        .with_inventory(host, |view| {
++            view.iter()
++                .filter(|(slot, _)| carried_slot(*slot))
++                .map(|(slot, stack)| (slot, stack.item().id(host).unwrap_or_default().to_owned()))
++                .collect()
++        })
++        .unwrap_or_default()
+ }
+ 
+ /// Whether `slot` is one the assembly reads: the main inventory (0 to 35) or the off hand (40).
+@@ -405,12 +405,13 @@ fn slot_holding(carried: &[(u32, String)], item: &str) -> Option<u32> {
+ /// Takes one `item` out of the player's inventory: the stack's count drops by one in place, so
+ /// the rest of it stays where it was.
+ fn take_one(host: &mut dyn ServerHost, player: PlayerRef, item: &str) -> Option<ItemStack> {
+-    let slots = player.inventory_slots(&*host)?;
+-    let (slot, stack) = slots
+-        .into_iter()
+-        .filter(|(slot, _)| carried_slot(*slot))
+-        .filter(|(_, stack)| stack.item().id(&*host) == item)
+-        .min_by_key(|(slot, _)| *slot)?;
++    let (slot, stack) = player.with_inventory(&*host, |view| {
++        view.iter()
++            .filter(|(slot, _)| carried_slot(*slot))
++            .filter(|(_, stack)| stack.item().id(&*host) == Some(item))
++            .min_by_key(|(slot, _)| *slot)
++            .and_then(|(slot, stack)| Some((slot, stack.project()?)))
++    })??;
+     let split = stack.split(1);
+     let taken = split.taken?;
+     // A refused write leaves the slot as it was, so nothing was consumed and the caller must not

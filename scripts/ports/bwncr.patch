@@ -1,0 +1,113 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index b39d6f5..755cdc0 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -20,7 +20,7 @@ pub mod support;
+ use mod_api::{
+     self, ClientHost, CommandEvent, ConfigLoadingEvent, ConfigReloadingEvent, Flow, Hooks,
+     HostSide, LoopContext, PlaySoundEvent, RegisterClientCommandsEvent, RegisterCommandsEvent,
+-    RegisterConfigsEvent, RunModCommandEvent, ServerHost,
++    RegisterConfigsEvent, ServerHost,
+ };
+ 
+ /// The hook object: it holds nothing. The switches, the listen switch and the heard names
+@@ -33,12 +33,12 @@ struct Mod;
+ impl Hooks for Mod {
+     /// Declare `config/bwncr-common.toml` (NeoForge's COMMON config for this mod), written
+     /// with upstream's defaults when the file is missing.
+-    fn register_configs(&self, _host: HostSide, event: &mut RegisterConfigsEvent<'_>) {
++    fn register_configs(&self, _host: &dyn mod_api::ConfigContext, event: &mut RegisterConfigsEvent<'_>) {
+         support::register_configs(event);
+     }
+ 
+     /// The file was read: keep its switches.
+-    fn config_loading(&self, _host: HostSide, event: &mut ConfigLoadingEvent<'_>) {
++    fn config_loading(&self, _host: &dyn mod_api::ConfigContext, event: &mut ConfigLoadingEvent<'_>) {
+         support::config_loading(event);
+     }
+ 
+@@ -52,15 +52,6 @@ impl Hooks for Mod {
+         support::declare_commands(event.commands);
+     }
+ 
+-    /// Answer `/bwncr status|check|listen|heard|silence|allow|reload` and take the command.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        support::run_command(host, event)
+-    }
+-
+     /// Declare `/bwncr-listen` and `/bwncr-heard [n]` in this client's own tree: the capture
+     /// switch and the feed are the client's, not the server's.
+     fn register_client_commands(
+diff --git a/src/support.rs b/src/support.rs
+index 6902312..570f393 100644
+--- a/src/support.rs
++++ b/src/support.rs
+@@ -14,7 +14,7 @@ use std::sync::{Mutex, MutexGuard};
+ use mod_api::{
+     Command, CommandArgumentValue, CommandInvocation, Config as ModConfig, ConfigKind,
+     ConfigLoadingEvent, ConfigPath, ConfigReloadingEvent, Flow, PlaySoundEvent,
+-    RegisterConfigsEvent, RunModCommandEvent, ServerHost, Text,
++    RegisterConfigsEvent, ServerHost, Text,
+ };
+ 
+ use crate::runtime::{
+@@ -115,14 +115,14 @@ fn read(mod_id: &str, text: &str) {
+ /// it is this client's, so it lives in the client tree ([`declare_client_commands`]) and a
+ /// guest cannot reach the host's capture. Each usage has no argument kinds beyond the one
+ /// that needs it: a sound name contains `:`, so it is the greedy `text` kind.
+-pub fn declare_commands(commands: &mut Vec<Command>) {
++pub fn declare_commands(commands: &mut Vec<mod_api::CommandRegistration>) {
+     for usage in [
+         "bwncr",
+         "bwncr status",
+         "bwncr check",
+         "bwncr check <sound:text>",
+     ] {
+-        commands.push(Command::new(usage));
++        commands.push(Command::new(usage).executes(|host, _source, command| run_command(host, command)));
+     }
+     for usage in [
+         "bwncr silence",
+@@ -131,7 +131,7 @@ pub fn declare_commands(commands: &mut Vec<Command>) {
+         "bwncr allow <sound:text>",
+         "bwncr reload",
+     ] {
+-        commands.push(Command::op(usage, 2));
++        commands.push(Command::op(usage, 2).executes(|host, _source, command| run_command(host, command)));
+     }
+ }
+ 
+@@ -182,13 +182,12 @@ fn say(host: &mut dyn ServerHost, line: &str) {
+ 
+ /// A player's (or the console's) `/bwncr …`: answer it and take it. `Flow::Continue` for a
+ /// line that is not ours.
+-pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>) -> Flow {
+-    let invocation = event.command;
++pub fn run_command(host: &mut dyn ServerHost, invocation: &CommandInvocation) -> Option<i32> {
+     let Some(root) = invocation.literals.first().map(String::as_str) else {
+-        return Flow::Continue;
++        return None;
+     };
+     if root != MOD_ID {
+-        return Flow::Continue;
++        return None;
+     }
+     let path: Vec<&str> = invocation.literals.iter().map(String::as_str).collect();
+     let line = match path.as_slice() {
+@@ -198,10 +197,10 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
+         ["bwncr", "silence"] => silence(host, sound_argument(invocation).unwrap_or("")),
+         ["bwncr", "allow"] => allow(host, sound_argument(invocation).unwrap_or("")),
+         ["bwncr", "reload"] => reload(host),
+-        _ => return Flow::Continue,
++        _ => return None,
+     };
+     say(host, &line);
+-    Flow::Cancel
++    Some(1)
+ }
+ 
+ fn usage() -> String {

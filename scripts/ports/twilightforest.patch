@@ -1,0 +1,172 @@
+diff --git a/src/dimension.rs b/src/dimension.rs
+index 2e039a0..8904b64 100644
+--- a/src/dimension.rs
++++ b/src/dimension.rs
+@@ -15,7 +15,7 @@ use std::sync::Mutex;
+ 
+ use mod_api::{
+     BiomeSource, ChunkAccess, ChunkGenerator, Command, CommandArgumentValue, DimensionSettings,
+-    Flow, RegisterCommandsEvent, Registrar, RunModCommandEvent, ServerHost, Text,
++    Flow, RegisterCommandsEvent, Registrar, ServerHost, Text,
+ };
+ 
+ use crate::grid::{self, Biome, CARRIED};
+@@ -164,31 +164,36 @@ pub fn register(r: &mut dyn Registrar) {
+ pub fn register_commands(event: &mut RegisterCommandsEvent<'_>) {
+     event
+         .commands
+-        .push(Command::new("twilightforest dimension"));
+-    event.commands.push(Command::new(
+-        "twilightforest dimension <x:integer> <y:integer> <z:integer> <seed:integer>",
+-    ));
++        .push(Command::new("twilightforest dimension").executes(run_command));
++    event.commands.push(
++        Command::new("twilightforest dimension <x:integer> <y:integer> <z:integer> <seed:integer>")
++            .executes(run_command),
++    );
+ }
+ 
+ /// Answer `dimension`, and let every other usage through.
+-pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>) -> Flow {
++pub fn run_command(
++    host: &mut dyn ServerHost,
++    _source: &mod_api::CommandSource,
++    command: &mod_api::CommandInvocation,
++) -> Option<i32> {
+     const NAME: &str = "twilightforest";
+-    if event.command.literals.first().map(String::as_str) != Some(NAME) {
+-        return Flow::Continue;
++    if command.literals.first().map(String::as_str) != Some(NAME) {
++        return None;
+     }
+-    if event.command.literals.get(1).map(String::as_str) != Some("dimension") {
+-        return Flow::Continue;
++    if command.literals.get(1).map(String::as_str) != Some("dimension") {
++        return None;
+     }
+     let (pos, seed) = match (
+-        integer(event.command, "x"),
+-        integer(event.command, "y"),
+-        integer(event.command, "z"),
+-        integer(event.command, "seed"),
++        integer(command, "x"),
++        integer(command, "y"),
++        integer(command, "z"),
++        integer(command, "seed"),
+     ) {
+         (Some(x), Some(y), Some(z), Some(seed)) => ([x, y, z], i64::from(seed)),
+         // No position: the invocation's own, as `/execute positioned` set it.
+         _ => {
+-            let at = event.command.position;
++            let at = command.position;
+             (
+                 [
+                     at[0].floor() as i32,
+@@ -204,7 +209,7 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
+     let key = grid::key_biome(seed, quart[0], quart[2]);
+     let line = grid::status_line(DIMENSION, pos, seed, biome, key);
+     let _ = host.commands().feedback(Text::literal(line));
+-    Flow::Cancel
++    Some(1)
+ }
+ 
+ fn integer(command: &mod_api::CommandInvocation, name: &str) -> Option<i32> {
+diff --git a/src/lib.rs b/src/lib.rs
+index 43cfd04..6f885ee 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -26,7 +26,7 @@ use std::sync::Mutex;
+ use mod_api::{
+     self, AddPackFindersEvent, Flow, Hooks, HostSide, Identifier, PackPosition, PackRegistration,
+     PackType, PlayerTickPostEvent, RegisterCommandsEvent, Registrar, RegistrationContext,
+-    RunModCommandEvent, ServerHost,
++    ServerHost,
+ };
+ 
+ /// The pack's location inside this package: `assets/twilightforest/datapack/` holds a
+@@ -60,7 +60,11 @@ impl Hooks for Mod {
+     /// `assets/twilightforest/datapack/`, a real pack (`pack.mcmeta` + `data/`), registered
+     /// always-active and hidden so it loads in every world without a screen entry. The
+     /// `horizon/` registry declarations stay in the package's own `data/` tree.
+-    fn add_pack_finders(&self, _host: HostSide, event: &mut AddPackFindersEvent<'_>) {
++    fn add_pack_finders(
++        &self,
++        _host: &mut dyn mod_api::PackDiscoveryContext,
++        event: &mut AddPackFindersEvent<'_>,
++    ) {
+         if event.packs.pack_type() != PackType::ServerData {
+             return;
+         }
+@@ -85,15 +89,6 @@ impl Hooks for Mod {
+         dimension::register_commands(event);
+     }
+ 
+-    /// Answer the readout, and let every other usage through.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        dimension::run_command(host, event)
+-    }
+-
+     /// After a player's tick on both logical sides (NeoForge `PlayerTickEvent.Post`): every 20
+     /// ticks, scan 32 blocks around that player for a dropped catalyst standing in a framed pool.
+     ///
+diff --git a/src/portal.rs b/src/portal.rs
+index ea40316..d836140 100644
+--- a/src/portal.rs
++++ b/src/portal.rs
+@@ -65,25 +65,29 @@ pub(crate) fn on_player_tick(
+     let Some([x, y, z]) = player.entity().position(host) else {
+         return;
+     };
+-    let Some(entities) = level.entities_in(
++    // `getEntitiesOfClass(ItemEntity.class, box)`: the box holds every entity kind, so narrow it
++    // to dropped items; another kind is skipped, not a failure.
++    let mut dropped: Vec<(EntityRef, ItemEntityRef)> = Vec::new();
++    let visited = level.visit_entities_in(
+         host,
+         [x - range, y - range, z - range],
+         [x + range, y + range, z + range],
+-    ) else {
++        &mut |entity| {
++            if let Some(item) = host.item_entity(entity) {
++                dropped.push((entity, item));
++            }
++            core::ops::ControlFlow::Continue(())
++        },
++    );
++    if visited.is_err() {
+         return;
+-    };
+-    // `getEntitiesOfClass(ItemEntity.class, box)`: the box holds every entity kind, so narrow it
+-    // to dropped items; another kind is skipped, not a failure.
+-    let dropped: Vec<(EntityRef, ItemEntityRef)> = entities
+-        .into_iter()
+-        .filter_map(|entity| host.item_entity(entity).map(|item| (entity, item)))
+-        .collect();
++    }
+     let dimension = dimension.to_string();
+     for (entity, item) in dropped {
+-        let Some(stack) = item.stack(host) else {
++        let Some(stack) = item.with_stack(host, |stack| stack.project()).flatten() else {
+             continue;
+         };
+-        if !is_activator(&stack.item().id(host)) {
++        if !is_activator(stack.item().id(host).unwrap_or_default()) {
+             continue;
+         }
+         // `entityItem.getOwner() == player`: another player's or a dispenser's drop is not
+@@ -226,7 +230,10 @@ fn edit_rights(
+         } else {
+             0
+         },
+-        spawn: level.respawn_data(view).map(|data| data.pos),
++        spawn: level.respawn_data(view).map(|data| {
++            let pos = data.position.pos();
++            [pos.x, pos.y, pos.z]
++        }),
+         in_overworld: dimension == "minecraft:overworld",
+     }
+ }

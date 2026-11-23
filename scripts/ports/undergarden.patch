@@ -1,0 +1,105 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index be84f42..9ba2ecf 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -13,7 +13,7 @@ pub mod support;
+ 
+ use mod_api::{
+     self, AddPackFindersEvent, Flow, Hooks, HostSide, Identifier, PackPosition, PackRegistration,
+-    PackType, RegisterCommandsEvent, Registrar, RegistrationContext, RunModCommandEvent,
++    PackType, RegisterCommandsEvent, Registrar, RegistrationContext,
+     ServerHost, Text,
+ };
+ 
+@@ -39,7 +39,11 @@ impl Hooks for Mod {
+     /// (`pack.mcmeta` + `data/`), registered always-active and hidden so it loads in every world
+     /// without asking the player to enable it. The `horizon/` registry declarations stay in the
+     /// package's own `data/` tree.
+-    fn add_pack_finders(&self, _host: HostSide, event: &mut AddPackFindersEvent<'_>) {
++    fn add_pack_finders(
++        &self,
++        _host: &mut dyn mod_api::PackDiscoveryContext,
++        event: &mut AddPackFindersEvent<'_>,
++    ) {
+         if event.packs.pack_type() != PackType::ServerData {
+             return;
+         }
+@@ -63,13 +67,4 @@ impl Hooks for Mod {
+     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+         support::declare_commands(event.commands);
+     }
+-
+-    /// Answer `/undergarden status|climate …` and take the command.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        support::run_command(host, event)
+-    }
+ }
+diff --git a/src/support.rs b/src/support.rs
+index adc7ff8..7cad6ee 100644
+--- a/src/support.rs
++++ b/src/support.rs
+@@ -2,8 +2,8 @@
+ 
+ use crate::runtime::{self, Climate, POINTS};
+ use mod_api::{
+-    self, BiomePoint, BiomeSourceKind, Command, DimensionSettings, Flow, Registrar,
+-    RegistrationContext, RunModCommandEvent, ServerHost, Text,
++    self, BiomePoint, BiomeSourceKind, Command, DimensionSettings, Registrar,
++    RegistrationContext, ServerHost, Text,
+ };
+ 
+ /// The mod's id, which is also its resource namespace.
+@@ -79,19 +79,26 @@ pub fn register(r: &mut dyn Registrar, _cx: &RegistrationContext) {
+ }
+ 
+ /// The commands, each usage on its own.
+-pub fn declare_commands(commands: &mut Vec<Command>) {
++pub fn declare_commands(commands: &mut Vec<mod_api::CommandRegistration>) {
+     for usage in ["undergarden", "undergarden status", "undergarden climate"] {
+-        commands.push(Command::new(usage));
++        commands.push(
++            Command::new(usage).executes(|host, _source, command| run_command(host, command)),
++        );
+     }
+-    commands.push(Command::new(
+-        "undergarden climate <continentalness:number> <erosion:number> <humidity:number> \
+-         <temperature:number> <weirdness:number> <depth:number>",
+-    ));
++    commands.push(
++        Command::new(
++            "undergarden climate <continentalness:number> <erosion:number> <humidity:number> \
++             <temperature:number> <weirdness:number> <depth:number>",
++        )
++        .executes(|host, _source, command| run_command(host, command)),
++    );
+ }
+ 
+ /// Answer `/undergarden …` and take it; `Flow::Continue` for a line that is not ours.
+-pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>) -> Flow {
+-    let invocation = event.command;
++pub fn run_command(
++    host: &mut dyn ServerHost,
++    invocation: &mod_api::CommandInvocation,
++) -> Option<i32> {
+     let path: Vec<&str> = invocation.literals.iter().map(String::as_str).collect();
+     let lines = match path.as_slice() {
+         ["undergarden"] => usage(),
+@@ -100,12 +107,12 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
+             Some(climate) => vec![runtime::cell_line(&climate)],
+             None => usage(),
+         },
+-        _ => return Flow::Continue,
++        _ => return None,
+     };
+     for line in lines {
+         let _ = host.commands().feedback(Text::literal(line));
+     }
+-    Flow::Cancel
++    Some(1)
+ }
+ 
+ /// The six numbers of `/undergarden climate`, or none when one is missing or not a number.

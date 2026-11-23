@@ -1,0 +1,93 @@
+diff --git a/src/settings.rs b/src/settings.rs
+index 1300016..92df6b3 100644
+--- a/src/settings.rs
++++ b/src/settings.rs
+@@ -4,7 +4,7 @@
+ use std::sync::{Mutex, OnceLock};
+ 
+ use mod_api::{
+-    ClientHost, Compound, Host, IPayloadContext, LevelRef, PayloadCodec, PayloadId, Registrar, Tag,
++    ClientHost, Compound, Host, IPayloadContext, LevelRef, PayloadId, Registrar, Tag,
+     Text, ToClient, ToServer,
+ };
+ 
+@@ -21,7 +21,7 @@ const MAX_SETTING_DISTANCE: f64 = 6.0;
+ 
+ /// What one torch screen sends when a button changes something, and what the server answers
+ /// with when the screen opens.
+-#[derive(Clone, Debug, PartialEq, Eq, Default, PayloadCodec)]
++#[derive(Clone, Debug, PartialEq, Eq, Default, mod_api::Wire)]
+ pub(super) struct Config {
+     /// 0 = store these values, 1 = ask the server for the values the torch really holds.
+     pub(super) kind: i32,
+diff --git a/src/tier.rs b/src/tier.rs
+index f06af29..ed654ad 100644
+--- a/src/tier.rs
++++ b/src/tier.rs
+@@ -76,7 +76,7 @@ impl Tier {
+ 
+ /// The tier of a block, when it is one of ours.
+ pub(super) fn tier_of(host: &dyn Host, block: BlockKey) -> Option<Tier> {
+-    tier_of_name(&block.id(host))
++    tier_of_name(block.id(host).unwrap_or_default())
+ }
+ 
+ /// The tier a block id names, from the block a hook saw or the one a block entity saved.
+diff --git a/src/torch.rs b/src/torch.rs
+index b24f141..0bb54bd 100644
+--- a/src/torch.rs
++++ b/src/torch.rs
+@@ -2,7 +2,7 @@
+ //! it.
+ 
+ use mod_api::{
+-    BlockEntityEvent, BlockEntityPart, BlockEntityTickEvent, BlockEntityTickReply,
++    BlockEntityEvent, BlockEntityPart, BlockEntityTickEvent,
+     BlockEntityTicksEvent, BlockEntityUpdateTagEvent, BlockPart, Compound, Host, LevelRef,
+     LevelSide, ServerHost, Tag,
+ };
+@@ -42,24 +42,29 @@ impl BlockEntityPart for Torch {
+     /// Each tick, offers every block in range its share of random ticks - 100% is one extra
+     /// random tick per block per tick - and hands them to the level, within the budget all the
+     /// running torches share. Then, now and then, shows a spark in the tier own colour.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        *event.reply = BlockEntityTickReply::Unchanged;
+-        let pos = event.pos;
+-        let data = &event.entity.nbt;
+-        if !flag(data, "active") {
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        let Some((pos, active, speed, reach)) = event.subject.with_view(|view| {
++            let data = view.nbt();
++            // Each number is how far the area reaches out from the torch on that axis, so 1
++            // covers 3x3x3 with the torch in the middle and 27 covers 55x55x55.
++            let reach = [
++                odd_side(int(data, "sx", 1), MAX_REACH),
++                odd_side(int(data, "sy", 1), MAX_REACH),
++                odd_side(int(data, "sz", 1), MAX_REACH),
++            ];
++            (
++                view.position(),
++                flag(data, "active"),
++                int(data, "speed", 100).clamp(0, MAX_SPEED),
++                reach,
++            )
++        }) else {
+             return;
+-        }
+-        let speed = int(data, "speed", 100).clamp(0, MAX_SPEED);
+-        if speed <= 0 {
++        };
++        if !active || speed <= 0 {
+             return;
+         }
+-        // Each number is how far the area reaches out from the torch on that axis, so 1 covers
+-        // 3x3x3 with the torch in the middle and 27 covers 55x55x55.
+-        let reach = [
+-            odd_side(int(data, "sx", 1), MAX_REACH),
+-            odd_side(int(data, "sy", 1), MAX_REACH),
+-            odd_side(int(data, "sz", 1), MAX_REACH),
+-        ];
++        let host = event.subject.host();
+         let Some(level) = host.level(host.dimension()) else {
+             return;
+         };

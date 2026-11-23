@@ -1,0 +1,302 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 067689b..c8bf872 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -15,7 +15,7 @@ use mod_api::{
+     self, BlockEntityPart, BlockEntityRef, BlockEntityTickEvent, BlockEntityTicksEvent, BlockPart,
+     BlockUpdateFlags, Capability, Command, CommandArgumentValue, Compound, Direction, FLUIDS, Flow,
+     FluidResource, FluidStack, Hooks, HostTransaction, InteractionResult, LevelRef, ModFluidTanks,
+-    RegisterCommandsEvent, Registrar, RegistrationContext, ResourceHandler, RunModCommandEvent,
++    RegisterCommandsEvent, Registrar, RegistrationContext, ResourceHandler,
+     ServerHost, Tag, Text, UseWithoutItemEvent,
+ };
+ 
+@@ -163,7 +163,7 @@ fn in_place_level(host: &mut dyn ServerHost) -> Option<LevelRef> {
+ /// The pump block entity at `pos`, if the block there is ours.
+ fn pump_at(host: &mut dyn ServerHost, level: LevelRef, pos: Pos) -> Option<BlockEntityRef> {
+     let block = level.block(host, pos)?;
+-    (block.id(host) == PUMP)
++    (block.id(host) == Some(PUMP))
+         .then(|| host.block_entity(level, pos))
+         .flatten()
+ }
+@@ -252,7 +252,7 @@ fn push_output(host: &mut dyn ServerHost, level: LevelRef, pos: Pos, tank: &Tank
+         let neighbour = [pos[0] + dx, pos[1] + dy, pos[2] + dz];
+         if let Some(handler) = level.capability(host, &FLUIDS, neighbour, Some(face.opposite()))
+             && (0..handler.size(host))
+-                .any(|index| handler.capacity(host, index, &resource) > handler.amount(host, index))
++                .any(|index| handler.capacity(host, index, Some(&resource)) > handler.amount(host, index))
+         {
+             targets.push(handler);
+         }
+@@ -268,7 +268,7 @@ fn push_output(host: &mut dyn ServerHost, level: LevelRef, pos: Pos, tank: &Tank
+     for handler in targets {
+         let went = host
+             .transaction(|host, tx| {
+-                Ok::<u32, ()>(handler.insert_any(host, tx, &resource, share as u32))
++                Ok::<u32, ()>(handler.insert(host, tx, &resource, share as u32).unwrap_or(0))
+             })
+             .unwrap_or(0);
+         moved += went as i32;
+@@ -278,17 +278,25 @@ fn push_output(host: &mut dyn ServerHost, level: LevelRef, pos: Pos, tank: &Tank
+ 
+ /// One server tick of a pump: every `SPEED_TICKS`, advance the scan and drain a still source
+ /// block into the tank; then push the tank into the neighbours.
+-fn pump_tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
++fn pump_tick(event: &mut BlockEntityTickEvent<'_>) {
++    let Some((pos, handle, before)) = event
++        .subject
++        .with_view(|view| (view.position(), view.handle(), view.nbt().clone()))
++    else {
++        return;
++    };
++    let host = event.subject.host();
+     let Some(level) = in_place_level(host) else {
+         return;
+     };
+-    let pos = event.pos;
+-    let max_range = configured_range(&event.entity.nbt);
+-    let ticks = int(&event.entity.nbt, "ticks").unwrap_or(0).max(0) as u32;
++    // The old code runs on a copy of the entity's data; what it changed is written back below.
++    let mut nbt = before.clone();
++    let max_range = configured_range(&nbt);
++    let ticks = int(&nbt, "ticks").unwrap_or(0).max(0) as u32;
+     if ticks.is_multiple_of(SPEED_TICKS)
+         && let Some((min_y, _height)) = level.height(host)
+     {
+-        let mut scan = read_scan(&event.entity.nbt);
++        let mut scan = read_scan(&nbt);
+         // The probe walks a *copy*: a source the tank cannot take must leave the scan where it
+         // was, so the next look retries that block. Advancing first (and saving the advance)
+         // skipped every source behind a full tank for good.
+@@ -297,16 +305,19 @@ fn pump_tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+         // scan in constant time instead of walking 4,206,601 empty columns in one tick.
+         match next.advance(pos, min_y, max_range).pos {
+             Some(target) => {
+-                let block = level.block(host, target).map(|block| block.id(host));
++                let block = level
++                    .block(host, target)
++                    .and_then(|block| block.id(host))
++                    .map(str::to_owned);
+                 let level_property = level.block_property(host, target, "level");
+                 match source_fluid(block.as_deref().unwrap_or(""), level_property.as_deref()) {
+                     None => scan = next,
+                     Some(fluid) => {
+-                        let mut tank = read_tank(&event.entity.nbt);
++                        let mut tank = read_tank(&nbt);
+                         // `insert_bucket` is false when the tank is full or holds another
+                         // fluid; the source stays in the world and the scan waits.
+                         if tank.insert_bucket(fluid) {
+-                            write_tank(&mut event.entity.nbt, &tank);
++                            write_tank(&mut nbt, &tank);
+                             replace_source(host, level, target);
+                             scan = next;
+                         }
+@@ -316,23 +327,43 @@ fn pump_tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+             // The scan is finished: keep that, or it would start over.
+             None => scan = next,
+         }
+-        write_scan(&mut event.entity.nbt, &scan);
++        write_scan(&mut nbt, &scan);
+     }
+-    let tank = read_tank(&event.entity.nbt);
++    let tank = read_tank(&nbt);
+     let moved = push_output(host, level, pos, &tank);
+     if moved > 0
+         && let Some(fluid) = tank.fluid.as_deref()
+     {
+         write_tank(
+-            &mut event.entity.nbt,
++            &mut nbt,
+             &Tank::new(fluid, tank.amount - moved),
+         );
+     }
+     put(
+-        &mut event.entity.nbt,
++        &mut nbt,
+         "ticks",
+         Tag::Int((ticks as i32).wrapping_add(1)),
+     );
++    let changed = event
++        .subject
++        .with_view(|mut view| {
++            let mut changed = false;
++            for (key, value) in nbt.iter() {
++                if before.get(key) != Some(value) {
++                    changed |= view.set_nbt(key.clone(), Some(value.clone()));
++                }
++            }
++            for (key, _) in before.iter() {
++                if nbt.get(key).is_none() {
++                    changed |= view.set_nbt(key.clone(), None);
++                }
++            }
++            changed
++        })
++        .unwrap_or(false);
++    if changed {
++        handle.set_changed(event.subject.host());
++    }
+ }
+ 
+ /// The pump: its block entity (ticking, tank) and its block (the readout).
+@@ -365,8 +396,8 @@ impl BlockEntityPart for Pump {
+         event.ticks = true;
+     }
+ 
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        pump_tick(host, event);
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        pump_tick(event);
+     }
+ }
+ 
+@@ -402,82 +433,81 @@ impl Hooks for Mod {
+     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+         event
+             .commands
+-            .push(Command::new("rangedpumps info <pos:block_pos>"));
++            .push(Command::new("rangedpumps info <pos:block_pos>").executes(run_command));
+         event.commands.push(Command::op(
+             "rangedpumps range <pos:block_pos> <range:integer>",
+             2,
+-        ));
++        ).executes(run_command));
+     }
++}
+ 
+-    /// Run the `/rangedpumps` commands a player types.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        let invocation = event.command;
+-        let literals: Vec<&str> = invocation.literals.iter().map(String::as_str).collect();
+-        if !matches!(literals.as_slice(), ["rangedpumps", "info" | "range"]) {
+-            return Flow::Continue;
++/// Run the `/rangedpumps` commands a player types.
++fn run_command(
++    host: &mut dyn ServerHost,
++    _source: &mod_api::CommandSource,
++    invocation: &mod_api::CommandInvocation,
++) -> Option<i32> {
++    let literals: Vec<&str> = invocation.literals.iter().map(String::as_str).collect();
++    if !matches!(literals.as_slice(), ["rangedpumps", "info" | "range"]) {
++        return None;
++    }
++    let Some(CommandArgumentValue::BlockPos(pos)) = invocation.argument("pos") else {
++        feedback(
++            host,
++            "Usage: /rangedpumps info <x> <y> <z> or /rangedpumps range <x> <y> <z> <range>",
++        );
++        return Some(1);
++    };
++    let pos = *pos;
++    let level = host
++        .levels()
++        .list_levels()
++        .into_iter()
++        .find(|level| level.dimension() == invocation.dimension);
++    let Some(level) = level else {
++        feedback(host, "No Ranged Pump there.");
++        return Some(1);
++    };
++    match literals.as_slice() {
++        ["rangedpumps", "info"] => {
++            let Some(entity) = pump_at(host, level, pos) else {
++                feedback(host, "No Ranged Pump there.");
++                return Some(1);
++            };
++            let Some(data) = entity.data(host) else {
++                feedback(host, "No Ranged Pump there.");
++                return Some(1);
++            };
++            feedback(host, &info_line(&data, pos));
+         }
+-        let Some(CommandArgumentValue::BlockPos(pos)) = invocation.argument("pos") else {
+-            feedback(
+-                host,
+-                "Usage: /rangedpumps info <x> <y> <z> or /rangedpumps range <x> <y> <z> <range>",
+-            );
+-            return Flow::Cancel;
+-        };
+-        let pos = *pos;
+-        let level = host
+-            .levels()
+-            .list_levels()
+-            .into_iter()
+-            .find(|level| level.dimension() == invocation.dimension);
+-        let Some(level) = level else {
+-            feedback(host, "No Ranged Pump there.");
+-            return Flow::Cancel;
+-        };
+-        match literals.as_slice() {
+-            ["rangedpumps", "info"] => {
+-                let Some(entity) = pump_at(host, level, pos) else {
+-                    feedback(host, "No Ranged Pump there.");
+-                    return Flow::Cancel;
+-                };
+-                let Some(data) = entity.data(host) else {
+-                    feedback(host, "No Ranged Pump there.");
+-                    return Flow::Cancel;
+-                };
+-                feedback(host, &info_line(&data, pos));
+-            }
+-            ["rangedpumps", "range"] => {
+-                let Some(CommandArgumentValue::Integer(range)) = invocation.argument("range")
+-                else {
+-                    feedback(host, "The range must be a whole number.");
+-                    return Flow::Cancel;
+-                };
+-                let Some(entity) = pump_at(host, level, pos) else {
+-                    feedback(host, "No Ranged Pump there.");
+-                    return Flow::Cancel;
+-                };
+-                let clamped = (*range).clamp(0, MAX_RANGE);
+-                let Some(mut data) = entity.data(host) else {
+-                    feedback(host, "No Ranged Pump there.");
+-                    return Flow::Cancel;
+-                };
+-                // Re-scan from the block below with the new maximum.
+-                put(&mut data, "configuredRange", Tag::Int(clamped));
+-                write_scan(&mut data, &Scan::new());
+-                put(&mut data, "ticks", Tag::Int(0));
+-                if entity.replace_data(host, data).is_err() {
+-                    feedback(host, "No Ranged Pump there.");
+-                    return Flow::Cancel;
+-                }
+-                feedback(host, &format!("Ranged Pump range set to {clamped}."));
++        ["rangedpumps", "range"] => {
++            let Some(CommandArgumentValue::Integer(range)) = invocation.argument("range")
++            else {
++                feedback(host, "The range must be a whole number.");
++                return Some(1);
++            };
++            let Some(entity) = pump_at(host, level, pos) else {
++                feedback(host, "No Ranged Pump there.");
++                return Some(1);
++            };
++            let clamped = (*range).clamp(0, MAX_RANGE);
++            let Some(mut data) = entity.data(host) else {
++                feedback(host, "No Ranged Pump there.");
++                return Some(1);
++            };
++            // Re-scan from the block below with the new maximum.
++            put(&mut data, "configuredRange", Tag::Int(clamped));
++            write_scan(&mut data, &Scan::new());
++            put(&mut data, "ticks", Tag::Int(0));
++            if entity.replace_data(host, data).is_err() {
++                feedback(host, "No Ranged Pump there.");
++                return Some(1);
+             }
+-            _ => return Flow::Continue,
++            feedback(host, &format!("Ranged Pump range set to {clamped}."));
+         }
+-        Flow::Cancel
++        _ => return None,
+     }
++    Some(1)
+ }
+ 
+ /// The command's success feedback, routed to its originating source (the swapped-in player, the

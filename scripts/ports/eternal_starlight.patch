@@ -1,0 +1,94 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 849bb37..3a1d073 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -31,7 +31,7 @@ use mod_api::{
+     self, AddPackFindersEvent, BiomeSource, BlockKey, ChunkAccess, ChunkGenerator,
+     CommandArgumentValue, DimensionSettings, Flow, Hooks, HostSide, Identifier, PackPosition,
+     PackRegistration, PackType, RegisterCommandsEvent, Registrar, RegistrationContext,
+-    RunModCommandEvent, ServerHost, Text, VanillaStages,
++    ServerHost, Text, VanillaStages,
+ };
+ 
+ /// The pack's location inside this package: `assets/eternal_starlight/datapack/` holds a
+@@ -244,7 +244,11 @@ impl Hooks for Mod {
+     /// noise settings, the material rule, the density function, the noise and the four biomes
+     /// live in `assets/eternal_starlight/datapack/`, a real pack (`pack.mcmeta` + `data/`),
+     /// registered always-active and hidden so it loads in every world without a screen entry.
+-    fn add_pack_finders(&self, _host: HostSide, event: &mut AddPackFindersEvent<'_>) {
++    fn add_pack_finders(
++        &self,
++        _host: &mut dyn mod_api::PackDiscoveryContext,
++        event: &mut AddPackFindersEvent<'_>,
++    ) {
+         if event.packs.pack_type() != PackType::ServerData {
+             return;
+         }
+@@ -271,35 +275,38 @@ impl Hooks for Mod {
+     /// two commands (the bare form and the three-argument form); a `[<x> <y> <z>]` group is
+     /// refused at startup with `` `[<x:integer>` is not `<name:kind>` ``.
+     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+-        event
+-            .commands
+-            .push(mod_api::Command::new("eternal_starlight status"));
+-        event.commands.push(mod_api::Command::new(
+-            "eternal_starlight status <x:integer> <y:integer> <z:integer>",
+-        ));
++        event.commands.push(
++            mod_api::Command::new("eternal_starlight status")
++                .executes(|host, _source, command| status_command(host, command)),
++        );
++        event.commands.push(
++            mod_api::Command::new("eternal_starlight status <x:integer> <y:integer> <z:integer>")
++                .executes(|host, _source, command| status_command(host, command)),
++        );
+     }
++}
+ 
+-    /// Answer `status`, and let every other usage through.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
++/// Answer `status`, and refuse every other usage.
++fn status_command(
++    host: &mut dyn ServerHost,
++    command: &mod_api::CommandInvocation,
++) -> Option<i32> {
++    {
+         const NAME: &str = "eternal_starlight";
+-        if event.command.literals.first().map(String::as_str) != Some(NAME) {
+-            return Flow::Continue;
++        if command.literals.first().map(String::as_str) != Some(NAME) {
++            return None;
+         }
+-        if event.command.literals.get(1).map(String::as_str) != Some("status") {
+-            return Flow::Continue;
++        if command.literals.get(1).map(String::as_str) != Some("status") {
++            return None;
+         }
+         let block = match (
+-            integer(event.command, "x"),
+-            integer(event.command, "y"),
+-            integer(event.command, "z"),
++            integer(command, "x"),
++            integer(command, "y"),
++            integer(command, "z"),
+         ) {
+             (Some(x), Some(y), Some(z)) => [x, y, z],
+             // No position: the invocation's own, as `/execute positioned` set it.
+-            _ => event.command.position.map(|value| value.floor() as i32),
++            _ => command.position.map(|value| value.floor() as i32),
+         };
+         let quart = [block[0] >> 2, block[1] >> 2, block[2] >> 2];
+         let climate = runtime::climate_at(quart);
+@@ -315,7 +322,7 @@ impl Hooks for Mod {
+             surface,
+         );
+         let _ = host.commands().feedback(Text::literal(line));
+-        Flow::Cancel
++        Some(1)
+     }
+ }
+ 

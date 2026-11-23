@@ -1,0 +1,22 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 9b8ebb9..ca4fda2 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -20,7 +20,7 @@
+ //! port needs) and was first filed as #10131, closed 2026-11-06 without
+ //! the surface landing. Until it lands the core compiles and tests green,
+ //! and the screens draw vanilla's gradient.
+-use mod_api::{self, ClientHost, ClientSetupEvent, RegistrationContext};
++use mod_api::{self, ClientSetupContext, ClientSetupEvent, RegistrationContext};
+ 
+ mod runtime;
+ 
+@@ -37,7 +37,7 @@ impl mod_api::Hooks for Mod {
+     }
+ 
+     /// ModEntry.init, 1:1: logs the environment the mod loads on.
+-    fn client_setup(&self, _host: &mut dyn ClientHost, _event: &mut ClientSetupEvent) {
++    fn client_setup(&self, _host: &mut dyn ClientSetupContext, _event: &mut ClientSetupEvent) {
+         ModEntry::init(TARGET_PLATFORM);
+     }
+ }

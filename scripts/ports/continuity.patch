@@ -1,0 +1,22 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index f6f2f0e..66e7e27 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -92,7 +92,7 @@ impl mod_api::Hooks for Mod {
+     /// wrap flags applied from the settings' current values (upstream's
+     /// defaults until the player changes one: `setting_bool` is a world-only
+     /// read and is not reachable in Setup).
+-    fn client_setup(&self, _host: &mut dyn ClientHost, _event: &mut ClientSetupEvent) {
++    fn client_setup(&self, _host: &mut dyn mod_api::ClientSetupContext, _event: &mut ClientSetupEvent) {
+         continuity_client::on_initialize_client();
+         model_wrapping::init();
+         custom_block_layers::ReloadListener::init();
+@@ -119,7 +119,7 @@ impl mod_api::Hooks for Mod {
+     /// reachable in Reloading).
+     fn client_resources_reloaded(
+         &self,
+-        _host: &mut dyn ClientHost,
++        _host: &dyn mod_api::ClientReloadHost,
+         _event: &mut ClientResourcesReloadedEvent,
+     ) {
+         apply_wrapping();

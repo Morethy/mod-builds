@@ -1,0 +1,35 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 463b1d7..15eaec2 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -150,7 +150,7 @@ fn current_key(
+ ) -> Option<(String, String)> {
+     let server = host.client_session().client_server()?.address?;
+     let player = local_player_name(host, identity).unwrap_or_default();
+-    Some((server, player))
++    Some((server.to_owned(), player))
+ }
+ 
+ /// The local player's profile name, from the tab list entry with the UUID
+@@ -232,9 +232,7 @@ impl Hooks for Mod {
+         if !host.on(engine::ID) {
+             return Flow::Continue;
+         }
+-        let Ok(text) = host.text_string(&event.bar.name) else {
+-            return Flow::Continue;
+-        };
++        let text = host.text_string(&event.bar.name);
+         let Some((server, player)) = current_key(host, &self.identity) else {
+             return Flow::Continue;
+         };
+@@ -266,9 +264,7 @@ impl Hooks for Mod {
+         let Some((server, player)) = current_key(host, &self.identity) else {
+             return Flow::Continue;
+         };
+-        let Ok(text) = host.text_string(&*event.message) else {
+-            return Flow::Continue;
+-        };
++        let text = host.text_string(&*event.message);
+         load(host);
+         engine::note_chat(&server, &player, &text);
+         persist(host);

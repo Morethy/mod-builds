@@ -1,0 +1,102 @@
+diff --git a/src/glue.rs b/src/glue.rs
+index 8e8b7cf..2d4ebea 100644
+--- a/src/glue.rs
++++ b/src/glue.rs
+@@ -86,7 +86,10 @@ impl BlockPart for SaplingPart {
+ 
+     /// Upstream's `canSaplingStay`: an acceptable soil below, air above, and no branch or
+     /// sapling beside it.
+-    fn can_survive(&self, level: &dyn LevelHost, event: &mut CanSurviveEvent) -> Option<bool> {
++    fn can_survive(&self, level: LevelSide<'_>, event: &mut CanSurviveEvent) -> Option<bool> {
++        // The server decides, as before; a client keeps the template's own prediction.
++        let LevelSide::Server(level) = level else { return None };
++        let level: &dyn LevelHost = level;
+         let pos = pos_of(event.pos);
+         let beside = neighbours(level, pos);
+         let beside: Vec<&str> = beside.iter().map(String::as_str).collect();
+@@ -286,7 +289,7 @@ fn pulse(host: &mut dyn ServerHost, state: &mut Core) {
+             index += 1;
+             continue;
+         };
+-        let base_id = base_block.id(host);
++        let base_id = base_block.id(host).unwrap_or_default();
+         if placed > 0 && base_id != runtime::OAK_BRANCH {
+             state.trees.remove(index);
+             removed = true;
+@@ -393,19 +396,19 @@ pub(crate) fn on_world_lifecycle(host: &mut dyn ServerHost, phase: WorldPhase) {
+ /// The `/dynamictrees` command's answer: `info <pos>` or `list`.
+ pub(crate) fn run_command(
+     host: &mut dyn ServerHost,
+-    event: &mut mod_api::RunModCommandEvent<'_>,
+-) -> Flow {
+-    let literals: Vec<&str> = event.command.literals.iter().map(String::as_str).collect();
++    command: &mod_api::CommandInvocation,
++) -> Option<i32> {
++    let literals: Vec<&str> = command.literals.iter().map(String::as_str).collect();
+     if literals.first() != Some(&"dynamictrees") {
+-        return Flow::Continue;
++        return None;
+     }
+-    let line = match (literals.get(1), block_pos(event.command.argument("pos"))) {
+-        (Some(&"info"), Some(pos)) => info_line(&*host, event.command.dimension, pos),
++    let line = match (literals.get(1), block_pos(command.argument("pos"))) {
++        (Some(&"info"), Some(pos)) => info_line(&*host, command.dimension, pos),
+         (Some(&"list"), _) => list_lines(),
+         _ => "usage: /dynamictrees info <x> <y> <z> | /dynamictrees list".to_owned(),
+     };
+     let _ = host.commands().feedback(Text::literal(line));
+-    Flow::Cancel
++    Some(1)
+ }
+ 
+ /// One tree's readout, as the harness reads it: the record's stage when the tree has one,
+@@ -498,8 +501,9 @@ fn block_id(level: &dyn LevelHost, pos: [i32; 3]) -> String {
+ fn block_in(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> String {
+     level
+         .block(host, pos)
+-        .map(|block| block.id(host))
++        .and_then(|block| block.id(host))
+         .unwrap_or_default()
++        .to_owned()
+ }
+ 
+ /// The four horizontal neighbours of `pos`, read through the host.
+diff --git a/src/lib.rs b/src/lib.rs
+index cdbb087..0cb24f7 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -25,8 +25,7 @@ mod glue;
+ pub mod runtime;
+ 
+ use mod_api::{
+-    self, Command, Flow, Hooks, RegisterCommandsEvent, Registrar, RegistrationContext,
+-    RunModCommandEvent, ServerHost, ServerStoppingEvent, ServerTickEvent, ServerTickPhase,
++    self, Command, Hooks, RegisterCommandsEvent, Registrar, RegistrationContext, ServerHost, ServerStoppingEvent, ServerTickEvent, ServerTickPhase,
+     WorldLifecycleEvent,
+ };
+ 
+@@ -65,18 +64,11 @@ impl Hooks for Mod {
+     /// `/dynamictrees info <pos>` and `/dynamictrees list`: the readout the harness and players
+     /// use. A player's own command: no operator level, nothing it does changes the world.
+     fn register_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+-        event
+-            .commands
+-            .push(Command::new("dynamictrees info <pos:block_pos>"));
+-        event.commands.push(Command::new("dynamictrees list"));
+-    }
+-
+-    /// Answer the two usages; anything else named `dynamictrees` gets the usage line.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        glue::run_command(host, event)
++        // Answer the two usages; anything else named `dynamictrees` gets the usage line.
++        for usage in ["dynamictrees info <pos:block_pos>", "dynamictrees list"] {
++            event.commands.push(
++                Command::new(usage).executes(|host, _source, command| glue::run_command(host, command)),
++            );
++        }
+     }
+ }

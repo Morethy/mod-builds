@@ -1,0 +1,212 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 4adf362..68009f3 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -28,9 +28,9 @@ use std::sync::Mutex;
+ 
+ use mod_api::{
+     self, AttributeModifier, AttributeOperation, Command, CommandArgumentValue, CommandSource,
+-    Flow, GameMode, Hooks, Host, HostSide, Identifier, ItemStack, LivingEntityUseItemFinishEvent,
++    GameMode, Hooks, Host, HostSide, Identifier, ItemStack, LivingEntityUseItemFinishEvent,
+     ModifierLifetime, PlayerDiedEvent, PlayerRef, PlayerTickPostEvent, RegisterCommandsEvent,
+-    RunModCommandEvent, ServerAboutToStartEvent, ServerHost, ServerStartedEvent,
++    ServerAboutToStartEvent, ServerHost, ServerStartedEvent,
+     ServerStoppingEvent, Text, WorldLifecycleEvent, WorldPhase,
+ };
+ 
+@@ -176,104 +176,101 @@ impl Hooks for Mod {
+             "foodlist size [target:player]",
+             "foodlist sync [target:player]",
+         ] {
+-            event.commands.push(Command::new(usage));
++            event.commands.push(Command::new(usage).executes(run_command));
+         }
+         event
+             .commands
+-            .push(Command::op("foodlist clear [target:player]", 2));
++            .push(Command::op("foodlist clear [target:player]", 2).executes(run_command));
+     }
++}
+ 
+-    /// Run one of them. The dispatcher has already parsed the usage and resolved the target,
+-    /// so this reads typed values instead of a line; the acting player's state is swapped
+-    /// in, so a self-targeted health change applies immediately.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        let Some((command, target)) =
+-            requested(&event.command.literals, event.command.argument("target"))
+-        else {
+-            return Flow::Continue;
+-        };
+-        let sender = match event.source {
+-            CommandSource::Player { player, .. } => Some(*player),
+-            _ => None,
+-        };
+-        let permission = match event.source {
+-            CommandSource::Player { permission, .. } => Some(*permission),
+-            _ => None,
+-        };
+-        let Some(target) = target.or(sender) else {
+-            let _ = host
+-                .commands()
+-                .feedback(Text::literal("A player, or a player target, is needed"));
+-            return Flow::Cancel;
+-        };
+-        // Another player's food history is their own: `size` names only the sender's own state,
+-        // or any player when the console (a non-player source) runs it. `sync` and `clear` already
+-        // only act on the sender's own state; this closes the one read that could name anyone.
+-        let is_self = sender.map(PlayerRef::uuid) == Some(target.uuid());
+-        if !may_query_other(is_self, permission) {
++/// Run one of them. The dispatcher has already parsed the usage and resolved the target,
++/// so this reads typed values instead of a line; the acting player's state is swapped
++/// in, so a self-targeted health change applies immediately.
++fn run_command(
++    host: &mut dyn ServerHost,
++    source: &CommandSource,
++    invocation: &mod_api::CommandInvocation,
++) -> Option<i32> {
++    let (command, target) = requested(&invocation.literals, invocation.argument("target"))?;
++    let sender = match source {
++        CommandSource::Player { player, .. } => Some(*player),
++        _ => None,
++    };
++    let permission = match source {
++        CommandSource::Player { permission, .. } => Some(*permission),
++        _ => None,
++    };
++    let Some(target) = target.or(sender) else {
++        let _ = host
++            .commands()
++            .feedback(Text::literal("A player, or a player target, is needed"));
++        return Some(1);
++    };
++    // Another player's food history is their own: `size` names only the sender's own state,
++    // or any player when the console (a non-player source) runs it. `sync` and `clear` already
++    // only act on the sender's own state; this closes the one read that could name anyone.
++    let is_self = sender.map(PlayerRef::uuid) == Some(target.uuid());
++    if !may_query_other(is_self, permission) {
++        let _ = host
++            .commands()
++            .feedback(Text::literal("You may only check your own food list."));
++        return Some(1);
++    }
++    let uuid = target.uuid();
++    match command {
++        FoodCommand::Size(_) => {
++            let (count, config) = counted(&*host, uuid);
++            let progress = progress(count, &config);
++            let name = target
++                .name(&*host)
++                .map(str::to_owned)
++                .unwrap_or_else(|| format!("player {}", format_uuid_hex(uuid)));
++            let mut lines = vec![format!("{name}: {count} unique foods eaten")];
++            match (progress.has_reached_max, progress.next_milestone) {
++                (true, _) => lines.push("Every milestone has been reached".to_owned()),
++                (false, Some(next)) => lines.push(format!(
++                    "Next milestone at {next} foods ({} to go)",
++                    progress.foods_until_next.unwrap_or(0)
++                )),
++                (false, None) => {}
++            }
++            for line in lines {
++                let _ = host.commands().feedback(Text::literal(line));
++            }
++        }
++        FoodCommand::Sync(_) => {
++            if sender.map(PlayerRef::uuid) == Some(uuid) {
++                let (_, config) = counted(&*host, uuid);
++                apply_health(&mut *host, target, &config);
++            }
+             let _ = host
+                 .commands()
+-                .feedback(Text::literal("You may only check your own food list."));
+-            return Flow::Cancel;
++                .feedback(Text::literal("Food list synced".to_owned()));
+         }
+-        let uuid = target.uuid();
+-        match command {
+-            FoodCommand::Size(_) => {
+-                let (count, config) = counted(&*host, uuid);
+-                let progress = progress(count, &config);
+-                let name = target
+-                    .name(&*host)
+-                    .unwrap_or_else(|| format!("player {}", format_uuid_hex(uuid)));
+-                let mut lines = vec![format!("{name}: {count} unique foods eaten")];
+-                match (progress.has_reached_max, progress.next_milestone) {
+-                    (true, _) => lines.push("Every milestone has been reached".to_owned()),
+-                    (false, Some(next)) => lines.push(format!(
+-                        "Next milestone at {next} foods ({} to go)",
+-                        progress.foods_until_next.unwrap_or(0)
+-                    )),
+-                    (false, None) => {}
+-                }
+-                for line in lines {
+-                    let _ = host.commands().feedback(Text::literal(line));
+-                }
+-            }
+-            FoodCommand::Sync(_) => {
+-                if sender.map(PlayerRef::uuid) == Some(uuid) {
+-                    let (_, config) = counted(&*host, uuid);
+-                    apply_health(&mut *host, target, &config);
++        FoodCommand::Clear(_) => {
++            let config = {
++                let mut guard = core();
++                let core = guard.get_or_insert_with(Core::default);
++                if let Some(state) = core.players.get_mut(&uuid) {
++                    state.history.clear();
+                 }
+-                let _ = host
+-                    .commands()
+-                    .feedback(Text::literal("Food list synced".to_owned()));
++                save(&*host, core);
++                core.config.clone()
++            };
++            if sender.map(PlayerRef::uuid) == Some(uuid) {
++                apply_health(&mut *host, target, &config);
+             }
+-            FoodCommand::Clear(_) => {
+-                let config = {
+-                    let mut guard = core();
+-                    let core = guard.get_or_insert_with(Core::default);
+-                    if let Some(state) = core.players.get_mut(&uuid) {
+-                        state.history.clear();
+-                    }
+-                    save(&*host, core);
+-                    core.config.clone()
+-                };
+-                if sender.map(PlayerRef::uuid) == Some(uuid) {
+-                    apply_health(&mut *host, target, &config);
+-                }
+-                let _ = host
+-                    .commands()
+-                    .feedback(Text::literal("Food list cleared".to_owned()));
+-                if sender.map(PlayerRef::uuid) != Some(uuid) {
+-                    let _ = target.tell(&mut *host, Text::literal("Your food list was cleared"));
+-                }
++            let _ = host
++                .commands()
++                .feedback(Text::literal("Food list cleared".to_owned()));
++            if sender.map(PlayerRef::uuid) != Some(uuid) {
++                let _ = target.tell(&mut *host, Text::literal("Your food list was cleared"));
+             }
+-            FoodCommand::Unknown => return Flow::Continue,
+         }
+-        Flow::Cancel
++        FoodCommand::Unknown => return None,
+     }
++    Some(1)
+ }
+ 
+ /// Whether a source may read `target`'s food history: the player themselves, or a non-player
+@@ -338,7 +335,7 @@ fn record_food(host: &mut dyn ServerHost, stack: &ItemStack) {
+         return;
+     };
+     let uuid = player.uuid();
+-    let item = stack.item().id(&*host);
++    let item = stack.item().id(&*host).unwrap_or_default().to_owned();
+     let Some(nutrition) = nutrition_of(&*host, &item) else {
+         return;
+     };

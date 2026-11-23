@@ -1,0 +1,167 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index a002ea5..8fc3288 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -247,7 +247,7 @@ const DIRS: [(&str, [i32; 3]); 6] = [
+ ];
+ 
+ fn lrand(level: &mut dyn LevelWriteHost, bound: i32) -> i32 {
+-    level.with_random(|r| mod_api::RandomSource::next_int_bound(r, bound).unwrap_or(0)).unwrap_or(0)
++    level.with_random(|r| mod_api::RandomSource::next_int_bound(r, bound)).unwrap_or(0)
+ }
+ 
+ #[mod_api::sunrise_part]
+@@ -403,7 +403,7 @@ fn dist(a: [f64; 3], b: [f64; 3]) -> f64 {
+ fn is_living(host: &dyn ServerHost, e: EntityRef) -> Option<LivingRef> {
+     let living = host.living(e)?;
+     let kind = e.kind(host)?;
+-    if kind.id(host) == "minecraft:armor_stand" {
++    if kind.id(host).as_deref() == Some("minecraft:armor_stand") {
+         return None;
+     }
+     Some(living)
+@@ -411,9 +411,16 @@ fn is_living(host: &dyn ServerHost, e: EntityRef) -> Option<LivingRef> {
+ 
+ /// Living entities (not armour stands) whose box meets the cube of `r` around `c`.
+ fn living_near(host: &dyn ServerHost, level: LevelRef, c: [f64; 3], r: f64) -> Vec<(LivingRef, [f64; 3])> {
+-    let Some(list) = level.entities_in(host, [c[0] - r, c[1] - r, c[2] - r], [c[0] + r, c[1] + r, c[2] + r]) else {
++    let mut list = Vec::new();
++    if level
++        .visit_entities_in(host, [c[0] - r, c[1] - r, c[2] - r], [c[0] + r, c[1] + r, c[2] + r], &mut |e| {
++            list.push(e);
++            std::ops::ControlFlow::Continue(())
++        })
++        .is_err()
++    {
+         return Vec::new();
+-    };
++    }
+     list.into_iter()
+         .filter_map(|e| Some((is_living(host, e)?, pos_of(host, e)?)))
+         .collect()
+@@ -440,7 +447,7 @@ fn knockback(host: &mut dyn ServerHost, living: LivingRef, strength: f64, dx: f6
+ }
+ 
+ fn sound(host: &mut dyn ServerHost, level: LevelRef, at: [f64; 3], name: &str, volume: f32, pitch: f32) {
+-    level.play_sound(host, name, at, SoundSource::Players, volume, pitch);
++    level.play_sound(host, name, at, SoundSource::Players, volume, pitch, None);
+ }
+ 
+ /// A ring of dust at `c` (the jar's wave rings, drawn once at their full radius).
+@@ -522,8 +529,11 @@ fn tick_living(host: &mut dyn ServerHost, dim: &str, living: LivingRef) {
+         (mod_api::EquipmentSlot::Legs, PIECES[2], PIECE_LEVELS[2]),
+         (mod_api::EquipmentSlot::Feet, PIECES[3], PIECE_LEVELS[3]),
+     ] {
+-        let Some(stack) = living.equipment(&*host, slot) else { continue };
+-        let item = stack.item().id(&*host).to_string();
++        let Some(item) =
++            living.with_equipment(&*host, slot, |stack| stack.item().id(&*host).unwrap_or_default().to_string())
++        else {
++            continue;
++        };
+         for (i, (gem, _)) in SETS.iter().enumerate() {
+             if item.strip_prefix(NS).is_some_and(|r| r == format!("{gem}_{piece}")) {
+                 levels[i] += add;
+@@ -534,7 +544,7 @@ fn tick_living(host: &mut dyn ServerHost, dim: &str, living: LivingRef) {
+         .effects(&*host)
+         .unwrap_or_default()
+         .into_iter()
+-        .filter_map(|a| Some((a.id.id(&*host).to_string(), a)))
++        .filter_map(|a| Some((a.id.id(&*host).unwrap_or_default().to_string(), a)))
+         .collect();
+     let has = |n: &str| effects.get(&format!("{NS}{n}"));
+     let mut st = {
+@@ -560,7 +570,7 @@ fn tick_living(host: &mut dyn ServerHost, dim: &str, living: LivingRef) {
+         .effects(&*host)
+         .unwrap_or_default()
+         .into_iter()
+-        .filter_map(|a| Some((a.id.id(&*host).to_string(), a)))
++        .filter_map(|a| Some((a.id.id(&*host).unwrap_or_default().to_string(), a)))
+         .collect();
+     let amp = |n: &str| effects.get(&format!("{NS}{n}")).map(|a| a.amplifier);
+     // Caches for the hooks that have no host.
+@@ -685,7 +695,7 @@ fn tick_living(host: &mut dyn ServerHost, dim: &str, living: LivingRef) {
+ fn miasma_poison(host: &mut dyn ServerHost, lvl: LevelRef, dim: &str, owner: LivingRef, c: [f64; 3], level: i32) {
+     let radius = level as f32 * MIASMA_CLOUD_RADIUS_PER_LEVEL;
+     let owner_uuid = owner.entity().uuid(host);
+-    let owner_tags = owner.entity().tags(&*host).unwrap_or_default();
++    let owner_tags = owner.entity().tags(&*host);
+     let _ = owner_tags;
+     for (l, q) in living_near(&*host, lvl, c, radius as f64) {
+         if l.id() == owner.id() || dist(q, c) > radius as f64 {
+@@ -840,8 +850,11 @@ fn handle_hit(host: &mut dyn ServerHost, h: Hit) {
+     if h.direct > 0 && h.direct == h.causing {
+         if let Some(att) = attacker {
+             let ae = att.entity();
+-            let weapon = att.hand_item(&*host, mod_api::Hand::Main);
+-            let gem = weapon.as_ref().and_then(|s| tool_gem(&s.item().id(&*host).to_string()));
++            let gem = att
++                .with_hand_item(&*host, mod_api::Hand::Main, |s| {
++                    tool_gem(&s.item().id(&*host).unwrap_or_default().to_string())
++                })
++                .flatten();
+             match gem {
+                 Some("sapphire") => {
+                     let max = victim.max_health(&*host).unwrap_or(20.0);
+@@ -1051,15 +1064,18 @@ impl Hooks for Mod {
+         }
+     }
+ 
+-    fn entity_tick_post(&self, host: &mut dyn ServerHost, event: &mut mod_api::EntityTickPostEvent<'_>) {
+-        let Some(e) = host.entity(event.entity) else { return };
+-        let Some(living) = is_living(&*host, e) else { return };
++    fn entity_tick_post(&self, host: mod_api::HostSide<'_>, event: &mut mod_api::EntityTickPostEvent<'_>) {
++        let mod_api::HostSide::Server(host) = host else { return };
+         let dim = event.dimension.to_string();
+-        tick_living(host, &dim, living);
++        for &entity in event.entities.iter() {
++            let Some(e) = host.entity(entity) else { continue };
++            let Some(living) = is_living(&*host, e) else { continue };
++            tick_living(host, &dim, living);
++        }
+     }
+ 
+     /// Topaz Reaction takes 5% per level off fall damage (captureHealth's mu_topazFallBlocked, healed back in Java).
+-    fn living_damage_pre(&self, _level: &mut dyn mod_api::LevelRandomHost, event: &mut mod_api::LivingDamagePreEvent<'_>) {
++    fn living_damage_pre(&self, _level: &mut dyn mod_api::HitHost, event: &mut mod_api::LivingDamagePreEvent<'_>) {
+         if event.source.damage_type != "minecraft:fall" {
+             return;
+         }
+@@ -1077,7 +1093,7 @@ impl Hooks for Mod {
+         });
+     }
+ 
+-    fn living_damage_post(&self, _level: &mut dyn mod_api::LevelRandomHost, event: &mut mod_api::LivingDamagePostEvent<'_>) {
++    fn living_damage_post(&self, _level: &mut dyn mod_api::HitHost, event: &mut mod_api::LivingDamagePostEvent<'_>) {
+         let t = event.source.damage_type;
+         if OWN_HURT.load(Ordering::Relaxed) || OWN_DAMAGE.iter().any(|o| t.strip_prefix(NS) == Some(*o)) {
+             return;
+@@ -1144,8 +1160,12 @@ impl Hooks for Mod {
+     fn player_destroyed_block(&self, host: &mut dyn ServerHost, event: &mut mod_api::PlayerDestroyedBlockEvent) {
+         let Some(player) = host.players().acting_player() else { return };
+         let Some(living) = host.living(player.entity()) else { return };
+-        let Some(stack) = living.hand_item(&*host, mod_api::Hand::Main) else { return };
+-        if let Some(gem) = tool_gem(&stack.item().id(&*host).to_string()) {
++        let Some(gem) = living.with_hand_item(&*host, mod_api::Hand::Main, |stack| {
++            tool_gem(&stack.item().id(&*host).unwrap_or_default().to_string())
++        }) else {
++            return;
++        };
++        if let Some(gem) = gem {
+             if matches!(gem, "jade" | "ruby" | "topaz") {
+                 lock(&BROKEN).push((player.entity().id(), gem, event.pos));
+             }
+@@ -1171,7 +1191,12 @@ impl Hooks for Mod {
+                 let dims: Vec<String> = ["minecraft:overworld", "minecraft:the_nether", "minecraft:the_end"].iter().map(|s| s.to_string()).collect();
+                 for d in dims {
+                     let Some(lvl) = host.level(&d) else { continue };
+-                    for p in lvl.online_players(&*host).unwrap_or_default() {
++                    let mut players = Vec::new();
++                    let _ = lvl.visit_online_players(&*host, &mut |p| {
++                        players.push(p);
++                        std::ops::ControlFlow::Continue(())
++                    });
++                    for p in players {
+                         if let Some(l) = host.living(p.entity()) {
+                             tick_living(host, &d, l);
+                         }

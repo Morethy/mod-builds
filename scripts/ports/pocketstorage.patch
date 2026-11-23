@@ -1,0 +1,264 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index d6a58a2..d4e984a 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -19,10 +19,10 @@ pub mod runtime;
+ 
+ use mod_api::{
+     self, Command, CommandArgumentValue, CommandInvocation, CommandSource, Component, CraftingGrid,
+-    CraftingRecipeCodec, CraftingRecipeKind, Direction, Flow, Hand, Hooks, HostSide,
++    CraftingRecipeKind, Direction, Flow, Hand, Hooks, HostSide,
+     HostTransaction, ITEMS, Identifier, ItemKey, ItemPlace, ItemResource, ItemStack,
+     LeftClickBlockEvent, LevelRef, PlayerRef, RegisterCommandsEvent, Registrar,
+-    RegistrationContext, RightClickBlockEvent, RunModCommandEvent, ServerHost, Tag,
++    RegistrationContext, RightClickBlockEvent, ServerHost, Tag,
+     TagsUpdatedEvent, Text,
+ };
+ 
+@@ -100,11 +100,8 @@ impl Hooks for Mod {
+ 
+     /// The merged tags were (re)published: the upgrade recipes' tag cells ask them at
+     /// craft time, when no host is available, so keep their members here.
+-    fn tags_updated(&self, host: HostSide, _event: &mut TagsUpdatedEvent) {
+-        match host {
+-            HostSide::Server(host) => refresh_upgrade_tags(host),
+-            HostSide::Client(host) => refresh_upgrade_tags(host),
+-        }
++    fn tags_updated(&self, host: &dyn mod_api::ReloadContext, _event: &mut TagsUpdatedEvent) {
++        refresh_upgrade_tags(host);
+     }
+ 
+     /// Before content loads: register the unit's component id, so a saved stack's
+@@ -114,9 +111,7 @@ impl Hooks for Mod {
+         _context: &mod_api::RegistrationContext,
+         event: &mut mod_api::ComponentTypesEvent<'_>,
+     ) {
+-        if !event.types.iter().any(|known| known == COMPONENT) {
+-            event.types.push(COMPONENT.to_owned());
+-        }
++        event.register(COMPONENT.into());
+     }
+ 
+     /// A sneak right click on a container empties the held unit into it, all but
+@@ -150,35 +145,33 @@ impl Hooks for Mod {
+             "psu put <item:item> [count:integer]",
+             "psu help",
+         ] {
+-            event.commands.push(Command::new(usage));
++            event.commands.push(Command::new(usage).executes(run_command));
+         }
+     }
++}
+ 
+-    /// Runs a `/psu` usage for the player who typed it, whose held stack is in
+-    /// place. The dispatcher has already parsed and resolved the arguments, so
+-    /// this reads them typed instead of re-parsing a line.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        let CommandSource::Player { player, .. } = *event.source else {
+-            return Flow::Continue;
+-        };
+-        let Some(action) = action_of(event.command, &*host) else {
+-            return Flow::Continue;
+-        };
+-        let lines = match action {
+-            Action::Help => HELP.iter().map(|line| (*line).to_owned()).collect(),
+-            Action::List => list_lines(host, player),
+-            Action::Put { item, count } => vec![put(host, player, &item, count)],
+-            Action::Unknown => return Flow::Continue,
+-        };
+-        for line in lines {
+-            let _ = player.tell(host, Text::literal(line));
+-        }
+-        Flow::Cancel
++/// Runs a `/psu` usage for the player who typed it, whose held stack is in
++/// place. The dispatcher has already parsed and resolved the arguments, so
++/// this reads them typed instead of re-parsing a line.
++fn run_command(
++    host: &mut dyn ServerHost,
++    source: &CommandSource,
++    command: &CommandInvocation,
++) -> Option<i32> {
++    let CommandSource::Player { player, .. } = *source else {
++        return None;
++    };
++    let action = action_of(command, &*host)?;
++    let lines = match action {
++        Action::Help => HELP.iter().map(|line| (*line).to_owned()).collect(),
++        Action::List => list_lines(host, player),
++        Action::Put { item, count } => vec![put(host, player, &item, count)],
++        Action::Unknown => return None,
++    };
++    for line in lines {
++        let _ = player.tell(host, Text::literal(line));
+     }
++    Some(1)
+ }
+ 
+ /// Sneak + right-click a container: deposit all but one of each held kind.
+@@ -193,7 +186,7 @@ fn deposit(host: &mut dyn ServerHost, click: &mod_api::BlockClick<'_>) -> bool {
+     let Some(stack) = click.stack else {
+         return false;
+     };
+-    let Some(tier) = tier_of(&stack.item().id(&*host)) else {
++    let Some(tier) = tier_of(stack.item().id(&*host).unwrap_or_default()) else {
+         return false;
+     };
+     let Some(level) = player.level(&*host) else {
+@@ -223,7 +216,7 @@ fn deposit(host: &mut dyn ServerHost, click: &mod_api::BlockClick<'_>) -> bool {
+                     continue;
+                 };
+                 let resource = ItemResource::of(&ItemStack::of(key));
+-                let put = handler.insert_any(host, tx, &resource, entry.count);
++                let put = handler.insert(host, tx, &resource, entry.count).unwrap_or(0);
+                 moved += put;
+                 // Upstream keeps one of each kind behind, so the slot keeps the kind.
+                 contents.set(slot, Some(Entry::new(&entry.item, entry.count - put + 1)));
+@@ -256,10 +249,10 @@ fn withdraw(host: &mut dyn ServerHost, pos: [i32; 3], face: [i32; 3]) -> bool {
+     let Some(living) = host.living(player.entity()) else {
+         return false;
+     };
+-    let Some(stack) = living.hand_item(&*host, Hand::Main) else {
++    let Some(stack) = living.with_hand_item(&*host, Hand::Main, |stack| stack.project()).flatten() else {
+         return false;
+     };
+-    let Some(tier) = tier_of(&stack.item().id(&*host)) else {
++    let Some(tier) = tier_of(stack.item().id(&*host).unwrap_or_default()) else {
+         return false;
+     };
+     let Some(level) = player.level(&*host) else {
+@@ -286,7 +279,7 @@ fn withdraw(host: &mut dyn ServerHost, pos: [i32; 3], face: [i32; 3]) -> bool {
+                     continue;
+                 };
+                 let here = resource.as_stack();
+-                let id = here.item().id(&*host);
++                let id = here.item().id(&*host).unwrap_or_default().to_owned();
+                 // Only a plain stack can be stored: an entry is `{id, count}`, and rebuilding a
+                 // damaged or component-bearing stack from it would hand back a plain one and
+                 // destroy the custom state for good (the reviewer's P1).
+@@ -302,7 +295,7 @@ fn withdraw(host: &mut dyn ServerHost, pos: [i32; 3], face: [i32; 3]) -> bool {
+                     }
+                     continue;
+                 }
+-                let got = handler.extract(host, tx, index, &resource, want);
++                let got = handler.extract_at(host, tx, index, &resource, want);
+                 if got == 0 {
+                     continue;
+                 }
+@@ -311,7 +304,7 @@ fn withdraw(host: &mut dyn ServerHost, pos: [i32; 3], face: [i32; 3]) -> bool {
+                 if leftover > 0 {
+                     // Unreachable: `withdrawable` never asks for more than the slot's room. Kept
+                     // so a container answering differently never loses an item.
+-                    handler.insert(host, tx, index, &resource, leftover);
++                    handler.insert_at(host, tx, index, &resource, leftover);
+                 }
+             }
+             Ok::<u64, ()>(moved)
+@@ -358,7 +351,7 @@ fn list_lines(host: &mut dyn ServerHost, player: PlayerRef) -> Vec<String> {
+     let Some(stack) = hand_unit(host, player) else {
+         return vec!["Hold a Pocket Storage Unit first.".to_owned()];
+     };
+-    let Some(tier) = tier_of(&stack.item().id(&*host)) else {
++    let Some(tier) = tier_of(stack.item().id(&*host).unwrap_or_default()) else {
+         return vec!["The held item is not a Pocket Storage Unit.".to_owned()];
+     };
+     let contents = read_contents(&stack, tier);
+@@ -393,7 +386,7 @@ fn put(host: &mut dyn ServerHost, player: PlayerRef, item: &str, count: u32) ->
+     let Some(stack) = hand_unit(host, player) else {
+         return "Hold a Pocket Storage Unit first.".to_owned();
+     };
+-    let Some(tier) = tier_of(&stack.item().id(&*host)) else {
++    let Some(tier) = tier_of(stack.item().id(&*host).unwrap_or_default()) else {
+         return "The held item is not a Pocket Storage Unit.".to_owned();
+     };
+     let mut contents = read_contents(&stack, tier);
+@@ -412,7 +405,13 @@ fn put(host: &mut dyn ServerHost, player: PlayerRef, item: &str, count: u32) ->
+     let resource = ItemResource::of(&wanted);
+     // The player's own slots, as vanilla's `Inventory` numbers them; only a plain
+     // stack of the named item can go in, which is what the command says.
+-    let slots = player.inventory_slots(&*host).unwrap_or_default();
++    let slots: Vec<(u32, ItemStack)> = player
++        .with_inventory(&*host, |view| {
++            view.iter()
++                .filter_map(|(slot, here)| Some((slot, here.project()?)))
++                .collect()
++        })
++        .unwrap_or_default();
+     let taken = host
+         .transaction(|host, tx| {
+             let mut taken = 0_u32;
+@@ -453,7 +452,9 @@ fn put(host: &mut dyn ServerHost, player: PlayerRef, item: &str, count: u32) ->
+ 
+ /// The stack in a player's main hand, or `None` when they hold none.
+ fn hand_unit(host: &mut dyn ServerHost, player: PlayerRef) -> Option<ItemStack> {
+-    host.living(player.entity())?.hand_item(&*host, Hand::Main)
++    host.living(player.entity())?
++        .with_hand_item(&*host, Hand::Main, |stack| stack.project())
++        .flatten()
+ }
+ 
+ /// Where `/psu put` may take from, as an [`ItemPlace::PlayerSlot`] number.
+@@ -553,7 +554,7 @@ fn action_of(invocation: &CommandInvocation, host: &dyn mod_api::Host) -> Option
+         Some("help") | None => Some(Action::Help),
+         Some("put") => {
+             let item = match invocation.argument("item")? {
+-                CommandArgumentValue::Item(stack) => stack.item().id(host),
++                CommandArgumentValue::Item(stack) => stack.item().id(host).unwrap_or_default().to_owned(),
+                 _ => return None,
+             };
+             let count = match invocation.argument("count") {
+@@ -633,7 +634,7 @@ fn in_upgrade_tag(tag: &str, key: ItemKey) -> bool {
+ }
+ 
+ /// Re-reads the upgrade recipes' tags from the game's merged tags.
+-fn refresh_upgrade_tags(host: &dyn mod_api::Host) {
++fn refresh_upgrade_tags(host: &dyn mod_api::ReloadContext) {
+     let mut loaded = Vec::with_capacity(UPGRADE_TAGS.len());
+     for tag in UPGRADE_TAGS {
+         let Some(id) = Identifier::parse(tag).ok() else {
+@@ -642,7 +643,7 @@ fn refresh_upgrade_tags(host: &dyn mod_api::Host) {
+         let Some(key) = host.tags().key(&id) else {
+             continue;
+         };
+-        let Some(members) = host.tags().items(key) else {
++        let mod_api::TagMembers::Members(members) = host.tags().items(key) else {
+             continue;
+         };
+         loaded.push((tag, members));
+@@ -726,10 +727,6 @@ impl UpgradeKind {
+ impl CraftingRecipeKind for UpgradeKind {
+     type Value = UpgradeValue;
+ 
+-    fn codec(&self) -> Option<CraftingRecipeCodec<Self::Value>> {
+-        Some(CraftingRecipeCodec::wire())
+-    }
+-
+     fn decode(&self, json: &str) -> Result<Self::Value, String> {
+         decode_upgrade(json).map(|upgrade| UpgradeValue::of(&upgrade))
+     }
+@@ -741,7 +738,7 @@ impl CraftingRecipeKind for UpgradeKind {
+         Ok(write_upgrade(&upgrade))
+     }
+ 
+-    fn matches(&self, value: &Self::Value, grid: CraftingGrid) -> bool {
++    fn matches(&self, _host: &dyn mod_api::LoopContext, value: &Self::Value, grid: CraftingGrid) -> bool {
+         if (grid.width, grid.height) != (3, 3) || grid.cells.len() != 9 {
+             return false;
+         }
+@@ -755,7 +752,12 @@ impl CraftingRecipeKind for UpgradeKind {
+         upgrade.matches(&keys, |id| self.key(id), in_upgrade_tag)
+     }
+ 
+-    fn assemble(&self, value: &Self::Value, grid: CraftingGrid) -> Option<ItemStack> {
++    fn assemble(
++        &self,
++        _host: &dyn mod_api::LoopContext,
++        value: &Self::Value,
++        grid: CraftingGrid,
++    ) -> Option<ItemStack> {
+         if (grid.width, grid.height) != (3, 3) {
+             return None;
+         }

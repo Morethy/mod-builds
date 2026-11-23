@@ -1,0 +1,287 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index b4e0541..23c9995 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -26,10 +26,10 @@
+ mod runtime;
+ 
+ use mod_api::{
+-    self, BlockEntityPart, BlockEntityTickEvent, BlockEntityTickReply, BlockEntityTicksEvent,
++    self, BlockEntityPart, BlockEntityTickEvent, BlockEntityTicksEvent,
+     BlockPart, Command, CommandArgumentValue, CommandInvocation, Compound, DimensionKey, Flow,
+     Hooks, LevelRef, ModContainer, ModEnergyBuffer, RegisterCommandsEvent, Registrar,
+-    RegistrationContext, RunModCommandEvent, ServerHost, Tag, Text,
++    RegistrationContext, ServerHost, Tag, Text,
+ };
+ use runtime::{CAPACITY, Fuel, Generator, RedstoneControl, RedstoneMode, clamp_energy, persists};
+ 
+@@ -59,18 +59,29 @@ impl BlockEntityPart for GeneratorPart {
+         event.ticks = true;
+     }
+ 
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        let mut state = state_of(&event.entity.nbt);
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        let Some((pos, handle, before, fuel)) = event.subject.with_view(|view| {
++            (
++                view.position(),
++                view.handle(),
++                view.nbt().clone(),
++                view.item_slot(FUEL_SLOT as u32).and_then(|stack| stack.to_owned()),
++            )
++        }) else {
++            return;
++        };
++        let host = event.subject.host();
++        let mut state = state_of(&before);
+         // Upstream `evaluateRedstone` runs before the machine's own tick: the
+         // signal is sampled once a tick, and in `PULSE` mode a rising edge latches
+         // one burn. A block-entity tick is not told its level, so the one in
+         // place answers — the same read `actuallyadditions` makes at this pin.
+         let powered =
+-            in_place_level(host).is_some_and(|level| level.has_neighbor_signal(&*host, event.pos));
++            in_place_level(host).is_some_and(|level| level.has_neighbor_signal(&*host, pos));
+         let control_before = state.redstone;
+         state.redstone.sample(powered);
+         let mut control = state.redstone;
+-        let mut slot = event.entity.items.get_mut(FUEL_SLOT).and_then(Option::take);
++        let mut slot = fuel;
+         let mut pulls = 0_u32;
+         // The runtime pulls one fuel item at a time and consumes it as
+         // upstream's `doBurn` does: one item, or the crafting remainder when
+@@ -91,16 +102,24 @@ impl BlockEntityPart for GeneratorPart {
+             Some(fuel)
+         });
+         state.redstone = control;
+-        if let Some(entry) = event.entity.items.get_mut(FUEL_SLOT) {
+-            *entry = slot;
+-        }
+-        store(&mut event.entity.nbt, &state);
++        let mut after = before.clone();
++        store(&mut after, &state);
++        let _ = event.subject.with_view(|mut view| {
++            if pulls > 0 {
++                let _ = view.set_item_slot(FUEL_SLOT as u32, slot);
++            }
++            for (key, value) in after.iter() {
++                if before.get(key) != Some(value) {
++                    view.set_nbt(key.clone(), Some(value.clone()));
++                }
++            }
++        });
+         // Nothing burnt, nothing pulled and no redstone state moved: no payload to
+         // keep, so the chunk is not dirtied (upstream's `setChanged` only runs
+         // when it changed). A dropped falling edge would lose the signal level,
+         // and then the next rising edge would not be one — hence `persists`.
+-        if !persists(produced, pulls, control_before, state.redstone) {
+-            *event.reply = BlockEntityTickReply::Unchanged;
++        if persists(produced, pulls, control_before, state.redstone) {
++            handle.set_changed(event.subject.host());
+         }
+     }
+ }
+@@ -122,93 +141,97 @@ impl Hooks for Mod {
+     }
+ 
+     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+-        event.commands.extend(declared_commands());
++        event.commands.extend(
++            declared_commands()
++                .into_iter()
++                .map(|command| command.executes(run_command)),
++        );
+     }
++}
+ 
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        let invocation = event.command;
+-        let Some(CommandArgumentValue::BlockPos(pos)) = invocation.argument("pos") else {
+-            return Flow::Continue;
+-        };
+-        let pos = *pos;
+-        match invocation.literals.get(1).map(String::as_str) {
+-            Some("info") => {
+-                let line = match level_of(host, invocation) {
+-                    Some(level) => status_text(host, level, pos),
+-                    None => NO_BLOCK.to_owned(),
+-                };
+-                feedback(host, line);
+-                Flow::Cancel
++/// Run the three usages [`declared_commands`] declares.
++fn run_command(
++    host: &mut dyn ServerHost,
++    source: &mod_api::CommandSource,
++    invocation: &CommandInvocation,
++) -> Option<i32> {
++    let Some(CommandArgumentValue::BlockPos(pos)) = invocation.argument("pos") else {
++        return None;
++    };
++    let pos = *pos;
++    match invocation.literals.get(1).map(String::as_str) {
++        Some("info") => {
++            let line = match level_of(host, invocation) {
++                Some(level) => status_text(host, level, pos),
++                None => NO_BLOCK.to_owned(),
++            };
++            feedback(host, line);
++            Some(1)
++        }
++        Some("set") => {
++            // The usage is registered at level 2; this second check keeps the harness control
++            // closed even if a command source reaches it through a path that does not apply a
++            // usage's level (a function with overrides, or a future dispatcher change).
++            if !may_administer(source_permission(source)) {
++                feedback(
++                    host,
++                    "Only an operator may change a generator's buffer.".to_owned(),
++                );
++                return Some(1);
+             }
+-            Some("set") => {
+-                // The usage is registered at level 2; this second check keeps the harness control
+-                // closed even if a command source reaches it through a path that does not apply a
+-                // usage's level (a function with overrides, or a future dispatcher change).
+-                if !may_administer(source_permission(event.source)) {
+-                    feedback(
+-                        host,
+-                        "Only an operator may change a generator's buffer.".to_owned(),
+-                    );
+-                    return Flow::Cancel;
+-                }
+-                // A player's control reaches only a generator they could touch, whatever their
+-                // command level: the level gate above stops ordinary players, and this stops a
+-                // guest (or an operator) from rewriting a machine across the world. The console,
+-                // command blocks and functions are not player sources and keep acting anywhere.
+-                if is_player_source(event.source) && !within_reach(invocation.position, pos) {
+-                    feedback(host, "That generator is out of reach.".to_owned());
+-                    return Flow::Cancel;
+-                }
+-                let Some(CommandArgumentValue::Integer(amount)) = invocation.argument("amount")
+-                else {
+-                    feedback(host, "The amount must be a whole number of FE.".to_owned());
+-                    return Flow::Cancel;
+-                };
+-                let after = clamp_energy(*amount, CAPACITY);
+-                match set_energy(host, invocation, pos, after) {
+-                    Some(()) => feedback(host, format!("Energy set to {after} FE.")),
+-                    None => feedback(host, NO_BLOCK.to_owned()),
+-                }
+-                Flow::Cancel
++            // A player's control reaches only a generator they could touch, whatever their
++            // command level: the level gate above stops ordinary players, and this stops a
++            // guest (or an operator) from rewriting a machine across the world. The console,
++            // command blocks and functions are not player sources and keep acting anywhere.
++            if is_player_source(source) && !within_reach(invocation.position, pos) {
++                feedback(host, "That generator is out of reach.".to_owned());
++                return Some(1);
+             }
+-            Some("mode") => {
+-                // Upstream changes this from the machine's GUI button; this slice has no menu
+-                // (gap 2), so the harness control stands in — with the same operator gate and
+-                // reach as `set`, because it changes another block's saved state.
+-                if !may_administer(source_permission(event.source)) {
+-                    feedback(
+-                        host,
+-                        "Only an operator may change a generator's redstone mode.".to_owned(),
+-                    );
+-                    return Flow::Cancel;
+-                }
+-                if is_player_source(event.source) && !within_reach(invocation.position, pos) {
+-                    feedback(host, "That generator is out of reach.".to_owned());
+-                    return Flow::Cancel;
+-                }
+-                let Some(CommandArgumentValue::String(wanted)) = invocation.argument("mode") else {
+-                    feedback(host, "The mode must be a word.".to_owned());
+-                    return Flow::Cancel;
+-                };
+-                let Some(mode) = RedstoneMode::parse(&wanted.clone()) else {
+-                    feedback(
+-                        host,
+-                        format!("Unknown redstone mode {wanted}: use ignored, low, high or pulse."),
+-                    );
+-                    return Flow::Cancel;
+-                };
+-                match set_mode(host, invocation, pos, mode) {
+-                    Some(()) => feedback(host, format!("Redstone mode set to {}.", mode.name())),
+-                    None => feedback(host, NO_BLOCK.to_owned()),
+-                }
+-                Flow::Cancel
++            let Some(CommandArgumentValue::Integer(amount)) = invocation.argument("amount")
++            else {
++                feedback(host, "The amount must be a whole number of FE.".to_owned());
++                return Some(1);
++            };
++            let after = clamp_energy(*amount, CAPACITY);
++            match set_energy(host, invocation, pos, after) {
++                Some(()) => feedback(host, format!("Energy set to {after} FE.")),
++                None => feedback(host, NO_BLOCK.to_owned()),
+             }
+-            _ => Flow::Continue,
++            Some(1)
+         }
++        Some("mode") => {
++            // Upstream changes this from the machine's GUI button; this slice has no menu
++            // (gap 2), so the harness control stands in — with the same operator gate and
++            // reach as `set`, because it changes another block's saved state.
++            if !may_administer(source_permission(source)) {
++                feedback(
++                    host,
++                    "Only an operator may change a generator's redstone mode.".to_owned(),
++                );
++                return Some(1);
++            }
++            if is_player_source(source) && !within_reach(invocation.position, pos) {
++                feedback(host, "That generator is out of reach.".to_owned());
++                return Some(1);
++            }
++            let Some(CommandArgumentValue::String(wanted)) = invocation.argument("mode") else {
++                feedback(host, "The mode must be a word.".to_owned());
++                return Some(1);
++            };
++            let Some(mode) = RedstoneMode::parse(&wanted.clone()) else {
++                feedback(
++                    host,
++                    format!("Unknown redstone mode {wanted}: use ignored, low, high or pulse."),
++                );
++                return Some(1);
++            };
++            match set_mode(host, invocation, pos, mode) {
++                Some(()) => feedback(host, format!("Redstone mode set to {}.", mode.name())),
++                None => feedback(host, NO_BLOCK.to_owned()),
++            }
++            Some(1)
++        }
++        _ => None,
+     }
+ }
+ 
+@@ -261,6 +284,7 @@ fn may_administer(permission: Option<mod_api::PermissionLevel>) -> bool {
+ /// `GeneratorItemHandler`.
+ fn fuel_slot() -> ModContainer {
+     ModContainer {
++        insert_rules: Vec::new(),
+         slots: FUEL_SLOT + 1,
+         faces: std::array::from_fn(|_| vec![FUEL_SLOT]),
+         inputs: vec![FUEL_SLOT],
+@@ -388,7 +412,7 @@ fn generator_at(
+     level: LevelRef,
+     pos: [i32; 3],
+ ) -> Option<mod_api::BlockEntityRef> {
+-    if level.block(host, pos)?.id(host) != GENERATOR {
++    if level.block(host, pos)?.id(host) != Some(GENERATOR) {
+         return None;
+     }
+     host.block_entity(level, pos)
+@@ -396,7 +420,7 @@ fn generator_at(
+ 
+ fn stack_line(host: &dyn ServerHost, stack: Option<mod_api::ItemStack>) -> String {
+     match stack {
+-        Some(stack) => format!("{} x{}", stack.item().id(host), stack.count()),
++        Some(stack) => format!("{} x{}", stack.item().id(host).unwrap_or_default(), stack.count()),
+         None => "empty".to_owned(),
+     }
+ }

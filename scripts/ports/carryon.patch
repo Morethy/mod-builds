@@ -1,0 +1,107 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 1fa04c0..d93a89e 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -314,7 +314,7 @@ fn spawn_eggs(host: &dyn Host) -> &'static HashMap<String, ItemKey> {
+         host.item_keys()
+             .into_iter()
+             .filter_map(|k| {
+-                let id = k.id(host);
++                let id = k.id(host)?;
+                 id.strip_suffix("_spawn_egg").map(|kind| (kind.to_string(), k))
+             })
+             .collect()
+@@ -381,7 +381,7 @@ fn set_carry(host: &mut dyn ServerHost, uuid: u128, c: Compound) {
+ 
+ fn hands_empty(host: &dyn Host, player: PlayerRef) -> bool {
+     let living = LivingRef::new(player.entity());
+-    [Hand::Main, Hand::Off].into_iter().all(|h| living.hand_item(host, h).is_none_or(|s| s.count() == 0))
++    [Hand::Main, Hand::Off].into_iter().all(|h| living.with_hand_item(host, h, |s| s.count() == 0).unwrap_or(true))
+ }
+ 
+ /// PickupHandler.canCarryGeneral, but for the key (sneaking) and distance.
+@@ -406,12 +406,12 @@ fn air(host: &dyn Host) -> Option<mod_api::BlockState> {
+ 
+ fn sound_at(host: &mut dyn ServerHost, dim: &str, sound: &str, at: [f64; 3], source: SoundSource, volume: f32, pitch: f32) {
+     if let Some(level) = host.level(dim) {
+-        level.play_sound(host, sound, at, source, volume, pitch);
++        level.play_sound(host, sound, at, source, volume, pitch, None);
+     }
+ }
+ 
+ fn entity_kind(host: &dyn Host, e: EntityRef) -> String {
+-    e.kind(host).map(|k| k.id(host)).unwrap_or_default()
++    e.kind(host).and_then(|k| k.id(host)).map(|n| n.to_string()).unwrap_or_default()
+ }
+ 
+ impl Mod {
+@@ -429,8 +429,8 @@ impl Mod {
+             return false;
+         }
+         let Some(state) = level.block_state(reader, pos) else { return false };
+-        let Some(block) = level.block(reader, pos).map(|k| k.id(reader)) else { return false };
+-        if block == "minecraft:air" || listed(&block, FORBIDDEN_TILES) {
++        let Some(block) = level.block(reader, pos).and_then(|k| k.id(reader)) else { return false };
++        if block == "minecraft:air" || listed(block, FORBIDDEN_TILES) {
+             return false;
+         }
+         if reader.block_states().destroy_speed(state).is_some_and(|s| s < 0.0) && !creative(reader, player) && !PICKUP_UNBREAKABLE {
+@@ -562,15 +562,21 @@ impl Mod {
+                 // Level.isUnobstructed: no mob or player in the way.
+                 let lo = pos.map(f64::from);
+                 let hi = pos.map(|v| f64::from(v) + 1.0);
+-                let blocked = level.entities_in(reader, lo, hi).unwrap_or_default().into_iter().any(|e| {
+-                    let k = entity_kind(reader, e);
+-                    !matches!(k.as_str(), "minecraft:item" | "minecraft:experience_orb" | "minecraft:arrow")
+-                });
++                let blocked = level
++                    .visit_entities_in(reader, lo, hi, &mut |e| {
++                        let k = entity_kind(reader, e);
++                        if matches!(k.as_str(), "minecraft:item" | "minecraft:experience_orb" | "minecraft:arrow") {
++                            std::ops::ControlFlow::Continue(())
++                        } else {
++                            std::ops::ControlFlow::Break(())
++                        }
++                    })
++                    .is_ok_and(|flow| flow.is_break());
+                 if blocked {
+                     return fail(host);
+                 }
+                 let [yaw, pitch] = player.entity().rotation(reader).unwrap_or([0.0, 0.0]);
+-                let in_water = level.block(reader, pos).map(|k| k.id(reader)).as_deref() == Some("minecraft:water")
++                let in_water = level.block(reader, pos).and_then(|k| k.id(reader)) == Some("minecraft:water")
+                     && level.block_property(reader, pos, "level").as_deref() == Some("0");
+                 let carried = get_str(&carry, "block").unwrap_or_default();
+                 let text = placement_state(reader, &carried, &Placement { face, yaw, pitch, in_water });
+@@ -766,15 +772,17 @@ impl Mod {
+             if player.selected_slot(&*host) != Some(selected) {
+                 player.set_selected_slot(host, selected);
+             }
+-            let held = LivingRef::new(player.entity()).hand_item(&*host, Hand::Main).filter(|s| s.count() > 0);
++            let held = LivingRef::new(player.entity()).with_hand_item(&*host, Hand::Main, |s| s.project()).flatten().filter(|s| s.count() > 0);
+             if let Some(stack) = held {
+                 // `inventory_slots` is None when a slot holds an item the game can't hand to a mod (a mod that isn't
+                 // installed): no slot can be trusted to be free then, so the held stack is dropped, not written over
+                 // one.
+-                let free = player.inventory_slots(&*host).and_then(|slots| {
+-                    let used: Vec<u32> = slots.into_iter().map(|(i, _)| i).collect();
+-                    (0..36u32).find(|i| *i as usize != selected && !used.contains(i))
+-                });
++                let free = player
++                    .with_inventory(&*host, |view| {
++                        let used: Vec<u32> = view.iter().map(|(i, _)| i).collect();
++                        (0..36u32).find(|i| *i as usize != selected && !used.contains(i))
++                    })
++                    .flatten();
+                 let _ = player.set_inventory_slot(host, selected as u32, None);
+                 match free {
+                     Some(i) => {
+@@ -846,7 +854,7 @@ fn block_props(props: &[(String, String)], facing: &str) -> Vec<(String, String)
+ /// chest renderer); a block with no item is drawn as its block model, its front to +z.
+ fn draw_block(host: &dyn Host, draw: &mut dyn mod_api::BlockEntityDrawContext, id: &str, props: &[(String, String)]) {
+     let Some(key) = host.block_key(id) else { return };
+-    let item = host.block_item(key).filter(|k| k.id(host) != "minecraft:air").and_then(|k| ItemStack::new(k, 1));
++    let item = host.block_item(key).filter(|k| k.id(host) != Some("minecraft:air")).and_then(|k| ItemStack::new(k, 1));
+     if let Some(stack) = item {
+         draw.push();
+         draw.translate([0.5, 0.5, 0.5]);

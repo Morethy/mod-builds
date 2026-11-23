@@ -1,0 +1,20 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 83fb085..891b256 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -121,10 +121,12 @@ impl Hooks for Mod {
+         let Some(level) = player.level(&*host) else {
+             return Flow::Continue;
+         };
+-        let held = living.hand_item(&*host, mod_api::Hand::Main);
+-        let held_id = held.as_ref().map(|stack| stack.item().id(&*host));
++        let held = living
++            .with_hand_item(&*host, mod_api::Hand::Main, |stack| stack.project())
++            .flatten();
++        let held_id = held.as_ref().and_then(|stack| stack.item().id(&*host).map(str::to_owned));
+         let chosen = held.as_ref().and_then(|stack| bundle_front(&*host, stack));
+-        let current = event.state.block().id(&*host);
++        let current = event.state.block().id(&*host).unwrap_or_default().to_owned();
+         // A stale player handle answers nothing; treat that as "may not build" rather than
+         // letting an unreadable actor write.
+         let may_build = player.may_build(&*host) == Some(true);

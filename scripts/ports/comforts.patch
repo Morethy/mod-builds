@@ -1,0 +1,89 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 4e7799a..b9bd61b 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -98,7 +98,7 @@ struct Mod {
+ impl Hooks for Mod {
+     /// The server config `config/comforts-server.toml`, written from upstream's defaults
+     /// when the file is missing (a world's `serverconfig/` copy wins).
+-    fn register_configs(&self, _host: HostSide, event: &mut RegisterConfigsEvent<'_>) {
++    fn register_configs(&self, _host: &dyn mod_api::ConfigContext, event: &mut RegisterConfigsEvent<'_>) {
+         event.configs.push(ModConfig::new(
+             runtime::MOD_ID,
+             ConfigKind::Server,
+@@ -107,7 +107,7 @@ impl Hooks for Mod {
+     }
+ 
+     /// The file was read: keep the parsed rules.
+-    fn config_loading(&self, _host: HostSide, event: &mut ConfigLoadingEvent<'_>) {
++    fn config_loading(&self, _host: &dyn mod_api::ConfigContext, event: &mut ConfigLoadingEvent<'_>) {
+         self.read_config(event.config);
+     }
+ 
+@@ -130,7 +130,7 @@ impl Hooks for Mod {
+         let Some(block) = level.block(host, event.pos) else {
+             return;
+         };
+-        if !runtime::is_sleeping_bed(&block.id(host)) {
++        if !runtime::is_sleeping_bed(block.id(host).unwrap_or_default()) {
+             return;
+         }
+         let Some(now) = level.day_time(host) else {
+@@ -166,7 +166,7 @@ impl Hooks for Mod {
+         let Some(block) = level.block(host, event.pos) else {
+             return Flow::Continue;
+         };
+-        if !runtime::is_sleeping_bed(&block.id(host)) {
++        if !runtime::is_sleeping_bed(block.id(host).unwrap_or_default()) {
+             return Flow::Continue;
+         }
+         let Some(started) = level.day_time(host) else {
+@@ -227,7 +227,7 @@ impl Hooks for Mod {
+         let Some(block) = level.block(host, event.pos) else {
+             return;
+         };
+-        if !runtime::is_sleeping_bed(&block.id(host)) {
++        if !runtime::is_sleeping_bed(block.id(host).unwrap_or_default()) {
+             return;
+         }
+         if should_break(&config, slept, level_roll(host, level)) {
+@@ -269,7 +269,7 @@ impl Hooks for Mod {
+         let Some(block) = level.block(host, pos) else {
+             return Flow::Continue;
+         };
+-        if runtime::is_sleeping_bed(&block.id(host)) {
++        if runtime::is_sleeping_bed(block.id(host).unwrap_or_default()) {
+             Flow::Cancel
+         } else {
+             Flow::Continue
+@@ -463,12 +463,7 @@ fn wake_target(config: &Config, day_sleeping: bool, current: i64, new_time: i64)
+ /// A draw from the level's own random stream, stored back so vanilla's later draws move
+ /// as a Java mod's would (`Level.random`).
+ fn level_roll(host: &mut dyn ServerHost, level: mod_api::LevelRef) -> Option<f64> {
+-    use mod_api::RandomSource;
+-
+-    let mut random = level.random(host)?;
+-    let roll = random.next_double();
+-    let _ = level.set_random(host, random);
+-    Some(roll)
++    level.with_random(host, |random| random.next_double())
+ }
+ 
+ /// Both halves of the bag are removed without drops (`ComfortsEvents.onWakeUp`), with
+@@ -482,7 +477,7 @@ fn break_bag(host: &mut dyn ServerHost, level: mod_api::LevelRef, head: [i32; 3]
+     for pos in [head, foot_pos(head, facing.as_deref())] {
+         let ours = level
+             .block(host, pos)
+-            .is_some_and(|block| runtime::is_sleeping_bed(&block.id(host)));
++            .is_some_and(|block| runtime::is_sleeping_bed(block.id(host).unwrap_or_default()));
+         if ours {
+             let _ = level.set_block(host, pos, air, flags);
+         }
+@@ -499,6 +494,7 @@ fn break_bag(host: &mut dyn ServerHost, level: mod_api::LevelRef, head: [i32; 3]
+         SoundSource::Blocks,
+         1.0,
+         1.0,
++        None,
+     );
+ }
+ 

@@ -1,0 +1,144 @@
+diff --git a/src/laser.rs b/src/laser.rs
+index 4301abc..9881eef 100644
+--- a/src/laser.rs
++++ b/src/laser.rs
+@@ -91,8 +91,11 @@ impl BlockEntityPart for Node {
+     }
+ 
+     /// One node tick: queue it for the level tick's end.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        let Some(level) = level_in_place(host) else {
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        let Some(pos) = event.subject.with_view(|view| view.position()) else {
++            return;
++        };
++        let Some(level) = level_in_place(event.subject.host()) else {
+             return;
+         };
+         // Only this expression runs under the lock: one insert on the port's own
+@@ -100,7 +103,7 @@ impl BlockEntityPart for Node {
+         self.queue
+             .lock()
+             .expect("the laser node queue lock is held for one insert")
+-            .push(level, event.pos);
++            .push(level, pos);
+     }
+ }
+ 
+@@ -329,16 +332,16 @@ fn run_card(
+         let Some(target) = container(host, level, to_pos, opposite(destination.face)) else {
+             return 0;
+         };
+-        let took = source.extract(host, tx, slot, &resource, remaining);
++        let took = source.extract_at(host, tx, slot, &resource, remaining);
+         if took == 0 {
+             return 0;
+         }
+-        let put = target.insert_any(host, tx, &resource, took);
++        let put = target.insert(host, tx, &resource, took).unwrap_or(0);
+         if put < took {
+             // Give the refused part back: the slot it came from has room for it
+             // again, and the whole move is inside one transaction.
+             let missing = took - put;
+-            let restored = source.insert_any(host, tx, &resource, missing);
++            let restored = source.insert(host, tx, &resource, missing).unwrap_or(0);
+             if restored < missing {
+                 // The source cannot take it back. Abort the network's transaction
+                 // so nothing of this tick moved, instead of losing the remainder.
+@@ -466,7 +469,7 @@ pub(crate) fn place_card_from_item(
+     let Some(face) = face_of_normal(normal) else {
+         return Placement::NotMine;
+     };
+-    if held.item().id(host) != CARD {
++    if held.item().id(host) != Some(CARD) {
+         return Placement::NotMine;
+     }
+     // A spectator's click is still delivered to this hook at this pin; installing a
+diff --git a/src/lib.rs b/src/lib.rs
+index 8352b6e..008807d 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
+ 
+ use mod_api::{
+     self, Command, Flow, Hand, Hooks, HostSide, LevelTickPostEvent, RegisterCommandsEvent,
+-    Registrar, RegistrationContext, RightClickBlockEvent, RunModCommandEvent, ServerHost,
++    Registrar, RegistrationContext, RightClickBlockEvent, ServerHost,
+ };
+ 
+ use crate::laser::{Node, Placement, Queue};
+@@ -117,48 +117,48 @@ impl Hooks for Mod {
+     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+         event
+             .commands
+-            .push(Command::new("laserio info <pos:block_pos>"));
++            .push(Command::new("laserio info <pos:block_pos>").executes(run_command));
+         event
+             .commands
+-            .push(Command::op("laserio card <pos:block_pos> <side:word>", 2));
++            .push(Command::op("laserio card <pos:block_pos> <side:word>", 2).executes(run_command));
+         event
+             .commands
+-            .push(Command::op("laserio remove <pos:block_pos> <side:word>", 2));
++            .push(Command::op("laserio remove <pos:block_pos> <side:word>", 2).executes(run_command));
+         event.commands.push(Command::op(
+             "laserio mode <pos:block_pos> <side:word> <mode:word>",
+             2,
+-        ));
++        ).executes(run_command));
+         event.commands.push(Command::op(
+             "laserio rate <pos:block_pos> <side:word> <amount:integer>",
+             2,
+-        ));
++        ).executes(run_command));
+         event.commands.push(Command::op(
+             "laserio channel <pos:block_pos> <side:word> <channel:integer>",
+             2,
+-        ));
++        ).executes(run_command));
+         event
+             .commands
+-            .push(Command::op("laserio face <pos:block_pos> <side:word>", 2));
++            .push(Command::op("laserio face <pos:block_pos> <side:word>", 2).executes(run_command));
+     }
++}
+ 
+-    /// Run the seven usages [`Hooks::register_commands`] declares, after the game
+-    /// has parsed and permission-checked them.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        let literals: Vec<&str> = event.command.literals.iter().map(String::as_str).collect();
+-        match literals.as_slice() {
+-            ["laserio", "info"] => laser::info(host, event.command),
+-            ["laserio", "card"] => laser::set_card_command(host, event.command, true),
+-            ["laserio", "remove"] => laser::set_card_command(host, event.command, false),
+-            ["laserio", "mode"] => laser::set_mode_command(host, event.command),
+-            ["laserio", "rate"] => laser::set_rate_command(host, event.command),
+-            ["laserio", "channel"] => laser::set_channel_command(host, event.command),
+-            ["laserio", "face"] => laser::set_face_command(host, event.command),
+-            _ => return Flow::Continue,
+-        }
+-        Flow::Cancel
++/// Run the seven usages [`Hooks::register_commands`] declares, after the game
++/// has parsed and permission-checked them.
++fn run_command(
++    host: &mut dyn ServerHost,
++    _source: &mod_api::CommandSource,
++    command: &mod_api::CommandInvocation,
++) -> Option<i32> {
++    let literals: Vec<&str> = command.literals.iter().map(String::as_str).collect();
++    match literals.as_slice() {
++        ["laserio", "info"] => laser::info(host, command),
++        ["laserio", "card"] => laser::set_card_command(host, command, true),
++        ["laserio", "remove"] => laser::set_card_command(host, command, false),
++        ["laserio", "mode"] => laser::set_mode_command(host, command),
++        ["laserio", "rate"] => laser::set_rate_command(host, command),
++        ["laserio", "channel"] => laser::set_channel_command(host, command),
++        ["laserio", "face"] => laser::set_face_command(host, command),
++        _ => return None,
+     }
++    Some(1)
+ }

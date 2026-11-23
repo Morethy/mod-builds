@@ -1,0 +1,219 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 2b6a8cb..c9c3d69 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -15,7 +15,7 @@ use mod_api::{
+     BlockState, ClientHost, LevelHost, ServerHost,
+     BlockChangedEvent, BlockPart, BlocksEvent, BreakBlockEvent, ClientTickPostEvent, Flow, Hooks, HostSide,
+     InteractionResult, ItemPart, ItemsEvent, OnBlockPlacedByEvent, RegisterCommandsEvent, Registrar,
+-    RegistrationContext, RightClickBlockEvent, RunModCommandEvent, ScreenCharTypedPreEvent,
++    RegistrationContext, RightClickBlockEvent, ScreenCharTypedPreEvent,
+     ScreenKeyPressedPreEvent, ScreenMouseButtonPressedPreEvent, ScreenMouseScrolledPreEvent,
+     ScreenRenderPostEvent, ServerTickEvent, StateForPlacementEvent, UseItemEvent, UseOnEvent,
+     WorldLifecycleEvent,
+@@ -35,21 +35,17 @@ impl Hooks for Mod {
+     }
+ 
+     fn blocks(&self, _: &RegistrationContext, event: &mut BlocksEvent<'_>) {
+-        server::blocks(event.blocks);
++        server::blocks(event);
+     }
+ 
+     fn items(&self, _: &RegistrationContext, event: &mut ItemsEvent<'_>) {
+-        server::items(event.items);
++        server::items(event);
+     }
+ 
+     fn register_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+         server::commands(event.commands);
+     }
+ 
+-    fn run_mod_command(&self, host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>) -> Flow {
+-        server::command(host, event)
+-    }
+-
+     fn right_click_block(&self, host: HostSide<'_>, event: &mut RightClickBlockEvent<'_>) -> Flow {
+         let HostSide::Server(host) = host else {
+             return Flow::Continue;
+@@ -119,9 +115,10 @@ impl BlockPart for StoneBlock {
+     /// A stone needs room for its upper block: none where there is none.
+     fn state_for_placement(
+         &self,
+-        level: &dyn LevelHost,
++        level: mod_api::LevelSide<'_>,
+         event: &mut StateForPlacementEvent,
+     ) -> Option<Option<BlockState>> {
++        let (mod_api::LevelSide::Server(level) | mod_api::LevelSide::Client(level)) = level;
+         if server::room_above(level, event.context.pos) { None } else { Some(None) }
+     }
+ }
+diff --git a/src/screen.rs b/src/screen.rs
+index 6aedbee..2e34fa6 100644
+--- a/src/screen.rs
++++ b/src/screen.rs
+@@ -94,7 +94,7 @@ pub(crate) fn render(host: &dyn ClientHost, event: &mut ScreenRenderPostEvent<'_
+         open.window = draw.size();
+         open.cooldown = rules::seconds_left(open.ready_at, now_ms());
+         open.render(event.screen.mouse, caret, &|text| draw.text_width(text), &|m| {
+-            host.text_string(&line(m)).unwrap_or_else(|_| m.key.clone())
++            host.text_string(&line(m))
+         })
+     };
+     let draw = &mut *event.draw;
+diff --git a/src/server.rs b/src/server.rs
+index 085f4c9..66fba84 100644
+--- a/src/server.rs
++++ b/src/server.rs
+@@ -3,9 +3,9 @@
+ use crate::rules;
+ use mod_api::{
+     Block, BlockChangedEvent, BlockKey, BlockProperties, BlockShapes, Command, CommandArgumentValue,
+-    CommandSource, Flow, IPayloadContext, IPayloadHandler, Identifier, Item, ItemKey, LevelRef, PayloadBytes,
++    CommandSource, IPayloadContext, IPayloadHandler, Identifier, Item, ItemKey, LevelRef, PayloadBytes,
+     LevelDimension, LevelHost, PayloadHandleError, PayloadId, PlayerRef, PushReaction, Rarity, Registrar,
+-    RunModCommandEvent, ServerHost, Text, text::TextStyle,
++    ServerHost, Text, text::TextStyle,
+ };
+ use std::{
+     collections::HashMap,
+@@ -282,7 +282,7 @@ fn pl(host: &dyn ServerHost, player: PlayerRef) -> Option<Pl> {
+     Some(Pl {
+         player,
+         uuid: player.uuid(),
+-        name: player.name(host)?,
++        name: player.name(host)?.to_owned(),
+         level: player.permission_level(host).unwrap_or(0),
+         dimension: identifier(&player.dimension(host)?),
+         position: player.entity().position(host)?,
+@@ -341,7 +341,7 @@ fn tell(host: &mut dyn ServerHost, player: PlayerRef, line: Text) {
+ /// neighbours' faces, which a model narrower than a cube needs. A piston neither moves nor crushes
+ /// them, so it never parts the two. The lower block has the item. Textures, models, the language
+ /// files, the loot tables, the recipes and the villages are this package's `assets/` and `data/`.
+-pub(crate) fn blocks(blocks: &mut Vec<Block>) {
++pub(crate) fn blocks(blocks: &mut mod_api::BlocksEvent<'_>) {
+     for (id, item) in [(rules::BLOCK, true), (rules::TOP, false)] {
+         // Narrower than a block, as tall as one: a player stands on top.
+         let shape = vec![[0.125, 0.0, 0.125, 0.875, 1.0, 0.875]];
+@@ -360,27 +360,27 @@ pub(crate) fn blocks(blocks: &mut Vec<Block>) {
+             values: std::collections::BTreeMap::new(),
+             default: Some(shape),
+         });
+-        blocks.push(block);
++        let _ = blocks.register(block);
+     }
+ }
+ 
+ /// The wayfarer's scroll: paper that opens the menu from anywhere and is used up by the travel.
+-pub(crate) fn items(items: &mut Vec<Item>) {
++pub(crate) fn items(items: &mut mod_api::ItemsEvent<'_>) {
+     let mut scroll = Item::new(rules::SCROLL, "minecraft:paper");
+     scroll.max_stack_size = Some(16);
+     scroll.rarity = Some(Rarity::Uncommon);
+-    items.push(scroll);
++    let _ = items.register(scroll);
+ }
+ 
+ /// The commands in every player's command tree.
+-pub(crate) fn commands(commands: &mut Vec<Command>) {
+-    commands.push(Command::new("wayfarer"));
+-    commands.push(Command::new("wayfarer list"));
+-    commands.push(Command::new("wayfarer to <name:text>"));
+-    commands.push(Command::new("wayfarer name <name:text>"));
+-    commands.push(Command::new("wayfarer forget <name:text>"));
+-    commands.push(Command::op("wayfarer global <name:text>", 2));
+-    commands.push(Command::op("wayfarer remove <name:text>", 2));
++pub(crate) fn commands(commands: &mut Vec<mod_api::CommandRegistration>) {
++    commands.push(Command::new("wayfarer").executes(command));
++    commands.push(Command::new("wayfarer list").executes(command));
++    commands.push(Command::new("wayfarer to <name:text>").executes(command));
++    commands.push(Command::new("wayfarer name <name:text>").executes(command));
++    commands.push(Command::new("wayfarer forget <name:text>").executes(command));
++    commands.push(Command::op("wayfarer global <name:text>", 2).executes(command));
++    commands.push(Command::op("wayfarer remove <name:text>", 2).executes(command));
+ }
+ 
+ // ---- blocks in the world -------------------------------------------------------
+@@ -420,7 +420,7 @@ fn cell(host: &dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> Option<rules::
+         return None;
+     }
+     let state = level.block_state(host, pos)?;
+-    Some(match state.block().id(host).as_str() {
++    Some(match state.block().id(host).unwrap_or_default() {
+         "minecraft:lava" | "minecraft:fire" | "minecraft:soul_fire" => rules::Cell::Hazard,
+         _ if host.block_in_tag(state.block(), "minecraft:replaceable").unwrap_or(false) => rules::Cell::Passable,
+         _ => rules::Cell::Solid,
+@@ -595,7 +595,7 @@ pub(crate) fn right_click(host: &mut dyn ServerHost, player: u128, pos: [i32; 3]
+     };
+     let [x, y, z] = lower;
+     let above = block_at(host, level, [x, y + 1, z]);
+-    let air = above.is_some_and(|b| b.id(host) == "minecraft:air");
++    let air = above.is_some_and(|b| b.id(host) == Some("minecraft:air"));
+     let Some(mut guard) = world_state(host) else {
+         return true;
+     };
+@@ -639,9 +639,9 @@ pub(crate) fn use_scroll(host: &mut dyn ServerHost, player: u128) -> bool {
+ }
+ 
+ /// The command line as the rules read it: its words, then its text argument.
+-fn command_line(event: &RunModCommandEvent<'_>) -> String {
+-    let mut line = event.command.literals.join(" ");
+-    if let Some(CommandArgumentValue::String(name)) = event.command.argument("name") {
++fn command_line(command: &mod_api::CommandInvocation) -> String {
++    let mut line = command.literals.join(" ");
++    if let Some(CommandArgumentValue::String(name)) = command.argument("name") {
+         line.push(' ');
+         line.push_str(&name);
+     }
+@@ -649,22 +649,26 @@ fn command_line(event: &RunModCommandEvent<'_>) -> String {
+ }
+ 
+ /// A player's command: ours, when it is one.
+-pub(crate) fn command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>) -> Flow {
+-    let word = event.command.literals.first().map(String::as_str).unwrap_or_default();
++fn command(
++    host: &mut dyn ServerHost,
++    source: &CommandSource,
++    command: &mod_api::CommandInvocation,
++) -> Option<i32> {
++    let word = command.literals.first().map(String::as_str).unwrap_or_default();
+     if !rules::COMMANDS.contains(&word) {
+-        return Flow::Continue;
++        return None;
+     }
+-    let CommandSource::Player { player, .. } = event.source else {
++    let CommandSource::Player { player, .. } = source else {
+         let _ = host.commands().feedback(red(rules::msg("wayfarer_stones.error.no_world", &[])));
+-        return Flow::Cancel;
++        return Some(1);
+     };
+     let Some(p) = pl(host, *player) else {
+-        return Flow::Cancel;
++        return Some(1);
+     };
+-    let line = command_line(event);
++    let line = command_line(command);
+     let Some(mut guard) = world_state(host) else {
+         let _ = host.commands().feedback(red(rules::msg("wayfarer_stones.error.no_world", &[])));
+-        return Flow::Cancel;
++        return Some(1);
+     };
+     let st = guard.as_mut().expect("opened");
+     let mut replies = Vec::new();
+@@ -686,7 +690,7 @@ pub(crate) fn command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<
+     for reply in replies {
+         let _ = host.commands().feedback(reply);
+     }
+-    Flow::Cancel
++    Some(1)
+ }
+ 
+ /// A request from a player's client, checked here as any player's input.
+@@ -820,7 +824,7 @@ pub(crate) fn tick(host: &mut dyn ServerHost) {
+         .levels()
+         .list_levels()
+         .into_iter()
+-        .filter_map(|level| Some((level.dimension().id(host)?, level)))
++        .filter_map(|level| Some((level.dimension().id(host)?.to_owned(), level)))
+         .collect();
+     let landing_spot = |w: &rules::Stone| match levels.get(&w.dimension) {
+         Some(level) => rules::landing_spot(w, &|pos| cell(host, *level, pos)),

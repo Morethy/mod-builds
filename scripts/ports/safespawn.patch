@@ -1,0 +1,13 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 667587f..b085102 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -87,7 +87,7 @@ fn full_cube(boxes: &[[f64; 6]]) -> bool {
+ }
+ 
+ fn block_id(host: &dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> String {
+-    level.block(host, pos).map(|k| k.id(host)).unwrap_or_default()
++    level.block(host, pos).and_then(|k| k.id(host)).map(str::to_owned).unwrap_or_default()
+ }
+ 
+ fn collision(host: &dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> Vec<[f64; 6]> {

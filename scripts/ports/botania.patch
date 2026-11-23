@@ -1,0 +1,359 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index db2fac9..cef8737 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -22,7 +22,7 @@ use mod_api::{
+     self, BlockEntityPart, BlockEntityTickEvent, BlockEntityTicksEvent, BlockKey, BlockPart,
+     Command, CommandArgumentValue, Compound, Flow, Hooks, Host, HostSide, ItemEntityRef, ItemKey,
+     ItemPart, ItemStack, LevelRef, OnBlockPlacedByEvent, RegisterCommandsEvent, Registrar,
+-    RegistrationContext, RemovalReason, RightClickBlockEvent, RunModCommandEvent, ServerHost, Tag,
++    RegistrationContext, RemovalReason, RightClickBlockEvent, ServerHost, Tag,
+     Text,
+ };
+ use runtime::{
+@@ -80,12 +80,8 @@ impl BlockEntityPart for EndoflamePart {
+         event.ticks = true;
+     }
+ 
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        let Some(level) = level_in_place(host) else {
+-            *event.reply = mod_api::BlockEntityTickReply::Unchanged;
+-            return;
+-        };
+-        tick_endoflame(host, level, event.pos, &mut event.entity.nbt);
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        tick_with_data(event, tick_endoflame);
+     }
+ }
+ 
+@@ -102,12 +98,48 @@ impl BlockEntityPart for SpreaderPart {
+         event.ticks = true;
+     }
+ 
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        let Some(level) = level_in_place(host) else {
+-            *event.reply = mod_api::BlockEntityTickReply::Unchanged;
+-            return;
+-        };
+-        tick_spreader(host, level, event.pos, &mut event.entity.nbt);
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        tick_with_data(event, tick_spreader);
++    }
++}
++
++/// Run one tick's body on a copy of the block entity's data, in the level in place, then
++/// write back what it changed and mark the chunk unsaved.
++fn tick_with_data(
++    event: &mut BlockEntityTickEvent<'_>,
++    tick: fn(&mut dyn ServerHost, LevelRef, [i32; 3], &mut Compound),
++) {
++    let Some((pos, handle, before)) = event
++        .subject
++        .with_view(|view| (view.position(), view.handle(), view.nbt().clone()))
++    else {
++        return;
++    };
++    let host = event.subject.host();
++    let Some(level) = level_in_place(host) else {
++        return;
++    };
++    let mut nbt = before.clone();
++    tick(host, level, pos, &mut nbt);
++    let changed = event
++        .subject
++        .with_view(|mut view| {
++            let mut changed = false;
++            for (key, value) in nbt.iter() {
++                if before.get(key) != Some(value) {
++                    changed |= view.set_nbt(key.clone(), Some(value.clone()));
++                }
++            }
++            for (key, _) in before.iter() {
++                if nbt.get(key).is_none() {
++                    changed |= view.set_nbt(key.clone(), None);
++                }
++            }
++            changed
++        })
++        .unwrap_or(false);
++    if changed {
++        handle.set_changed(event.subject.host());
+     }
+ }
+ 
+@@ -125,7 +157,7 @@ struct SpreaderPlacementPart;
+ #[mod_api::sunrise_part]
+ impl ItemPart for SpreaderPlacementPart {
+     fn on_block_placed_by(&self, host: &mut dyn ServerHost, event: &mut OnBlockPlacedByEvent<'_>) {
+-        if event.state.block().id(host) != MANA_SPREADER {
++        if event.state.block().id(host) != Some(MANA_SPREADER) {
+             return;
+         }
+         let Some(placer) = event.placer else {
+@@ -212,114 +244,114 @@ impl Hooks for Mod {
+     fn register_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+         event
+             .commands
+-            .push(Command::new("botania info <pos:block_pos>"));
++            .push(Command::new("botania info <pos:block_pos>").executes(run_command));
+         event.commands.push(Command::op(
+             "botania mana <pos:block_pos> <amount:integer>",
+             2,
+-        ));
++        ).executes(run_command));
+         event
+             .commands
+-            .push(Command::op("botania aim <pos:block_pos> <axis:word>", 2));
++            .push(Command::op("botania aim <pos:block_pos> <axis:word>", 2).executes(run_command));
+     }
++}
+ 
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        let invocation = event.command;
+-        let Some(CommandArgumentValue::BlockPos(pos)) = invocation.argument("pos") else {
+-            return Flow::Continue;
+-        };
+-        let pos = *pos;
+-        match invocation.literals.get(1).map(String::as_str) {
+-            Some("info") => {
+-                let Some(level) = level_of(host, invocation) else {
+-                    feedback(host, format!("{pos:?} is not a mod block entity."));
+-                    return Flow::Cancel;
+-                };
+-                let line = readout(host, level, pos);
+-                feedback(host, line);
+-                Flow::Cancel
+-            }
+-            Some("mana") => {
+-                let Some(CommandArgumentValue::Integer(amount)) = invocation.argument("amount")
+-                else {
+-                    feedback(host, "usage: /botania mana <x> <y> <z> <amount>".to_owned());
+-                    return Flow::Cancel;
+-                };
+-                let Some(level) = level_of(host, invocation) else {
+-                    feedback(host, format!("{pos:?} is not a Botania mana block."));
+-                    return Flow::Cancel;
+-                };
+-                let Some(id) = block_id(host, level, pos) else {
++/// Run the three usages `register_commands` declares.
++fn run_command(
++    host: &mut dyn ServerHost,
++    _source: &mod_api::CommandSource,
++    invocation: &mod_api::CommandInvocation,
++) -> Option<i32> {
++    let Some(CommandArgumentValue::BlockPos(pos)) = invocation.argument("pos") else {
++        return None;
++    };
++    let pos = *pos;
++    match invocation.literals.get(1).map(String::as_str) {
++        Some("info") => {
++            let Some(level) = level_of(host, invocation) else {
++                feedback(host, format!("{pos:?} is not a mod block entity."));
++                return Some(1);
++            };
++            let line = readout(host, level, pos);
++            feedback(host, line);
++            Some(1)
++        }
++        Some("mana") => {
++            let Some(CommandArgumentValue::Integer(amount)) = invocation.argument("amount")
++            else {
++                feedback(host, "usage: /botania mana <x> <y> <z> <amount>".to_owned());
++                return Some(1);
++            };
++            let Some(level) = level_of(host, invocation) else {
++                feedback(host, format!("{pos:?} is not a Botania mana block."));
++                return Some(1);
++            };
++            let Some(id) = block_id(host, level, pos) else {
++                feedback(host, format!("{pos:?} is not a Botania mana block."));
++                return Some(1);
++            };
++            let capacity = match id.as_str() {
++                ENDOFLAME => runtime::ENDOFLAME_MAX_MANA,
++                MANA_SPREADER => SPREADER_CAPACITY,
++                MANA_POOL => runtime::POOL_CAPACITY,
++                _ => {
+                     feedback(host, format!("{pos:?} is not a Botania mana block."));
+-                    return Flow::Cancel;
+-                };
+-                let capacity = match id.as_str() {
+-                    ENDOFLAME => runtime::ENDOFLAME_MAX_MANA,
+-                    MANA_SPREADER => SPREADER_CAPACITY,
+-                    MANA_POOL => runtime::POOL_CAPACITY,
+-                    _ => {
+-                        feedback(host, format!("{pos:?} is not a Botania mana block."));
+-                        return Flow::Cancel;
+-                    }
+-                };
+-                let mut data = Compound::new();
+-                write_int(&mut data, KEY_MANA, (*amount).clamp(0, capacity));
+-                let changed = merge_data(host, level, pos, data);
++                    return Some(1);
++                }
++            };
++            let mut data = Compound::new();
++            write_int(&mut data, KEY_MANA, (*amount).clamp(0, capacity));
++            let changed = merge_data(host, level, pos, data);
++            feedback(
++                host,
++                if changed {
++                    format!("{id} at {pos:?}: set to {amount} mana.")
++                } else {
++                    format!("{pos:?} is not a Botania mana block.")
++                },
++            );
++            Some(1)
++        }
++        Some("aim") => {
++            let Some(CommandArgumentValue::String(axis)) = invocation.argument("axis") else {
+                 feedback(
+                     host,
+-                    if changed {
+-                        format!("{id} at {pos:?}: set to {amount} mana.")
+-                    } else {
+-                        format!("{pos:?} is not a Botania mana block.")
+-                    },
++                    "usage: /botania aim <x> <y> <z> <north|south|east|west|up|down>"
++                        .to_owned(),
+                 );
+-                Flow::Cancel
+-            }
+-            Some("aim") => {
+-                let Some(CommandArgumentValue::String(axis)) = invocation.argument("axis") else {
+-                    feedback(
+-                        host,
+-                        "usage: /botania aim <x> <y> <z> <north|south|east|west|up|down>"
+-                            .to_owned(),
+-                    );
+-                    return Flow::Cancel;
+-                };
+-                let Some(aim) = axis_from_name(axis) else {
+-                    feedback(
+-                        host,
+-                        "usage: /botania aim <x> <y> <z> <north|south|east|west|up|down>"
+-                            .to_owned(),
+-                    );
+-                    return Flow::Cancel;
+-                };
+-                let Some(level) = level_of(host, invocation) else {
+-                    feedback(host, format!("{pos:?} is not a mana spreader."));
+-                    return Flow::Cancel;
+-                };
+-                if !is_block(&*host, level, pos, &SPREADER_KEY) {
+-                    feedback(host, format!("{pos:?} is not a mana spreader."));
+-                    return Flow::Cancel;
+-                }
+-                let (rotation_x, rotation_y) = rotation_for_aim(aim);
+-                let mut data = Compound::new();
+-                write_float(&mut data, KEY_ROTATION_X, rotation_x);
+-                write_float(&mut data, KEY_ROTATION_Y, rotation_y);
+-                let changed = merge_data(host, level, pos, data);
++                return Some(1);
++            };
++            let Some(aim) = axis_from_name(axis) else {
+                 feedback(
+                     host,
+-                    if changed {
+-                        format!("Mana Spreader at {pos:?}: aim set to {aim:?}.")
+-                    } else {
+-                        format!("{pos:?} is not a mana spreader.")
+-                    },
++                    "usage: /botania aim <x> <y> <z> <north|south|east|west|up|down>"
++                        .to_owned(),
+                 );
+-                Flow::Cancel
++                return Some(1);
++            };
++            let Some(level) = level_of(host, invocation) else {
++                feedback(host, format!("{pos:?} is not a mana spreader."));
++                return Some(1);
++            };
++            if !is_block(&*host, level, pos, &SPREADER_KEY) {
++                feedback(host, format!("{pos:?} is not a mana spreader."));
++                return Some(1);
+             }
+-            _ => Flow::Continue,
++            let (rotation_x, rotation_y) = rotation_for_aim(aim);
++            let mut data = Compound::new();
++            write_float(&mut data, KEY_ROTATION_X, rotation_x);
++            write_float(&mut data, KEY_ROTATION_Y, rotation_y);
++            let changed = merge_data(host, level, pos, data);
++            feedback(
++                host,
++                if changed {
++                    format!("Mana Spreader at {pos:?}: aim set to {aim:?}.")
++                } else {
++                    format!("{pos:?} is not a mana spreader.")
++                },
++            );
++            Some(1)
+         }
++        _ => None,
+     }
+ }
+ 
+@@ -517,26 +549,28 @@ fn dropped_fuel(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> DroppedFuel
+         f64::from(pos[1] + range + 1),
+         f64::from(pos[2] + range + 1),
+     ];
+-    let Some(entities) = level.entities_in(host, min, max) else {
+-        return DroppedFuel::none();
+-    };
+-    for entity in entities {
++    let mut found = DroppedFuel::none();
++    let visited = level.visit_entities_in(host, min, max, &mut |entity| {
+         let Some(item) = host.item_entity(entity) else {
+-            continue;
++            return std::ops::ControlFlow::Continue(());
+         };
+-        let Some(stack) = item.stack(host) else {
+-            continue;
++        let Some(stack) = item.with_stack(host, |stack| stack.project()).flatten() else {
++            return std::ops::ControlFlow::Continue(());
+         };
+         let Some(burn_time) = burn_time_of(host, &stack) else {
+-            continue;
++            return std::ops::ControlFlow::Continue(());
+         };
+-        return DroppedFuel {
++        found = DroppedFuel {
+             burn_time: Some(burn_time),
+             item: Some(item),
+             taken: None,
+         };
++        std::ops::ControlFlow::Break(())
++    });
++    if visited.is_err() {
++        return DroppedFuel::none();
+     }
+-    DroppedFuel::none()
++    found
+ }
+ 
+ /// `EndoflameBlockEntity.getBurnTime`: an item with a smelting burn time, no
+@@ -555,7 +589,7 @@ fn burn_time_of(host: &dyn Host, stack: &ItemStack) -> Option<u32> {
+ /// `EntityHelper.shrinkItem`: take one item out of the dropped stack; an empty
+ /// stack is removed (`ItemEntity.discard`) rather than written as a zero count.
+ fn consume_one(host: &mut dyn ServerHost, item: ItemEntityRef) {
+-    let Some(stack) = item.stack(host) else {
++    let Some(stack) = item.with_stack(host, |stack| stack.project()).flatten() else {
+         return;
+     };
+     let count = stack.count();
+@@ -648,7 +682,10 @@ fn is_block(host: &dyn Host, level: LevelRef, pos: [i32; 3], key: &OnceLock<Bloc
+ }
+ 
+ fn block_id(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> Option<String> {
+-    level.block(host, pos).map(|key| key.id(host))
++    level
++        .block(host, pos)
++        .and_then(|key| key.id(host))
++        .map(str::to_owned)
+ }
+ 
+ /// Merge `data` into the block entity at `pos` (`BlockDataAccessor.setData`:

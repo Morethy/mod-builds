@@ -141,6 +141,8 @@ def apply_port(files, patch):
                 lines = out[name].splitlines(keepends=True)
             else:
                 return None
+            # A file with Windows line ends keeps them (a patch made on Windows may have lost the CR).
+            eol = b"\r\n" if lines and lines[0].endswith(b"\r\n") else b"\n"
             delta = 0
             continue
         if row.startswith(b"@@ ") and lines is not None:
@@ -151,11 +153,11 @@ def apply_port(files, patch):
             at = max(begin - 1, 0) + delta
             i += 1
             while i < len(rows) and rows[i][:1] in (b" ", b"+", b"-", b"\\"):
-                kind, body = rows[i][:1], rows[i][1:] + b"\n"
+                kind, body = rows[i][:1], rows[i][1:].rstrip(b"\r") + eol
                 if kind == b"\\":
                     # "No newline at end of file": the line before it has none.
                     if rows[i - 1][:1] == b"+" and at > 0:
-                        lines[at - 1] = lines[at - 1].rstrip(b"\n")
+                        lines[at - 1] = lines[at - 1].rstrip(b"\r\n")
                     i += 1
                     continue
                 if kind == b"+":
@@ -163,7 +165,7 @@ def apply_port(files, patch):
                     at += 1
                     delta += 1
                 else:
-                    if at >= len(lines) or lines[at].rstrip(b"\n") != body.rstrip(b"\n"):
+                    if at >= len(lines) or lines[at].rstrip(b"\r\n") != body.rstrip(b"\r\n"):
                         return None
                     if kind == b"-":
                         del lines[at]

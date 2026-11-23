@@ -1,0 +1,83 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 57f7de6..ebdbe05 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -30,42 +30,33 @@ fn carrier_uuid(text: &str) -> Option<EntityUuid> {
+ #[mod_api::sunrise_mod]
+ impl Hooks for Undertow {
+     fn register_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+-        event
+-            .commands
+-            .push(Command::new("undertow_carrier <uuid:text>"));
+-    }
+-
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        if event.command.literals.first().map(String::as_str) != Some("undertow_carrier") {
+-            return Flow::Continue;
+-        }
+-        let (CommandSource::Player { player, .. }, Some(CommandArgumentValue::String(raw))) =
+-            (event.source, event.command.argument("uuid"))
+-        else {
+-            return Flow::Cancel;
+-        };
+-        if let Some(entity) = carrier_uuid(raw).and_then(|id| host.entity_by_uuid(id)) {
+-            let Some(pos) = entity.position(host) else {
+-                return Flow::Cancel;
+-            };
+-            if pos
+-                .iter()
+-                .zip(event.command.position)
+-                .map(|(a, b)| (a - b).powi(2))
+-                .sum::<f64>()
+-                <= 25.0
+-            {
+-                let _ = player.tell(
+-                    host,
+-                    Text::literal(format!("undertow:carrier:{raw}|{}", entity.id())),
+-                );
+-            }
+-        }
+-        Flow::Cancel
++        event.commands.push(
++            Command::new("undertow_carrier <uuid:text>").executes(|host, source, command| {
++                let (CommandSource::Player { player, .. }, Some(CommandArgumentValue::String(raw))) =
++                    (source, command.argument("uuid"))
++                else {
++                    return Some(1);
++                };
++                if let Some(entity) = carrier_uuid(&raw).and_then(|id| host.entity_by_uuid(id)) {
++                    let Some(pos) = entity.position(host) else {
++                        return Some(1);
++                    };
++                    if pos
++                        .iter()
++                        .zip(command.position)
++                        .map(|(a, b)| (a - b).powi(2))
++                        .sum::<f64>()
++                        <= 25.0
++                    {
++                        let _ = player.tell(
++                            host,
++                            Text::literal(format!("undertow:carrier:{raw}|{}", entity.id())),
++                        );
++                    }
++                }
++                Some(1)
++            }),
++        );
+     }
+ 
+     fn client_chat_received(
+@@ -262,7 +253,7 @@ impl EntityRenderLayer for CarrierLayer {
+     fn submit(
+         &self,
+         entity: &EntityRenderState,
+-        _: Option<&PosedParts>,
++        _: Option<&dyn FrameModel>,
+         draw: &mut dyn BlockEntityDrawContext,
+     ) -> Result<(), String> {
+         let state = self.0.lock().unwrap();

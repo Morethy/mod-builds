@@ -1,0 +1,84 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index ee3c649..3930b8a 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -11,7 +11,7 @@
+ //! [`runtime`], a plain module with no `mod_api` types, so `cargo test` alone proves them.
+ use mod_api::{
+     self, BlockEntityPart, BlockEntityTickEvent, BlockEntityTicksEvent, BlockPart, BlockState,
+-    Hooks, Host, LevelHost, Registrar, RegistrationContext, ServerHost, StateForPlacementEvent,
++    Hooks, Host, Registrar, RegistrationContext, StateForPlacementEvent,
+ };
+ 
+ pub mod runtime;
+@@ -36,11 +36,13 @@ impl BlockEntityPart for MoverPart {
+     }
+ 
+     /// One server tick: move the mobs in the powered run in front of the block.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
+         // This part writes nothing into the block entity's own payload, so the tick must not
+-        // dirty the chunk: `Unchanged` discards no one else's edits, it only says ours is none.
+-        *event.reply = mod_api::BlockEntityTickReply::Unchanged;
+-        support::on_tick(self.mover, host, event.pos);
++        // dirty the chunk: it never calls `set_changed`, which is now the only thing that would.
++        let Some(pos) = event.subject.with_view(|view| view.position()) else {
++            return;
++        };
++        support::on_tick(self.mover, event.subject.host(), pos);
+     }
+ }
+ 
+@@ -52,9 +54,10 @@ struct Placement;
+ impl BlockPart for Placement {
+     fn state_for_placement(
+         &self,
+-        level: &dyn LevelHost,
++        level: mod_api::LevelSide<'_>,
+         event: &mut StateForPlacementEvent<'_>,
+     ) -> Option<Option<BlockState>> {
++        let (mod_api::LevelSide::Server(level) | mod_api::LevelSide::Client(level)) = level;
+         support::state_for_placement(level, event)
+     }
+ }
+@@ -69,7 +72,7 @@ impl Hooks for Mod {
+     /// The declaration owns the type id (`restrictions:attractor`, `restrictions:pusher`) and
+     /// the game creates the entity for the block it is held by — the retired `block_entity`
+     /// hook that answered the block's id and an empty compound is no longer needed.
+-    fn register(&self, r: &mut dyn Registrar, cx: &RegistrationContext) {
++    fn register(&self, r: &mut dyn Registrar, _cx: &RegistrationContext) {
+         for (path, block, mover) in [
+             ("attractor", runtime::ATTRACTOR, Mover::Attractor),
+             ("pusher", runtime::PUSHER, Mover::Pusher),
+@@ -79,7 +82,7 @@ impl Hooks for Mod {
+             // block would sit inert: refuse the mod's registration rather than load a
+             // half-working mover, so the game log names it.
+             if let Err(error) = r.block_entity_part(&kind, MoverPart { mover }) {
+-                cx.refuse(&format!(
++                r.refuse(&format!(
+                     "restrictions: the {path} mover part was refused: {error}"
+                 ));
+                 return;
+diff --git a/src/support.rs b/src/support.rs
+index 8bd00fa..4b29610 100644
+--- a/src/support.rs
++++ b/src/support.rs
+@@ -69,9 +69,16 @@ pub(crate) fn on_tick(mover: Mover, host: &mut dyn ServerHost, pos: [i32; 3]) {
+     }
+     let push = impulse(mover, facing);
+     let cells = volume(pos, facing, signal);
+-    let Some(entities) = level.entities_in(&*host, run[0], run[1]) else {
++    let mut entities = Vec::new();
++    if level
++        .visit_entities_in(&*host, run[0], run[1], &mut |entity| {
++            entities.push(entity);
++            std::ops::ControlFlow::Continue(())
++        })
++        .is_err()
++    {
+         return;
+-    };
++    }
+     // The level's players, once per tick: the one kind the sweep leaves alone.
+     let players: Vec<u32> = host
+         .players()

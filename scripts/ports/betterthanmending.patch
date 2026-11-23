@@ -1,0 +1,13 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 63ae45f..bdf37da 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -122,7 +122,7 @@ impl Hooks for Mod {
+                 let Some((points, damage)) = decide(&*host, player, click.stack) else { return Flow::Continue };
+                 let Some(name) = player.name(&*host) else { return Flow::Continue };
+                 let main_hand = matches!(click.hand, Hand::Main);
+-                self.queue.lock().unwrap_or_else(|e| e.into_inner()).push(Repair { player: name, main_hand, damage, points });
++                self.queue.lock().unwrap_or_else(|e| e.into_inner()).push(Repair { player: name.to_owned(), main_hand, damage, points });
+                 true
+             }
+             HostSide::Client(host) => {

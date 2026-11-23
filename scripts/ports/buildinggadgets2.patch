@@ -1,0 +1,203 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 442d9ae..3702bd5 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -20,7 +20,7 @@ pub mod support;
+ 
+ use mod_api::{
+     self, ClientHost, ComponentTypesEvent, Flow, Hooks, MouseScrollingEvent, RegisterCommandsEvent,
+-    Registrar, RegistrationContext, RunModCommandEvent, ServerHost,
++    Registrar, RegistrationContext, ServerHost,
+ };
+ 
+ /// The mod has no state of its own: the gadget's state is in the stack's component,
+@@ -41,7 +41,7 @@ impl Hooks for Mod {
+     /// Declare the component that holds the gadget's range and selection, before
+     /// content (and so the item's stack codec) loads.
+     fn component_types(&self, _context: &RegistrationContext, event: &mut ComponentTypesEvent<'_>) {
+-        support::declare_component(event.types);
++        support::declare_component(event);
+     }
+ 
+     /// `/buildinggadgets2 [range [n]]`: the range control the wheel steps and the
+@@ -50,14 +50,7 @@ impl Hooks for Mod {
+         support::declare_commands(event.commands);
+     }
+ 
+-    /// A player ran one of the commands above: answer it and take it.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        support::run_command(host, event)
+-    }
++
+ 
+     /// A wheel notch in gameplay: step the held gadget's range and send the same
+     /// server command the chat path uses, since only the server writes the stack.
+diff --git a/src/support.rs b/src/support.rs
+index 04ea3a8..e1e72f3 100644
+--- a/src/support.rs
++++ b/src/support.rs
+@@ -12,7 +12,7 @@ use mod_api::{
+     BlockFace, BlockMetadata, BlockState, BlockUpdateFlags, ClientHost, Command,
+     CommandArgumentValue, CommandInvocation, CommandSource, Component, Dist, Flow, Hand, Host,
+     HostBlockStates, HostSide, InteractionResult, ItemKey, ItemPart, ItemStack, LevelRef,
+-    MouseScrollingEvent, PlayerRef, RunModCommandEvent, ServerHost, Tag, Text, UseOnEvent,
++    MouseScrollingEvent, PlayerRef, ServerHost, Tag, Text, UseOnEvent,
+ };
+ 
+ use crate::runtime::{self, Command as GadgetCommand, DEFAULT_RANGE, MAX_RANGE};
+@@ -109,11 +109,8 @@ fn write_state(stack: &mut ItemStack, state: &GadgetState) {
+ fn held_gadget(host: &dyn ServerHost, player: PlayerRef) -> Option<(u32, ItemStack)> {
+     let slot = u32::try_from(player.selected_slot(host)?).ok()?;
+     let stack = player
+-        .inventory_slots(host)?
+-        .into_iter()
+-        .find(|(at, _)| *at == slot)
+-        .map(|(_, stack)| stack)?;
+-    (stack.item().id(host) == runtime::GADGET).then_some((slot, stack))
++        .with_inventory(host, |view| view.get(slot).and_then(|stack| stack.project()))??;
++    (stack.item().id(host) == Some(runtime::GADGET)).then_some((slot, stack))
+ }
+ 
+ /// Replace the held gadget's state: the stack is copied out, its component written,
+@@ -164,10 +161,8 @@ fn selected_name(host: &dyn ServerHost, text: &str) -> Option<String> {
+ /// `native_count_items`, this counts a stack that carries components too.
+ fn count_items(host: &dyn ServerHost, player: PlayerRef, item: ItemKey) -> u32 {
+     player
+-        .inventory_slots(host)
+-        .map(|slots| {
+-            slots
+-                .into_iter()
++        .with_inventory(host, |view| {
++            view.iter()
+                 .filter(|(slot, stack)| *slot < MAIN_INVENTORY_END && stack.item() == item)
+                 .map(|(_, stack)| stack.count())
+                 .sum()
+@@ -178,7 +173,12 @@ fn count_items(host: &dyn ServerHost, player: PlayerRef, item: ItemKey) -> u32 {
+ /// Take up to `count` items of `item` from the main inventory, returning how many
+ /// left it. A slot the game refuses to write stops the take where it is.
+ fn take_items(host: &mut dyn ServerHost, player: PlayerRef, item: ItemKey, count: u32) -> u32 {
+-    let Some(slots) = player.inventory_slots(host) else {
++    let Some(slots) = player.with_inventory(host, |view| {
++        view.iter()
++            .filter(|(slot, stack)| *slot < MAIN_INVENTORY_END && stack.item() == item)
++            .filter_map(|(slot, stack)| stack.project().map(|stack| (slot, stack)))
++            .collect::<Vec<(u32, ItemStack)>>()
++    }) else {
+         return 0;
+     };
+     let mut wanted = count;
+@@ -313,7 +313,10 @@ fn edit_rights(
+         } else {
+             0
+         },
+-        spawn: level.respawn_data(view).map(|data| data.pos),
++        spawn: level.respawn_data(view).map(|data| {
++            let pos = data.position.pos();
++            [pos.x, pos.y, pos.z]
++        }),
+         in_overworld,
+     }
+ }
+@@ -378,7 +381,7 @@ fn use_on_block(
+     let selected = state.selected.as_deref()?;
+     let place_state = host.block_state_id(selected)?;
+     let item = host.block_item(place_state.block())?;
+-    if item.id(host) == "minecraft:air" {
++    if item.id(host) == Some("minecraft:air") {
+         return None;
+     }
+     let facing = u32::try_from(event.player_entity_id)
+@@ -429,15 +432,15 @@ impl ItemPart for Gadget {
+ }
+ 
+ /// Declare the state component before content (and so the item's stack codec) loads.
+-pub fn declare_component(types: &mut Vec<String>) {
+-    types.push(COMPONENT.to_owned());
++pub fn declare_component(event: &mut mod_api::ComponentTypesEvent<'_>) {
++    event.register(COMPONENT.into());
+ }
+ 
+ /// Declare the `/buildinggadgets2` usages: the range control, and the usage line.
+-pub fn declare_commands(commands: &mut Vec<Command>) {
+-    commands.push(Command::new("buildinggadgets2"));
+-    commands.push(Command::new("buildinggadgets2 range"));
+-    commands.push(Command::new("buildinggadgets2 range <range:integer>"));
++pub fn declare_commands(commands: &mut Vec<mod_api::CommandRegistration>) {
++    commands.push(Command::new("buildinggadgets2").executes(run_command));
++    commands.push(Command::new("buildinggadgets2 range").executes(run_command));
++    commands.push(Command::new("buildinggadgets2 range <range:integer>").executes(run_command));
+ }
+ 
+ /// Rebuild the line the runtime's parser reads from the dispatcher's parsed command:
+@@ -476,14 +479,16 @@ fn reply(host: &mut dyn ServerHost, player: Option<PlayerRef>, line: String) {
+ 
+ /// `/buildinggadgets2 [range [n]]`: read and store the held gadget's range. The
+ /// runtime parses the line, so the chat path and the wheel path share one grammar.
+-pub fn run_command(host: &mut dyn ServerHost, event: &RunModCommandEvent<'_>) -> Flow {
+-    if event.command.literals.first().map(String::as_str) != Some("buildinggadgets2") {
+-        return Flow::Continue;
++pub fn run_command(
++    host: &mut dyn ServerHost,
++    source: &CommandSource,
++    command: &CommandInvocation,
++) -> Option<i32> {
++    if command.literals.first().map(String::as_str) != Some("buildinggadgets2") {
++        return None;
+     }
+-    let Some(parsed) = runtime::parse_command(&command_line(event.command)) else {
+-        return Flow::Continue;
+-    };
+-    let player = match event.source {
++    let parsed = runtime::parse_command(&command_line(command))?;
++    let player = match source {
+         CommandSource::Player { player, .. } => Some(*player),
+         _ => None,
+     };
+@@ -506,7 +511,7 @@ pub fn run_command(host: &mut dyn ServerHost, event: &RunModCommandEvent<'_>) ->
+                     None,
+                     "Hold the building gadget to set its range".to_owned(),
+                 );
+-                return Flow::Cancel;
++                return Some(1);
+             };
+             let Some(gadget) = held_gadget(host, player) else {
+                 reply(
+@@ -514,7 +519,7 @@ pub fn run_command(host: &mut dyn ServerHost, event: &RunModCommandEvent<'_>) ->
+                     Some(player),
+                     "Hold the building gadget to set its range".to_owned(),
+                 );
+-                return Flow::Cancel;
++                return Some(1);
+             };
+             let state = GadgetState {
+                 range: value,
+@@ -531,7 +536,7 @@ pub fn run_command(host: &mut dyn ServerHost, event: &RunModCommandEvent<'_>) ->
+             );
+         }
+     }
+-    Flow::Cancel
++    Some(1)
+ }
+ 
+ /// A wheel notch in gameplay: step the held gadget's range by one per notch, clamp
+@@ -553,13 +558,12 @@ pub fn scroll(host: &mut dyn ClientHost, event: &mut MouseScrollingEvent) -> Flo
+         return Flow::Continue;
+     };
+     let Some(stack) = player
+-        .inventory_slots(host)
+-        .and_then(|slots| slots.into_iter().find(|(at, _)| *at == slot))
+-        .map(|(_, stack)| stack)
++        .with_inventory(&*host, |view| view.get(slot).and_then(|stack| stack.project()))
++        .flatten()
+     else {
+         return Flow::Continue;
+     };
+-    if stack.item().id(host) != runtime::GADGET {
++    if stack.item().id(host) != Some(runtime::GADGET) {
+         return Flow::Continue;
+     }
+     let state = read_state(&stack);

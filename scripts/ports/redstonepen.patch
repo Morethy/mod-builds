@@ -1,0 +1,159 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 99ac636..36fbe83 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -17,7 +17,7 @@ mod support;
+ 
+ use mod_api::{
+     self, BlockChangedEvent, Command, CommandInvocation, Flow, Hooks, HostSide, LevelHost,
+-    LevelTickPostEvent, RegisterCommandsEvent, Registrar, RegistrationContext, RunModCommandEvent,
++    LevelTickPostEvent, RegisterCommandsEvent, Registrar, RegistrationContext,
+     ServerHost, Text,
+ };
+ 
+@@ -44,24 +44,7 @@ impl Hooks for Mod {
+     fn register_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+         event
+             .commands
+-            .push(Command::new("redstonepen probe <pos:block_pos>"));
+-    }
+-
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        let command: &CommandInvocation = event.command;
+-        if command.literals.first().map(String::as_str) != Some("redstonepen") {
+-            return Flow::Continue;
+-        }
+-        let Some(mod_api::CommandArgumentValue::BlockPos(pos)) = command.argument("pos") else {
+-            return Flow::Continue;
+-        };
+-        let line = support::probe_line(host, *pos);
+-        let _ = host.commands().feedback(Text::literal(line));
+-        Flow::Cancel
++            .push(Command::new("redstonepen probe <pos:block_pos>").executes(run_command));
+     }
+ 
+     /// End of the level tick: apply the queued delayed relay writes, the relays and the track
+@@ -73,3 +56,20 @@ impl Hooks for Mod {
+         support::level_tick_post(host, event.level);
+     }
+ }
++
++/// The body of `/redstonepen probe`.
++fn run_command(
++    host: &mut dyn ServerHost,
++    _source: &mod_api::CommandSource,
++    command: &CommandInvocation,
++) -> Option<i32> {
++    if command.literals.first().map(String::as_str) != Some("redstonepen") {
++        return None;
++    }
++    let Some(mod_api::CommandArgumentValue::BlockPos(pos)) = command.argument("pos") else {
++        return None;
++    };
++    let line = support::probe_line(host, *pos);
++    let _ = host.commands().feedback(Text::literal(line));
++    Some(1)
++}
+diff --git a/src/support.rs b/src/support.rs
+index 133393b..d74c8fa 100644
+--- a/src/support.rs
++++ b/src/support.rs
+@@ -258,9 +258,10 @@ impl BlockPart for SignalPart {
+     /// outputs away from the support it was clicked on.
+     fn state_for_placement(
+         &self,
+-        level: &dyn LevelHost,
++        level: mod_api::LevelSide<'_>,
+         event: &mut StateForPlacementEvent<'_>,
+     ) -> Option<Option<BlockState>> {
++        let (mod_api::LevelSide::Server(level) | mod_api::LevelSide::Client(level)) = level;
+         if is_track(event.state) {
+             let axis = placement_axis(
+                 dir(event.context.face),
+@@ -326,7 +327,7 @@ fn pen_click(host: &mut dyn ServerHost, event: &UseOnEvent<'_>) -> Option<Intera
+     let face = dir_from_vector(event.face)?;
+     let player = host.player(event.player)?;
+     let level = player.level(host)?;
+-    let dimension = level.dimension().id(host)?;
++    let dimension = level.dimension().id(host)?.to_owned();
+     let pos = event.pos;
+     let clicked = level.block_state(host, pos)?;
+     if is_block(host, clicked, AIR_BLOCK) {
+@@ -437,11 +438,11 @@ fn debit_draw(host: &mut dyn ServerHost, player: PlayerRef) {
+ /// The player's redstone dust in the main inventory (hotbar and backpack).
+ fn count_redstone(host: &dyn ServerHost, player: PlayerRef) -> u32 {
+     player
+-        .inventory_slots(host)
+-        .map(|slots| {
+-            slots
+-                .into_iter()
+-                .filter(|(slot, stack)| *slot < MAIN_INVENTORY_END && is_redstone(host, stack))
++        .with_inventory(host, |view| {
++            view.iter()
++                .filter(|(slot, stack)| {
++                    *slot < MAIN_INVENTORY_END && is_redstone(host, stack.item())
++                })
+                 .map(|(_, stack)| stack.count())
+                 .sum()
+         })
+@@ -450,7 +451,14 @@ fn count_redstone(host: &dyn ServerHost, player: PlayerRef) -> u32 {
+ 
+ /// Take up to `count` redstone dust from the main inventory; answers how many left it.
+ fn take_redstone(host: &mut dyn ServerHost, player: PlayerRef, count: u32) -> u32 {
+-    let Some(slots) = player.inventory_slots(host) else {
++    let view: &dyn ServerHost = &*host;
++    let Some(slots) = player.with_inventory(view, |slots| {
++        slots
++            .iter()
++            .filter(|(slot, stack)| *slot < MAIN_INVENTORY_END && is_redstone(view, stack.item()))
++            .filter_map(|(slot, stack)| stack.project().map(|stack| (slot, stack)))
++            .collect::<Vec<(u32, ItemStack)>>()
++    }) else {
+         return 0;
+     };
+     let mut wanted = count;
+@@ -459,7 +467,7 @@ fn take_redstone(host: &mut dyn ServerHost, player: PlayerRef, count: u32) -> u3
+         if wanted == 0 {
+             break;
+         }
+-        if slot >= MAIN_INVENTORY_END || !is_redstone(host, &stack) {
++        if slot >= MAIN_INVENTORY_END || !is_redstone(host, stack.item()) {
+             continue;
+         }
+         let take = stack.count().min(wanted);
+@@ -482,8 +490,8 @@ fn take_redstone(host: &mut dyn ServerHost, player: PlayerRef, count: u32) -> u3
+     taken
+ }
+ 
+-fn is_redstone(host: &dyn ServerHost, stack: &ItemStack) -> bool {
+-    stack.item().id(host) == REDSTONE
++fn is_redstone(host: &dyn ServerHost, item: mod_api::ItemKey) -> bool {
++    item.id(host) == Some(REDSTONE)
+ }
+ 
+ /// The player's right to write a track at a destination: the inputs of
+@@ -513,7 +521,10 @@ fn edit_rights(
+         } else {
+             0
+         },
+-        spawn: level.respawn_data(view).map(|data| data.pos),
++        spawn: level.respawn_data(view).map(|data| {
++            let pos = data.position.pos();
++            [pos.x, pos.y, pos.z]
++        }),
+         in_overworld: level
+             .dimension()
+             .id(view)
+@@ -578,7 +589,7 @@ fn look(host: &dyn Host, player_entity_id: i32) -> (f32, f32) {
+ 
+ /// End of the level tick: apply the queued delayed writes, relays and tracks of this level.
+ pub fn level_tick_post(host: &mut dyn ServerHost, level: LevelRef) {
+-    let Some(dimension) = level.dimension().id(host) else {
++    let Some(dimension) = level.dimension().id(host).map(str::to_owned) else {
+         return;
+     };
+     advance_pending(host, level, &dimension);

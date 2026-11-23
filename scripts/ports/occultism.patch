@@ -1,0 +1,328 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 1f02f2b..4750ced 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -29,12 +29,10 @@
+ pub mod runtime;
+ pub mod support;
+ 
+-use std::sync::Arc;
+-
+ use mod_api::{
+-    self, CraftingGrid, CraftingRecipeHandler, CraftingRecipeValue, EntityTickListenedEvent,
+-    EntityTickPostEvent, Flow, Hooks, HostSide, ItemStack, LootDropsEvent, RegisterCommandsEvent,
+-    Registrar, RegistrationContext, RightClickBlockEvent, RunModCommandEvent, ServerHost,
++    self, EntityTickListenedEvent, EntityTickPostEvent, Flow, Hooks, HostSide, LootDropsEvent,
++    RecipeSerializer, RegisterCommandsEvent, Registrar, RegistrationContext, RightClickBlockEvent,
++    ServerHost,
+ };
+ 
+ /// The serializer the carried `occultism:spirit_fire` files need. The port reads
+@@ -42,29 +40,15 @@ use mod_api::{
+ /// empty and no crafting-grid callback is used: this only admits the files.
+ struct SpiritFireSerializer;
+ 
+-impl CraftingRecipeHandler for SpiritFireSerializer {
+-    fn decode(&self, _json: &str) -> Result<CraftingRecipeValue, String> {
+-        Ok(CraftingRecipeValue::new(Vec::new()))
+-    }
+-
+-    fn write(&self, _value: &CraftingRecipeValue) -> Result<String, String> {
+-        Ok("{}".to_owned())
+-    }
+-
+-    fn matches(&self, _value: &CraftingRecipeValue, _grid: CraftingGrid) -> bool {
+-        false
+-    }
++impl RecipeSerializer for SpiritFireSerializer {
++    type Value = ();
+ 
+-    fn assemble(&self, _value: &CraftingRecipeValue, _grid: CraftingGrid) -> Option<ItemStack> {
+-        None
++    fn decode(&self, _json: &str) -> Result<(), String> {
++        Ok(())
+     }
+ 
+-    fn remaining_items(
+-        &self,
+-        _value: &CraftingRecipeValue,
+-        _grid: CraftingGrid,
+-    ) -> Option<Vec<Option<ItemStack>>> {
+-        None
++    fn write(&self, _value: &()) -> Result<String, String> {
++        Ok("{}".to_owned())
+     }
+ }
+ 
+@@ -82,10 +66,10 @@ impl Hooks for Mod {
+     /// service, so the serializer needs no crafting handler.
+     fn register(&self, r: &mut dyn Registrar, _: &RegistrationContext) {
+         r.register_recipe_type("occultism:spirit_fire");
+-        r.add_recipe_serializer(
++        r.register_read_only_recipe_serializer(
+             "occultism:spirit_fire",
+             "occultism:spirit_fire",
+-            Some(Arc::new(SpiritFireSerializer)),
++            SpiritFireSerializer,
+         );
+     }
+ 
+@@ -94,15 +78,6 @@ impl Hooks for Mod {
+         support::declare_commands(event.commands);
+     }
+ 
+-    /// Run one of the commands above and take it.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        support::run_command(host, event)
+-    }
+-
+     /// A right click on a block: chalk paints a spirit fire, a lighter strikes the datura
+     /// lying on the clicked block alight.
+     fn right_click_block(&self, host: HostSide<'_>, event: &mut RightClickBlockEvent<'_>) -> Flow {
+@@ -112,16 +87,24 @@ impl Hooks for Mod {
+     /// Whether the server tells this mod any entity's tick: without this answer none is told.
+     fn entity_tick_listened(
+         &self,
+-        _host: &mut dyn ServerHost,
++        host: HostSide<'_>,
+         event: &mut EntityTickListenedEvent,
+     ) {
+-        support::listen(event);
++        // Only the server's item entities are converted, as before the client was asked too.
++        if let HostSide::Server(_) = host {
++            support::listen(event);
++        }
+     }
+ 
+     /// One entity ticked: an item entity standing in spirit fire is converted when a carried
+     /// `occultism:spirit_fire` recipe accepts it (upstream's `entityInside`).
+-    fn entity_tick_post(&self, host: &mut dyn ServerHost, event: &mut EntityTickPostEvent<'_>) {
+-        support::entity_tick_post(host, event);
++    fn entity_tick_post(&self, host: HostSide<'_>, event: &mut EntityTickPostEvent<'_>) {
++        let HostSide::Server(host) = host else {
++            return;
++        };
++        for (&entity, &kind) in event.entities.iter().zip(event.kinds.iter()) {
++            support::entity_tick_post(host, event.dimension, entity, kind);
++        }
+     }
+ 
+     /// A block broke and the game built its drops: a hand-broken grass carries the jar's 2%
+diff --git a/src/support.rs b/src/support.rs
+index f97233d..514bd9f 100644
+--- a/src/support.rs
++++ b/src/support.rs
+@@ -19,9 +19,9 @@ use std::sync::{LazyLock, Mutex};
+ 
+ use mod_api::{
+     BlockClick, BlockUpdateFlags, Command, CommandArgumentValue, EntityRef,
+-    EntityTickListenedEvent, EntityTickPostEvent, Flow, GameMode, Hand, Host, HostBlockStates,
++    EntityTickListenedEvent, Flow, GameMode, Hand, Host, HostBlockStates,
+     HostSide, Identifier, InteractionResult, ItemStack, LevelRef, LootDropsEvent, RandomSource,
+-    Recipe, RightClickBlockEvent, RunModCommandEvent, ServerHost, Text,
++    Recipe, RightClickBlockEvent, ServerHost, Text,
+ };
+ 
+ use crate::runtime::{
+@@ -135,8 +135,8 @@ fn build(host: &dyn Host) -> Cached {
+             .and_then(|text| host.recipe_result(&text).ok().flatten());
+         match (ingredient, result) {
+             (Some(ingredient), Some(result)) => rules.push(runtime::Rule {
+-                inputs: ingredient.order,
+-                result: result.item().id(host),
++                inputs: ingredient.order.clone(),
++                result: result.item().id(host).unwrap_or_default().to_owned(),
+             }),
+             _ => skipped += 1,
+         }
+@@ -211,12 +211,12 @@ pub fn right_click(host: HostSide<'_>, event: &mut RightClickBlockEvent<'_>) ->
+     // The crop harvest comes first: an empty hand is the normal way to click it.
+     let clicked = level
+         .block(&*server, pos)
+-        .map(|block| block.id(&*server))
++        .and_then(|block| block.id(&*server))
+         .unwrap_or_default();
+     let crop_age = level.block_property(&*server, pos, runtime::AGE);
+     if let Some(harvest_age) = crop_age
+         .as_deref()
+-        .and_then(|age| runtime::harvest_age(&clicked, age))
++        .and_then(|age| runtime::harvest_age(clicked, age))
+     {
+         // The hook is called once per hand and the harvest writes the block, so
+         // the off hand's turn would harvest the crop the main hand just
+@@ -238,9 +238,9 @@ pub fn right_click(host: HostSide<'_>, event: &mut RightClickBlockEvent<'_>) ->
+     let Some(stack) = click.stack else {
+         return Flow::Continue;
+     };
+-    let item = stack.item().id(server);
++    let item = stack.item().id(server).unwrap_or_default();
+     let fire = server.block_key(SPIRIT_FIRE);
+-    if let Some(colour) = runtime::chalk_color(&item) {
++    if let Some(colour) = runtime::chalk_color(item) {
+         if level.block(&*server, pos) == fire {
+             server.set_block_property(pos, COLOR, colour);
+             // Upstream answers `sidedSuccess` for any chalk on the fire, whether or not the
+@@ -250,20 +250,29 @@ pub fn right_click(host: HostSide<'_>, event: &mut RightClickBlockEvent<'_>) ->
+         }
+         return Flow::Continue;
+     }
+-    if !runtime::starts_fire(&item) {
++    if !runtime::starts_fire(item) {
+         return Flow::Continue;
+     }
+     let (min, max) = runtime::datura_box(pos);
+-    let Some(entities) = level.entities_in(&*server, min, max) else {
++    let mut entities = Vec::new();
++    if level
++        .visit_entities_in(&*server, min, max, &mut |entity| {
++            entities.push(entity);
++            std::ops::ControlFlow::Continue(())
++        })
++        .is_err()
++    {
+         return Flow::Continue;
+-    };
++    }
+     let datura: Vec<EntityRef> = entities
+         .into_iter()
+         .filter(|entity| {
+             server
+                 .item_entity(*entity)
+-                .and_then(|item| item.stack(&*server))
+-                .is_some_and(|stack| stack.item().id(&*server) == DATURA)
++                .and_then(|item| {
++                    item.with_stack(&*server, |stack| stack.item().id(&*server) == Some(DATURA))
++                })
++                .unwrap_or(false)
+         })
+         .collect();
+     if datura.is_empty() {
+@@ -332,14 +341,14 @@ fn harvest(
+ 
+ /// One item entity's tick ended: convert it when it stands in a spirit fire and a recipe accepts
+ /// it (upstream's `entityInside`).
+-pub fn entity_tick_post(host: &mut dyn ServerHost, event: &mut EntityTickPostEvent<'_>) {
+-    if event.kind != "minecraft:item" {
++pub fn entity_tick_post(host: &mut dyn ServerHost, dimension: &str, entity: u32, kind: &str) {
++    if kind != "minecraft:item" {
+         return;
+     }
+-    let Some(level) = host.level(event.dimension) else {
++    let Some(level) = host.level(dimension) else {
+         return;
+     };
+-    let Some(entity) = host.entity(event.entity) else {
++    let Some(entity) = host.entity(entity) else {
+         return;
+     };
+     let Some(pos) = entity.block_position(host) else {
+@@ -351,11 +360,16 @@ pub fn entity_tick_post(host: &mut dyn ServerHost, event: &mut EntityTickPostEve
+     let Some(item) = host.item_entity(entity) else {
+         return;
+     };
+-    let Some(stack) = item.stack(host) else {
++    let view: &dyn Host = &*host;
++    let Some((item_id, count)) = item.with_stack(view, |stack| {
++        (
++            stack.item().id(view).unwrap_or_default().to_owned(),
++            stack.count(),
++        )
++    }) else {
+         return;
+     };
+-    let item_id = stack.item().id(host);
+-    let Some(conversion) = with_table(host, |cached| cached.table.convert(&item_id, stack.count()))
++    let Some(conversion) = with_table(host, |cached| cached.table.convert(&item_id, count))
+     else {
+         return;
+     };
+@@ -369,7 +383,7 @@ pub fn entity_tick_post(host: &mut dyn ServerHost, event: &mut EntityTickPostEve
+         return;
+     };
+     if item.set_stack(host, result).unwrap_or(false) {
+-        record(level, event.dimension, pos, &conversion);
++        record(level, dimension, pos, &conversion);
+     }
+ }
+ 
+@@ -404,8 +418,8 @@ pub fn loot_drops(host: &mut dyn ServerHost, event: &mut LootDropsEvent<'_>) {
+         return;
+     };
+     let block = text.split('[').next().unwrap_or(&text);
+-    let tool = context.tool.map(|stack| stack.item().id(&*host));
+-    if !runtime::seed_source(block, tool.as_deref()) {
++    let tool = context.tool.and_then(|stack| stack.item().id(&*host));
++    if !runtime::seed_source(block, tool) {
+         return;
+     }
+     let Some(level) = host.level(context.dimension) else {
+@@ -430,21 +444,25 @@ pub fn loot_drops(host: &mut dyn ServerHost, event: &mut LootDropsEvent<'_>) {
+ }
+ 
+ /// `/occultism info|recipes`.
+-pub fn declare_commands(commands: &mut Vec<Command>) {
++pub fn declare_commands(commands: &mut Vec<mod_api::CommandRegistration>) {
+     // `/occultism info` names the block at coordinates the caller chooses, so it
+     // is registered at the gamemaster level (2), as `/data` is.
+-    commands.push(Command::op(
+-        "occultism info <pos:block_pos>",
+-        runtime::INFO_LEVEL,
+-    ));
+-    commands.push(Command::new("occultism recipes"));
++    commands.push(
++        Command::op("occultism info <pos:block_pos>", runtime::INFO_LEVEL)
++            .executes(run_command),
++    );
++    commands.push(Command::new("occultism recipes").executes(run_command));
+ }
+ 
+ /// Run one of the commands above and take it.
+-pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>) -> Flow {
+-    let literals = &event.command.literals;
++pub fn run_command(
++    host: &mut dyn ServerHost,
++    source: &mod_api::CommandSource,
++    command: &mod_api::CommandInvocation,
++) -> Option<i32> {
++    let literals = &command.literals;
+     if literals.first().map(String::as_str) != Some("occultism") {
+-        return Flow::Continue;
++        return None;
+     }
+     let line = match literals.get(1).map(String::as_str) {
+         Some("info") => {
+@@ -452,9 +470,9 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
+             // again here: a source that reaches this body by another route (a
+             // function, a future dispatcher change) is still refused, and the
+             // refusal names no block.
+-            if !runtime::info_permitted(event.source.permission().level()) {
++            if !runtime::info_permitted(source.permission().level()) {
+                 runtime::INFO_DENIED.to_owned()
+-            } else if let Some(CommandArgumentValue::BlockPos(pos)) = event.command.argument("pos")
++            } else if let Some(CommandArgumentValue::BlockPos(pos)) = command.argument("pos")
+             {
+                 let pos = *pos;
+                 let (block, colour, rules, files, world, dimension) = {
+@@ -462,7 +480,8 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
+                     let level = view.level(view.dimension());
+                     let block = level
+                         .and_then(|level| level.block(view, pos))
+-                        .map(|block| block.id(view))
++                        .and_then(|block| block.id(view))
++                        .map(str::to_owned)
+                         .unwrap_or_default();
+                     let colour = level
+                         .and_then(|level| level.block_property(view, pos, COLOR))
+@@ -509,7 +528,7 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
+         _ => USAGE.to_owned(),
+     };
+     let _ = host.commands().feedback(Text::literal(line));
+-    Flow::Cancel
++    Some(1)
+ }
+ 
+ #[cfg(test)]

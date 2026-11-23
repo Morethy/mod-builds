@@ -1,0 +1,187 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index a3f4aa6..187de9f 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -15,7 +15,7 @@ mod support;
+ 
+ use mod_api::{
+     self, ClientHost, ComponentTypesEvent, Flow, Hooks, HostSide, InteractionResult, ItemPart,
+-    RegisterCommandsEvent, Registrar, RegistrationContext, RunModCommandEvent, ServerHost,
++    RegisterCommandsEvent, Registrar, RegistrationContext, ServerHost,
+     TooltipEvent, UseItemEvent,
+ };
+ 
+@@ -40,15 +40,6 @@ impl Hooks for Mod {
+     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+         support::register_commands(event);
+     }
+-
+-    /// The bodies of those commands, on the already-parsed invocation.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        support::run_command(host, event)
+-    }
+ }
+ 
+ /// The unit's part: what its stack does on a right click and what its tooltip adds.
+diff --git a/src/support.rs b/src/support.rs
+index 1e74812..274e291 100644
+--- a/src/support.rs
++++ b/src/support.rs
+@@ -14,7 +14,7 @@ use std::sync::OnceLock;
+ use mod_api::{
+     ClientHost, Command, CommandArgumentValue, CommandSource, ComponentTypesEvent, Compound, Flow,
+     Hand, HostSide, InteractionResult, ItemKey, ItemPlace, ItemStack, PlayerRef,
+-    RegisterCommandsEvent, Registrar, RunModCommandEvent, ServerHost, Tag, Text, TooltipEvent,
++    RegisterCommandsEvent, Registrar, ServerHost, Tag, Text, TooltipEvent,
+     UseItemEvent,
+ };
+ 
+@@ -82,13 +82,15 @@ fn sneaking(host: &dyn ServerHost, player: PlayerRef) -> bool {
+ /// `Inventory`'s: 0 to 35 the main inventory, 40 the off hand.
+ fn carried_count(host: &dyn ServerHost, player: PlayerRef) -> u32 {
+     player
+-        .inventory_slots(host)
+-        .unwrap_or_default()
+-        .into_iter()
+-        .filter(|(slot, _)| *slot <= 35 || *slot == 40)
+-        .filter(|(_, stack)| is_unit(stack))
+-        .map(|(_, stack)| stack.count())
+-        .sum()
++        .with_inventory(host, |view| {
++            view.iter()
++                .filter(|(slot, _)| *slot <= 35 || *slot == 40)
++                .filter_map(|(_, stack)| stack.project())
++                .filter(is_unit)
++                .map(|stack| stack.count())
++                .sum()
++        })
++        .unwrap_or(0)
+ }
+ 
+ /// Whether `hand` holds a unit.
+@@ -97,7 +99,8 @@ fn holds(host: &mut dyn ServerHost, player: PlayerRef, hand: Hand) -> bool {
+         player: player.uuid(),
+         hand,
+     }
+-    .stack(host)
++    .with_stack(host, |stack| stack.project())
++    .flatten()
+     .is_some_and(|stack| is_unit(&stack))
+ }
+ 
+@@ -124,7 +127,8 @@ fn reading(host: &mut dyn ServerHost, player: PlayerRef) -> Reading {
+                 player: player.uuid(),
+                 hand,
+             }
+-            .stack(host)?;
++            .with_stack(host, |stack| stack.project())
++            .flatten()?;
+             is_unit(&stack).then(|| read_mode(&stack))
+         })
+         .unwrap_or_default();
+@@ -149,7 +153,7 @@ fn set_hand_mode(
+         player: player.uuid(),
+         hand,
+     };
+-    let mut stack = place.stack(host)?;
++    let mut stack = place.with_stack(host, |stack| stack.project()).flatten()?;
+     if !is_unit(&stack) {
+         return None;
+     }
+@@ -211,19 +215,25 @@ pub fn on_tooltip(_host: &dyn ClientHost, event: &mut TooltipEvent<'_>) {
+ 
+ /// The component id the carried item declares its step in.
+ pub fn component_types(event: &mut ComponentTypesEvent<'_>) {
+-    event.types.push(MODE_COMPONENT.to_owned());
++    event.register(MODE_COMPONENT.into());
+ }
+ 
+ /// `/gmut info|mode|next|prev`: the harness controls the in-game check drives. Upstream has no
+ /// commands; its keybind, its config items and the MekaSuit GUI are the controls, and none of the
+ /// three exists at this pin.
+ pub fn register_commands(event: &mut RegisterCommandsEvent<'_>) {
+-    event.commands.push(Command::new("gmut info"));
+     event
+         .commands
+-        .push(Command::op("gmut mode <speed:word>", 2));
+-    event.commands.push(Command::op("gmut next", 2));
+-    event.commands.push(Command::op("gmut prev", 2));
++        .push(Command::new("gmut info").executes(run_command));
++    event
++        .commands
++        .push(Command::op("gmut mode <speed:word>", 2).executes(run_command));
++    event
++        .commands
++        .push(Command::op("gmut next", 2).executes(run_command));
++    event
++        .commands
++        .push(Command::op("gmut prev", 2).executes(run_command));
+ }
+ 
+ /// The steps `/gmut mode` accepts, for its usage line.
+@@ -237,21 +247,24 @@ fn step_list() -> String {
+ 
+ /// Run a `/gmut` command a player typed. The parsed invocation is already split into its literal
+ /// path and its named argument, so no whitespace parsing happens here.
+-pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>) -> Flow {
+-    let CommandSource::Player { player, .. } = event.source else {
++pub fn run_command(
++    host: &mut dyn ServerHost,
++    source: &CommandSource,
++    command: &mod_api::CommandInvocation,
++) -> Option<i32> {
++    let CommandSource::Player { player, .. } = source else {
+         // The readout is a player's; the console has no inventory to report.
+-        return Flow::Continue;
++        return None;
+     };
+     let player = *player;
+-    let literals: Vec<&str> = event.command.literals.iter().map(String::as_str).collect();
++    let literals: Vec<&str> = command.literals.iter().map(String::as_str).collect();
+     match literals.as_slice() {
+         ["gmut", "info"] => {
+             let line = reading(host, player).line();
+             tell(host, player, line);
+         }
+         ["gmut", "mode"] => {
+-            let Some(speed) = event
+-                .command
++            let Some(speed) = command
+                 .argument("speed")
+                 .and_then(|value| match value {
+                     CommandArgumentValue::String(name) => Some(name.as_str()),
+@@ -259,7 +272,7 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
+                 })
+             else {
+                 tell(host, player, format!("Usage: /gmut mode <{}>", step_list()));
+-                return Flow::Cancel;
++                return Some(1);
+             };
+             match VerticalSpeed::from_name(speed) {
+                 Some(mode) => report_mode(host, player, mode),
+@@ -268,9 +281,9 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
+         }
+         ["gmut", "next"] => cycle(host, player, true),
+         ["gmut", "prev"] => cycle(host, player, false),
+-        _ => return Flow::Continue,
++        _ => return None,
+     }
+-    Flow::Cancel
++    Some(1)
+ }
+ 
+ /// Turn the held unit one step (forward, or back) and report where it landed.
+@@ -279,7 +292,8 @@ fn cycle(host: &mut dyn ServerHost, player: PlayerRef, forward: bool) {
+         player: player.uuid(),
+         hand: Hand::Main,
+     }
+-    .stack(host)
++    .with_stack(host, |stack| stack.project())
++    .flatten()
+     .filter(is_unit)
+     .map(|stack| read_mode(&stack)) else {
+         tell(host, player, "Hold the unit first.");

@@ -1,0 +1,236 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 5730604..05c6b81 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -21,13 +21,13 @@ pub mod nbt_text;
+ pub mod runtime;
+ 
+ use std::collections::BTreeMap;
+-use std::sync::{Mutex, MutexGuard};
++use std::sync::{Arc, Mutex, MutexGuard};
+ 
+ use mod_api::{
+     self, BlockShapeKind, Command, CommandArgumentValue, CommandInvocation, CommandSource,
+     ConfigKind, ConfigLoadingEvent, ConfigReloadingEvent, EntityRef, EntityTickListenedEvent,
+-    EntityTickPreEvent, Flow, Hooks, HostSide, MobCategory, PlayerRef, RegisterCommandsEvent,
+-    RegisterConfigsEvent, RunModCommandEvent, ServerAboutToStartEvent, ServerHost, ServerTickEvent,
++    EntityTickPreEvent, Hooks, HostSide, MobCategory, PlayerRef, RegisterCommandsEvent,
++    RegisterConfigsEvent, ServerAboutToStartEvent, ServerHost, ServerTickEvent,
+     ServerTickPhase, Tag, Text,
+ };
+ 
+@@ -100,14 +100,14 @@ struct State {
+ /// the session, so the state lives on it behind a `Mutex` and dies with the game.
+ #[derive(Default)]
+ struct Mod {
+-    state: Mutex<Option<State>>,
++    state: Arc<Mutex<Option<State>>>,
+     /// The entities seen ticking, by id: `(dimension, kind)`.
+     ///
+     /// `entity_tick_pre` is the one enumeration of mobs, item entities, minecarts
+     /// and boats the port needs for `/cu e remove|entityData|find`; the entries
+     /// are pruned when a command finds the entity gone. A `BTreeMap` keeps the
+     /// readouts in id order.
+-    tracked: Mutex<BTreeMap<u32, (String, String)>>,
++    tracked: Arc<Mutex<BTreeMap<u32, (String, String)>>>,
+ }
+ 
+ impl Mod {
+@@ -197,7 +197,7 @@ impl Mod {
+             feedback(host, PLAYER_ONLY);
+             return;
+         };
+-        let name = player.name(host).unwrap_or_default();
++        let name = player.name(host).unwrap_or_default().to_owned();
+         feedback(host, &teleporting_message(&name, dimension, pos));
+         let mut guard = self.state();
+         if let Some(state) = guard.as_mut() {
+@@ -296,7 +296,7 @@ impl Mod {
+                     feedback(host, PLAYER_ONLY);
+                     return;
+                 };
+-                let name = player.name(host).unwrap_or_default();
++                let name = player.name(host).unwrap_or_default().to_owned();
+                 feedback(host, &unsticking_message(&name));
+                 let mut guard = self.state();
+                 if let Some(state) = guard.as_mut() {
+@@ -310,11 +310,40 @@ impl Mod {
+     }
+ }
+ 
++impl Mod {
++    /// A line the dispatcher parsed and allowed: claim it when it is ours.
++    fn run_mod_command(
++        &self,
++        host: &mut dyn ServerHost,
++        source: &CommandSource,
++        command: &CommandInvocation,
++    ) -> Option<i32> {
++        let line = command_line(command);
++        let action = parse(&line);
++        if matches!(action, Action::Unknown) {
++            return None;
++        }
++        let caller = match source {
++            CommandSource::Player { player, .. } => Some(*player),
++            _ => None,
++        };
++        // `execute in` moves the execution level; a plain command runs in the
++        // level the caller is in, which is what 0.1.0 read.
++        let dimension = command
++            .dimension
++            .id(host)
++            .map(str::to_owned)
++            .unwrap_or_else(|| host.dimension().to_owned());
++        self.run_action(host, caller, &dimension, action);
++        Some(1)
++    }
++}
++
+ #[mod_api::sunrise_mod]
+ impl Hooks for Mod {
+     /// Declare `config/crashutilities.toml`; the game writes `default` there when
+     /// the file is missing (`config_loading` then hands it back).
+-    fn register_configs(&self, _host: HostSide, event: &mut RegisterConfigsEvent<'_>) {
++    fn register_configs(&self, _host: &dyn mod_api::ConfigContext, event: &mut RegisterConfigsEvent<'_>) {
+         let default = to_toml(&Config::default());
+         event
+             .configs
+@@ -323,7 +352,7 @@ impl Hooks for Mod {
+ 
+     /// The config was read: ours is the only one this mod parses. Every mod hears
+     /// every config, so the id is checked.
+-    fn config_loading(&self, _host: HostSide, event: &mut ConfigLoadingEvent<'_>) {
++    fn config_loading(&self, _host: &dyn mod_api::ConfigContext, event: &mut ConfigLoadingEvent<'_>) {
+         self.apply_config(&event.config.mod_id, &event.config.text, false);
+     }
+ 
+@@ -351,34 +380,15 @@ impl Hooks for Mod {
+     /// The `/cu` usages, at permission level 2 (upstream's `CommandUtils.java:21`).
+     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+         for usage in usages() {
+-            event.commands.push(Command::op(&usage, 2));
+-        }
+-    }
+-
+-    /// A line the dispatcher parsed and allowed: claim it when it is ours.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        let line = command_line(event.command);
+-        let action = parse(&line);
+-        if matches!(action, Action::Unknown) {
+-            return Flow::Continue;
++            let this = Mod {
++                state: self.state.clone(),
++                tracked: self.tracked.clone(),
++            };
++            event.commands.push(
++                Command::op(&usage, 2)
++                    .executes(move |host, source, command| this.run_mod_command(host, source, command)),
++            );
+         }
+-        let caller = match event.source {
+-            CommandSource::Player { player, .. } => Some(*player),
+-            _ => None,
+-        };
+-        // `execute in` moves the execution level; a plain command runs in the
+-        // level the caller is in, which is what 0.1.0 read.
+-        let dimension = event
+-            .command
+-            .dimension
+-            .id(host)
+-            .unwrap_or_else(|| host.dimension().to_owned());
+-        self.run_action(host, caller, &dimension, action);
+-        Flow::Cancel
+     }
+ 
+     /// The end of a running server tick: run the queued teleports, advance the
+@@ -415,31 +425,29 @@ impl Hooks for Mod {
+     /// An entity about to tick: remember it, so `/cu e` has something to walk. The
+     /// tick is never cancelled, and the table is only written when something
+     /// changed, so this stays cheap for a world full of entities.
+-    fn entity_tick_pre(
+-        &self,
+-        _host: &mut dyn ServerHost,
+-        event: &mut EntityTickPreEvent<'_>,
+-    ) -> Flow {
++    fn entity_tick_pre(&self, host: HostSide<'_>, event: &mut EntityTickPreEvent<'_>) {
++        // Only the server's entities are walked, as before the client was told too.
++        let HostSide::Server(_) = host else {
++            return;
++        };
+         let mut tracked = self.tracked();
+-        match tracked.get_mut(&event.entity) {
+-            Some((dimension, kind)) => {
+-                if dimension != event.dimension {
+-                    dimension.clear();
+-                    dimension.push_str(event.dimension);
++        for (&entity, &event_kind) in event.entities.iter().zip(event.kinds.iter()) {
++            match tracked.get_mut(&entity) {
++                Some((dimension, kind)) => {
++                    if dimension != event.dimension {
++                        dimension.clear();
++                        dimension.push_str(event.dimension);
++                    }
++                    if kind != event_kind {
++                        kind.clear();
++                        kind.push_str(event_kind);
++                    }
+                 }
+-                if kind != event.kind {
+-                    kind.clear();
+-                    kind.push_str(event.kind);
++                None => {
++                    tracked.insert(entity, (event.dimension.to_owned(), event_kind.to_owned()));
+                 }
+             }
+-            None => {
+-                tracked.insert(
+-                    event.entity,
+-                    (event.dimension.to_owned(), event.kind.to_owned()),
+-                );
+-            }
+         }
+-        Flow::Continue
+     }
+ 
+     /// An entity left a level (picked up, merged, despawned, burnt, blown up, killed, taken by a
+@@ -482,12 +490,10 @@ impl Hooks for Mod {
+ 
+     /// The game tells entity ticks only while a mod listens; this mod does, or
+     /// `entity_tick_pre` never fires and `/cu e` sees nothing.
+-    fn entity_tick_listened(
+-        &self,
+-        _host: &mut dyn ServerHost,
+-        event: &mut EntityTickListenedEvent,
+-    ) {
+-        event.listened = true;
++    fn entity_tick_listened(&self, host: HostSide<'_>, event: &mut EntityTickListenedEvent) {
++        if let HostSide::Server(_) = host {
++            event.listened = true;
++        }
+     }
+ }
+ 
+@@ -687,9 +693,16 @@ fn item_entities(host: &mut dyn ServerHost, dimension: &str) -> Vec<EntityRef> {
+     let Some(level) = host.level(dimension) else {
+         return Vec::new();
+     };
+-    let Some(entities) = level.entities_in(host, [-ITEM_BOX; 3], [ITEM_BOX; 3]) else {
++    let mut entities = Vec::new();
++    if level
++        .visit_entities_in(host, [-ITEM_BOX; 3], [ITEM_BOX; 3], &mut |entity| {
++            entities.push(entity);
++            std::ops::ControlFlow::Continue(())
++        })
++        .is_err()
++    {
+         return Vec::new();
+-    };
++    }
+     entities
+         .into_iter()
+         .filter(|entity| host.item_entity(*entity).is_some())

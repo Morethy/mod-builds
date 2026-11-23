@@ -1,0 +1,189 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 1dbd2fd..c94336a 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -114,7 +114,7 @@ fn stack_carried(stack: &ItemStack) -> Option<Carried> {
+ /// Whether a spawner item may bring back mob `id`: a registered entity type with a spawn egg (a mob, as a creative
+ /// player may already set a spawner to with an egg), not tagged a boss.
+ fn mob_allowed(host: &dyn Host, id: &str) -> bool {
+-    let registered = host.entity_type_keys().into_iter().any(|k| k.id(host) == id);
++    let registered = host.entity_type_keys().into_iter().any(|k| k.id(host).as_deref() == Some(id));
+     let egg = Identifier::parse(&format!("{id}_spawn_egg")).ok().and_then(|egg| host.item_key(&egg)).is_some();
+     registered && egg && !host.entity_type_in_tag(id, "c:bosses")
+ }
+@@ -139,7 +139,7 @@ fn write(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3], nbt: Tag) ->
+ fn use_modifier(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3], player: u128, m: &Modifier) {
+     let (Some(keys), Some(player)) = (KEYS.get(), host.player(player)) else { return };
+     let Some(living) = host.living(player.entity()) else { return };
+-    let back = living.hand_item(&*host, Hand::Off).is_some_and(|s| s.item() == keys.quartz);
++    let back = living.with_hand_item(&*host, Hand::Off, |s| s.item() == keys.quartz).unwrap_or(false);
+     let Some(data) = host.block_entity(level, pos).and_then(|e| e.data(&*host)) else { return };
+     let mut nbt = Tag::Compound(data);
+     let powered = level.has_neighbor_signal(&*host, pos);
+@@ -152,7 +152,7 @@ fn use_modifier(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3], playe
+         return;
+     }
+     if !player.is_creative(&*host).unwrap_or(false) {
+-        let held = living.hand_item(&*host, Hand::Main).and_then(|s| s.shrink(1));
++        let held = living.with_hand_item(&*host, Hand::Main, |s| s.project()).flatten().and_then(|s| s.shrink(1));
+         let _ = living.set_hand_item(host, Hand::Main, held);
+     }
+     let _ = player.tell(host, stat_line(m, logic::shown(m, value), "gold", "yellow"));
+@@ -319,7 +319,7 @@ impl Hooks for VastSpawners {
+ 
+     /// A spawner mined with Silk Touch drops itself, with the mod's record of it (none for a spawner without a mob).
+     fn block_drops(&self, level: &dyn LevelHost, event: &mut BlockDropsEvent<'_>) -> Flow {
+-        if level.state_block(event.state) != Some(SPAWNER) || !event.tool.is_some_and(|t| enchantment_level(t, "minecraft:silk_touch") > 0) {
++        if level.state_block(event.state) != Some(SPAWNER) || !event.tool.as_ref().and_then(|t| t.project()).is_some_and(|t| enchantment_level(&t, "minecraft:silk_touch") > 0) {
+             return Flow::Continue;
+         }
+         let Some(keys) = KEYS.get() else { return Flow::Continue };
+@@ -334,7 +334,7 @@ impl Hooks for VastSpawners {
+         }
+         let p = event.pos;
+         let at = [f64::from(p.x) + 0.5, f64::from(p.y) + 0.5, f64::from(p.z) + 0.5];
+-        event.drops.push(ItemDrop::new(stack, at, [0.0, 0.1, 0.0], 10));
++        let _ = event.drops.push(ItemDrop::new(stack, at, [0.0, 0.1, 0.0], 10));
+         Flow::Continue
+     }
+ 
+@@ -344,7 +344,7 @@ impl Hooks for VastSpawners {
+         let Some((id, _)) = context.entity.filter(|_| !context.used && context.damage_source.is_some()) else { return };
+         let echoes = host
+             .entity(id)
+-            .and_then(|e| e.tags(&*host))
++            .and_then(|e| e.tags(&*host).map(|tags| tags.iter_utf16().map(String::from_utf16_lossy).collect::<Vec<String>>()))
+             .and_then(|tags| logic::counted_in(&tags, "echo"))
+             .unwrap_or(0.0) as usize;
+         if echoes > 0 {
+@@ -361,7 +361,7 @@ impl Hooks for VastSpawners {
+             return Flow::Continue;
+         }
+         let Some(entity) = host.entity(event.entity) else { return Flow::Continue };
+-        let Some(tags) = entity.tags(&*host) else { return Flow::Continue };
++        let Some(tags) = entity.tags(&*host).map(|tags| tags.iter_utf16().map(String::from_utf16_lossy).collect::<Vec<String>>()) else { return Flow::Continue };
+         let prefix = format!("{}vigour=", logic::TAG);
+         let Some(tag) = tags.iter().find(|t| t.starts_with(&prefix)) else { return Flow::Continue };
+         if let (Some(share), Some(living)) = (logic::counted_in(&tags, "vigour"), host.living(entity))
+diff --git a/src/logic.rs b/src/logic.rs
+index 086b5b3..c62ee2e 100644
+--- a/src/logic.rs
++++ b/src/logic.rs
+@@ -70,31 +70,31 @@ pub fn modifier_items(m: &Modifier) -> Vec<String> {
+ 
+ // ---- the spawner's data ----------------------------------------------------------------------------------------
+ 
+-/// The mob compounds a spawner's data holds: its next spawn's and each potential's.
+-pub fn entities_mut(nbt: &mut Tag) -> Vec<&mut Tag> {
+-    spawn_datas_mut(nbt).into_iter().filter_map(|d| d.get_mut("entity")).collect()
++/// Visits the mob compounds a spawner's data holds: its next spawn's and each potential's.
++pub fn entities_mut(nbt: &mut Tag, mut visit: impl FnMut(&mut Tag)) {
++    spawn_datas_mut(nbt, |d| {
++        if let Some(e) = d.get_mut("entity") {
++            visit(e);
++        }
++    });
+ }
+ 
+-/// The spawn data compounds (`SpawnData` and each potential's `data`), for their light rules.
+-pub fn spawn_datas_mut(nbt: &mut Tag) -> Vec<&mut Tag> {
+-    let mut out = Vec::new();
+-    let Tag::Compound(map) = nbt else { return out };
+-    for (key, value) in map.iter_mut() {
+-        match key.to_string_lossy().as_str() {
+-            "SpawnData" => out.push(value),
+-            "SpawnPotentials" => {
+-                if let Tag::List(list) = value {
+-                    for p in list.iter_mut() {
+-                        if let Some(d) = p.get_mut("data") {
+-                            out.push(d);
+-                        }
++/// Visits the spawn data compounds (`SpawnData` and each potential's `data`), for their light rules.
++pub fn spawn_datas_mut(nbt: &mut Tag, mut visit: impl FnMut(&mut Tag)) {
++    let Tag::Compound(map) = nbt else { return };
++    map.for_each_mut(|key, value| match key.to_string_lossy().as_str() {
++        "SpawnData" => visit(value),
++        "SpawnPotentials" => {
++            if let Tag::List(list) = value {
++                for p in list.iter_mut() {
++                    if let Some(d) = p.get_mut("data") {
++                        visit(d);
+                     }
+                 }
+             }
+-            _ => {}
+         }
+-    }
+-    out
++        _ => {}
++    });
+ }
+ 
+ /// The `Tags` of an entity compound.
+@@ -207,7 +207,7 @@ pub fn settle_range(nbt: &mut Tag, powered: bool) -> bool {
+ /// Sets flag `name` on every mob the spawner makes, with what it does to the mob.
+ pub fn set_flag(nbt: &mut Tag, name: &str, on: bool) {
+     let key = format!("{TAG}{name}");
+-    for e in entities_mut(nbt) {
++    entities_mut(nbt, |e| {
+         let mut t = tags(e);
+         t.retain(|x| x != &key);
+         if on {
+@@ -224,31 +224,31 @@ pub fn set_flag(nbt: &mut Tag, name: &str, on: bool) {
+             "kindled" => put(e, "Fire", on.then_some(Tag::Short(i16::MAX))),
+             _ => {}
+         }
+-    }
++    });
+     if matches!(name, "anywhere" | "lightproof") {
+         // Spawn data with light rules skips the mob's own spawn rules: both flags open every light level.
+         let open = on || (name == "anywhere" && flag(nbt, "lightproof")) || (name == "lightproof" && flag(nbt, "anywhere"));
+-        for d in spawn_datas_mut(nbt) {
++        spawn_datas_mut(nbt, |d| {
+             let rules = Tag::compound([
+                 ("block_light_limit", Tag::List(vec![Tag::Int(0), Tag::Int(15)])),
+                 ("sky_light_limit", Tag::List(vec![Tag::Int(0), Tag::Int(15)])),
+             ]);
+             put(d, "custom_spawn_rules", open.then_some(rules));
+-        }
++        });
+     }
+ }
+ 
+ /// Sets a counted value on every mob the spawner makes, or removes it with `None`.
+ pub fn set_counted(nbt: &mut Tag, name: &str, value: Option<f64>) {
+     let prefix = format!("{TAG}{name}=");
+-    for e in entities_mut(nbt) {
++    entities_mut(nbt, |e| {
+         let mut t = tags(e);
+         t.retain(|x| !x.starts_with(&prefix));
+         if let Some(v) = value {
+             t.push(format!("{prefix}{}", (v * 100.0).round() / 100.0));
+         }
+         set_tags(e, &t);
+-    }
++    });
+ }
+ 
+ /// Applies `m` (or its way back) to a spawner's data: the new value, or None when it is at its bound. `powered`:
+@@ -532,16 +532,16 @@ mod tests {
+         let chorus = modifier("minecraft:chorus_fruit");
+         assert_eq!(apply(&mut nbt, chorus, false, false), Some(1.0));
+         assert!(flag(&nbt, "dazed"));
+-        for e in entities_mut(&mut nbt) {
++        entities_mut(&mut nbt, |e| {
+             assert_eq!(e.get("NoAI"), Some(&Tag::Byte(1)));
+-        }
++        });
+         assert_eq!(apply(&mut nbt, chorus, false, false), None, "already set");
+         apply(&mut nbt, chorus, true, false);
+         assert!(!flag(&nbt, "dazed"));
+-        for e in entities_mut(&mut nbt) {
++        entities_mut(&mut nbt, |e| {
+             assert_eq!(e.get("NoAI"), None);
+             assert_eq!(e.get("Tags"), None, "no empty list left");
+-        }
++        });
+         assert!(std::ptr::eq(modifier("minecraft:red_wool"), modifier("minecraft:white_wool")));
+         apply(&mut nbt, modifier("minecraft:soul_lantern"), false, false);
+         assert!(nbt.get("SpawnData").unwrap().get("custom_spawn_rules").is_some());

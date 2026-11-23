@@ -1,0 +1,162 @@
+diff --git a/src/cable.rs b/src/cable.rs
+index cb47053..18045cc 100644
+--- a/src/cable.rs
++++ b/src/cable.rs
+@@ -102,8 +102,11 @@ impl BlockEntityPart for Cable {
+ 
+     /// One cable tick: queue it for the level tick's end. The tick itself writes
+     /// no block entity data; the network's pass at the end of the tick does.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        let Some(level) = level_in_place(host) else {
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        let Some(pos) = event.subject.with_view(|view| view.position()) else {
++            return;
++        };
++        let Some(level) = level_in_place(event.subject.host()) else {
+             return;
+         };
+         // Only this expression runs under the lock: one insert on the port's own
+@@ -111,7 +114,7 @@ impl BlockEntityPart for Cable {
+         self.queue
+             .lock()
+             .expect("the tunnel queue lock is held for one insert")
+-            .push(level, event.pos);
++            .push(level, pos);
+     }
+ }
+ 
+@@ -349,7 +352,7 @@ fn import_once(
+             let count = container.amount(host, slot);
+             Some(SlotView {
+                 slot,
+-                item: resource.item().id(host),
++                item: resource.item().id(host).unwrap_or_default().to_owned(),
+                 count,
+                 can_take: true,
+             })
+@@ -363,7 +366,7 @@ fn import_once(
+     };
+     let taken = host
+         .transaction(|host, tx| {
+-            Ok::<_, ()>(container.extract(host, tx, plan.slot, &resource, plan.count))
++            Ok::<_, ()>(container.extract_at(host, tx, plan.slot, &resource, plan.count))
+         })
+         .ok()
+         .unwrap_or(0);
+@@ -376,7 +379,7 @@ fn import_once(
+         store,
+         &ImportMove {
+             slot: plan.slot,
+-            item: resource.item().id(host),
++            item: resource.item().id(host).unwrap_or_default().to_owned(),
+             count: taken,
+         },
+     );
+@@ -408,7 +411,7 @@ fn export_once(
+         return;
+     };
+     let inserted = host
+-        .transaction(|host, tx| Ok::<_, ()>(container.insert_any(host, tx, &resource, plan.count)))
++        .transaction(|host, tx| Ok::<_, ()>(container.insert(host, tx, &resource, plan.count).unwrap_or(0)))
+         .ok()
+         .unwrap_or(0);
+     commit_export(store, &plan, inserted);
+@@ -417,7 +420,7 @@ fn export_once(
+ /// The id of a tank's fluid, or `None` for one this build cannot name.
+ fn fluid_name(host: &dyn Host, resource: &FluidResource) -> Option<String> {
+     match resource.fluid() {
+-        FluidIdentity::Resolved(key) => Some(key.id(host)),
++        FluidIdentity::Resolved(key) => Some(key.id(host).unwrap_or_default().to_owned()),
+         FluidIdentity::Unresolved(fluid) => Some(fluid.id(host)),
+         // `FluidIdentity` is non-exhaustive: a future identity is not one we can store.
+         _ => None,
+@@ -456,7 +459,7 @@ fn import_fluid_once(
+     let id = fluid_name(host, &resource).unwrap_or_else(|| plan.fluid.clone());
+     let taken = host
+         .transaction(|host, tx| {
+-            Ok::<_, ()>(container.extract(host, tx, plan.tank, &resource, plan.amount))
++            Ok::<_, ()>(container.extract_at(host, tx, plan.tank, &resource, plan.amount))
+         })
+         .ok()
+         .unwrap_or(0);
+@@ -497,7 +500,7 @@ fn export_fluid_once(
+         return;
+     };
+     let inserted = host
+-        .transaction(|host, tx| Ok::<_, ()>(container.insert_any(host, tx, &resource, plan.amount)))
++        .transaction(|host, tx| Ok::<_, ()>(container.insert(host, tx, &resource, plan.amount).unwrap_or(0)))
+         .ok()
+         .unwrap_or(0);
+     commit_fluid_export(fluids, &plan, inserted);
+@@ -625,7 +628,7 @@ pub(crate) fn place_part_from_item(
+     let Some(face) = face_of_normal(normal) else {
+         return Placement::NotMine;
+     };
+-    let part = match held.item().id(host).as_str() {
++    let part = match held.item().id(host).unwrap_or_default() {
+         IMPORTER => Part::ImporterItem,
+         EXPORTER => Part::ExporterItem,
+         IMPORTER_FLUID => Part::ImporterFluid,
+diff --git a/src/lib.rs b/src/lib.rs
+index a9dac82..5a1f8e9 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
+ 
+ use mod_api::{
+     self, Command, Flow, Hand, Hooks, HostSide, LevelTickPostEvent, RegisterCommandsEvent,
+-    Registrar, RegistrationContext, RightClickBlockEvent, RunModCommandEvent, ServerHost,
++    Registrar, RegistrationContext, RightClickBlockEvent, ServerHost,
+ };
+ 
+ use crate::cable::{Cable, Placement, Queue};
+@@ -111,27 +111,30 @@ impl Hooks for Mod {
+     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+         event
+             .commands
+-            .extend(cable::usages().map(|(usage, level)| Command::op(usage, level)));
++            .extend(
++                cable::usages()
++                    .map(|(usage, level)| Command::op(usage, level).executes(run_command)),
++            );
+     }
++}
+ 
+-    /// Run the two usages [`Hooks::register_commands`] declares, after the game has
+-    /// parsed and permission-checked them.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        let literals: Vec<&str> = event.command.literals.iter().map(String::as_str).collect();
+-        match literals.as_slice() {
+-            ["integratedtunnels", "info"] => {
+-                cable::info(host, event.command);
+-                Flow::Cancel
+-            }
+-            ["integratedtunnels", "part"] => {
+-                cable::set_part(host, event.command);
+-                Flow::Cancel
+-            }
+-            _ => Flow::Continue,
++/// Run the two usages [`Hooks::register_commands`] declares, after the game has
++/// parsed and permission-checked them.
++fn run_command(
++    host: &mut dyn ServerHost,
++    _source: &mod_api::CommandSource,
++    command: &mod_api::CommandInvocation,
++) -> Option<i32> {
++    let literals: Vec<&str> = command.literals.iter().map(String::as_str).collect();
++    match literals.as_slice() {
++        ["integratedtunnels", "info"] => {
++            cable::info(host, command);
++            Some(1)
++        }
++        ["integratedtunnels", "part"] => {
++            cable::set_part(host, command);
++            Some(1)
+         }
++        _ => None,
+     }
+ }

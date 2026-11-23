@@ -1,0 +1,102 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 1f84566..7b95c69 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -11,8 +11,8 @@
+ //! moment every item's use passes through — `use_item` is an item Part and would have to be
+ //! attached to every block item one by one.
+ use mod_api::{
+-    self, Command, Flow, Hooks, HostSide, RegisterCommandsEvent, RightClickItemEvent,
+-    RunModCommandEvent, ServerHost, Text,
++    self, Command, Flow, Hooks, HostSide, RegisterCommandsEvent, RightClickItemEvent, ServerHost,
++    Text,
+ };
+ 
+ pub mod runtime;
+@@ -27,21 +27,17 @@ struct Mod;
+ impl Hooks for Mod {
+     /// TEMPORARY diagnostic: `/bridgingmod last`.
+     fn register_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+-        event.commands.push(Command::new("bridgingmod last"));
+-    }
+-
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        if event.command.literals.first().map(String::as_str) != Some("bridgingmod") {
+-            return Flow::Continue;
+-        }
+-        let _ = host
+-            .commands()
+-            .feedback(Text::literal(support::last_line()));
+-        Flow::Cancel
++        event.commands.push(Command::new("bridgingmod last").executes(
++            |host, _source, command| {
++                if command.literals.first().map(String::as_str) != Some("bridgingmod") {
++                    return None;
++                }
++                let _ = host
++                    .commands()
++                    .feedback(Text::literal(support::last_line()));
++                Some(1)
++            },
++        ));
+     }
+ 
+     /// A player right-clicked with `event.click.stack`: in the air, or on a block whose own use
+diff --git a/src/support.rs b/src/support.rs
+index 9bd8afa..dc7f6f5 100644
+--- a/src/support.rs
++++ b/src/support.rs
+@@ -234,7 +234,10 @@ fn edit_rights(
+         } else {
+             0
+         },
+-        spawn: level.respawn_data(view).map(|data| data.pos),
++        spawn: level.respawn_data(view).map(|data| {
++            let pos = data.position.pos();
++            [pos.x, pos.y, pos.z]
++        }),
+         in_overworld: level
+             .dimension()
+             .id(view)
+@@ -253,11 +256,18 @@ fn obstructed(
+     pos: [i32; 3],
+ ) -> bool {
+     let origin = [f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2])];
+-    let Some(entities) = level.entities_in(host, origin, [1.0, 1.0, 1.0]) else {
++    let mut entities = Vec::new();
++    if level
++        .visit_entities_in(host, origin, [1.0, 1.0, 1.0], &mut |entity| {
++            entities.push(entity);
++            std::ops::ControlFlow::Continue(())
++        })
++        .is_err()
++    {
+         // A level that cannot answer the query has nothing loaded there, and nothing loaded
+         // means nothing standing in the cell: the write itself refuses an unloaded position.
+         return false;
+-    };
++    }
+     let placer = player.entity();
+     // The placer's own body is not an obstruction: a player bridges beside himself, and
+     // vanilla lets a placement happen at his feet.
+@@ -367,6 +377,7 @@ pub fn on_right_click(
+             SoundSource::Blocks,
+             volume,
+             pitch,
++            None,
+         );
+     }
+     // `BlockItem.place`'s tail: the block entity's own data from the stack, then the item's
+@@ -380,7 +391,7 @@ pub fn on_right_click(
+     {
+         let _ = entity.merge_data(host, data.clone());
+     }
+-    let item_id = stack.item().id(host).to_string();
++    let item_id = stack.item().id(host).unwrap_or_default().to_string();
+     player.award_stat(host, StatType::Used, &item_id, 1);
+     let resource = ItemResource::of(stack);
+     let hand = ItemPlace::PlayerHand {

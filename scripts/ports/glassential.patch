@@ -1,0 +1,16 @@
+diff --git a/src/support.rs b/src/support.rs
+index 6b95df8..9e02ab7 100644
+--- a/src/support.rs
++++ b/src/support.rs
+@@ -162,9 +162,10 @@ impl BlockPart for Connected {
+     /// an isolated pane costs no write.
+     fn state_for_placement(
+         &self,
+-        level: &dyn LevelHost,
++        level: mod_api::LevelSide<'_>,
+         event: &mut StateForPlacementEvent<'_>,
+     ) -> Option<Option<BlockState>> {
++        let (mod_api::LevelSide::Server(level) | mod_api::LevelSide::Client(level)) = level;
+         let pos = event.context.pos;
+         let links = self.links(level, [pos.x, pos.y, pos.z], None);
+         apply(level, event.state, links).map(Some)

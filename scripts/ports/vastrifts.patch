@@ -1,0 +1,89 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index a4cb072..baf877a 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -53,9 +53,33 @@ impl BlockEntityPart for RiftPart {
+         event.ticks = true;
+     }
+ 
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        let pos = event.pos;
+-        rift::tick(host, self.rift, &self.block, pos, &mut event.entity.nbt);
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        let Some((pos, saved)) = event.subject.with_view(|view| (view.position(), view.nbt().clone())) else {
++            return;
++        };
++        let mut nbt = saved.clone();
++        rift::tick(event.subject.host(), self.rift, &self.block, pos, &mut nbt);
++        if nbt == saved {
++            return;
++        }
++        // Write back the fields the tick changed, as the tick's own compound was kept before.
++        let written = event.subject.with_view(|mut view| {
++            let mut changed = false;
++            for key in saved.keys() {
++                if !nbt.contains_key(key) {
++                    changed |= view.set_nbt(key.clone(), None);
++                }
++            }
++            for (key, value) in nbt.iter() {
++                if saved.get(key) != Some(value) {
++                    changed |= view.set_nbt(key.clone(), Some(value.clone()));
++                }
++            }
++            (changed, view.handle())
++        });
++        if let Some((true, handle)) = written {
++            let _ = handle.set_changed(event.subject.host());
++        }
+     }
+ }
+ 
+diff --git a/src/rift.rs b/src/rift.rs
+index f771e0f..84a4a62 100644
+--- a/src/rift.rs
++++ b/src/rift.rs
+@@ -126,17 +126,27 @@ fn wave_index(saved: i32, len: usize) -> usize {
+ fn clear_wave(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3], wave: usize) {
+     let reach = LEASH + STRAY;
+     let here = centre(pos);
+-    let found = level.all_entities(host).or_else(|| {
+-        level.entities_in(
+-            host,
++    let mut found: Vec<mod_api::EntityRef> = Vec::new();
++    let mut collect = |e: mod_api::EntityRef| {
++        found.push(e);
++        std::ops::ControlFlow::Continue(())
++    };
++    if level.visit_all_entities(&*host, &mut collect).is_err() {
++        let _ = level.visit_entities_in(
++            &*host,
+             [here[0] - reach, here[1] - reach, here[2] - reach],
+             [here[0] + reach, here[1] + reach, here[2] + reach],
+-        )
+-    });
++            &mut collect,
++        );
++    }
+     let mobs: Vec<mod_api::EntityRef> = found
+-        .unwrap_or_default()
+         .into_iter()
+-        .filter(|e| e.tags(host).is_some_and(|tags| is_wave_mob(&tags, pos, wave)))
++        .filter(|e| {
++            e.tags(host).is_some_and(|tags| {
++                let tags: Vec<String> = tags.iter_utf16().map(String::from_utf16_lossy).collect();
++                is_wave_mob(&tags, pos, wave)
++            })
++        })
+         .collect();
+     for e in mobs {
+         let _ = e.discard(host);
+@@ -700,7 +710,7 @@ fn fail(host: &mut dyn ServerHost, level: LevelRef, dimension: &str, pos: [i32;
+ // ---- looks and words ------------------------------------------------------------------------------------------
+ 
+ fn sound(host: &mut dyn ServerHost, level: LevelRef, id: &str, at: [f64; 3], source: SoundSource, volume: f32, pitch: f32) {
+-    let _ = level.play_sound(host, id, at, source, volume * 4.0, pitch);
++    let _ = level.play_sound(host, id, at, source, volume * 4.0, pitch, None);
+ }
+ 
+ fn colour(rift: &Value) -> [f32; 3] {

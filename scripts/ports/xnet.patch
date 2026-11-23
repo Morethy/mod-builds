@@ -1,0 +1,144 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 546b017..1211fdb 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -19,8 +19,8 @@ mod network;
+ use std::sync::{Arc, Mutex};
+ 
+ use mod_api::{
+-    self, Flow, Hooks, HostSide, LevelTickPostEvent, RegisterCommandsEvent, Registrar,
+-    RegistrationContext, RunModCommandEvent, ServerHost,
++    self, Hooks, HostSide, LevelTickPostEvent, RegisterCommandsEvent, Registrar,
++    RegistrationContext, ServerHost,
+ };
+ 
+ use crate::network::{ControllerEntity, Controllers};
+@@ -77,16 +77,6 @@ impl Hooks for Mod {
+     /// `/xnet info <pos>` for every player, and the operator commands that edit a
+     /// channel (the controller screen is a gap).
+     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+-        network::register_commands(event);
+-    }
+-
+-    /// Run the usages [`Hooks::register_commands`] declares, after the game has
+-    /// parsed and permission-checked them.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        network::run_command(host, &self.controllers, event.command)
++        network::register_commands(event, &self.controllers);
+     }
+ }
+diff --git a/src/network.rs b/src/network.rs
+index b50207b..4e36a5c 100644
+--- a/src/network.rs
++++ b/src/network.rs
+@@ -149,8 +149,11 @@ impl BlockEntityPart for ControllerEntity {
+ 
+     /// One controller tick: queue it for the level tick's end. The tick itself
+     /// writes no block entity data; the pass at the end of the tick does.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        let Some(level) = level_in_place(host) else {
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        let Some(pos) = event.subject.with_view(|view| view.position()) else {
++            return;
++        };
++        let Some(level) = level_in_place(event.subject.host()) else {
+             return;
+         };
+         // Only this expression runs under the lock: one insert on the port's own
+@@ -158,7 +161,7 @@ impl BlockEntityPart for ControllerEntity {
+         self.controllers
+             .lock()
+             .expect("the controller queue lock is held for one insert")
+-            .push(level, event.pos);
++            .push(level, pos);
+     }
+ }
+ 
+@@ -291,7 +294,7 @@ fn count_matching(
+         let Some(resource) = container.resource(host, slot) else {
+             continue;
+         };
+-        if settings.matches(&resource.item().id(host)) {
++        if settings.matches(resource.item().id(host).unwrap_or_default()) {
+             total = total.saturating_add(container.amount(host, slot));
+         }
+     }
+@@ -343,7 +346,7 @@ fn run_operation(host: &mut dyn ServerHost, operation: &Operation<'_>, index: us
+         };
+         // The filter is by item id, as upstream's ghost slots are: the stack
+         // itself (components and all) is what moves.
+-        let item = resource.item().id(host);
++        let item = resource.item().id(host).unwrap_or_default().to_owned();
+         if !source.settings.matches(&item) {
+             continue;
+         }
+@@ -424,7 +427,7 @@ fn move_up_to(
+         return 0;
+     }
+     host.transaction(|host, tx| {
+-        let taken = from.extract(host, tx, slot, resource, take);
++        let taken = from.extract_at(host, tx, slot, resource, take);
+         if taken == 0 {
+             return Err(());
+         }
+@@ -435,7 +438,7 @@ fn move_up_to(
+             if allowed == 0 {
+                 continue;
+             }
+-            let went = container.insert_any(host, tx, resource, allowed);
++            let went = container.insert(host, tx, resource, allowed).unwrap_or(0);
+             if went > 0 {
+                 used += 1;
+             }
+@@ -448,7 +451,7 @@ fn move_up_to(
+         // contract leaves it; a source that cannot take it back aborts the transaction,
+         // so nothing leaves a container without arriving somewhere.
+         let keep = taken - inserted;
+-        if keep > 0 && from.insert(host, tx, slot, resource, keep) != keep {
++        if keep > 0 && from.insert_at(host, tx, slot, resource, keep) != keep {
+             return Err(());
+         }
+         Ok(used)
+@@ -787,10 +790,25 @@ fn connector_info(
+ /// a readout for every player; the editors stand in for the controller screen,
+ /// which is a gap in this slice, so they are operator-only (level 2), like a
+ /// command that changes a machine's settings.
+-pub(crate) fn register_commands(event: &mut RegisterCommandsEvent<'_>) {
++pub(crate) fn register_commands(
++    event: &mut RegisterCommandsEvent<'_>,
++    controllers: &Arc<Mutex<Controllers>>,
++) {
++    // Every usage runs the one router below, which the game calls after it has parsed and
++    // permission-checked the line.
++    let executor = |controllers: Arc<Mutex<Controllers>>| {
++        move |host: &mut dyn ServerHost,
++              _source: &mod_api::CommandSource,
++              command: &CommandInvocation| {
++            match run_command(host, &controllers, command) {
++                Flow::Cancel => Some(1),
++                _ => None,
++            }
++        }
++    };
+     event
+         .commands
+-        .push(Command::new("xnet info <pos:block_pos>"));
++        .push(Command::new("xnet info <pos:block_pos>").executes(executor(controllers.clone())));
+     for usage in [
+         "xnet channel <pos:block_pos> <channel:integer> <kind:word>",
+         "xnet connector <pos:block_pos> <channel:integer> <connector:block_pos> <side:word> <mode:word>",
+@@ -806,7 +824,9 @@ pub(crate) fn register_commands(event: &mut RegisterCommandsEvent<'_>) {
+         "xnet unfilter <pos:block_pos> <channel:integer> <connector:block_pos> <side:word> <item:text>",
+         "xnet blacklist <pos:block_pos> <channel:integer> <connector:block_pos> <side:word> <on:word>",
+     ] {
+-        event.commands.push(Command::op(usage, 2));
++        event
++            .commands
++            .push(Command::op(usage, 2).executes(executor(controllers.clone())));
+     }
+ }
+ 

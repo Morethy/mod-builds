@@ -1,0 +1,120 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 2f4d6f5..8d9afc7 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -18,9 +18,9 @@
+ //! game.
+ use mod_api::{
+     self, BlockEntityEvent, BlockEntityPart, BlockEntityTickEvent, BlockEntityTicksEvent,
+-    BlockPart, BlockState, Command, Compound, Flow, Hooks, Host, HostSide, ItemPart, LevelHost,
++    BlockPart, BlockState, Command, Compound, Hooks, Host, HostSide, ItemPart,
+     LevelTickPreEvent, OnBlockPlacedByEvent, OnDestroyedByPlayerEvent, RegisterCommandsEvent,
+-    Registrar, RegistrationContext, RunModCommandEvent, ServerHost, StateForPlacementEvent,
++    Registrar, RegistrationContext, ServerHost, StateForPlacementEvent,
+ };
+ 
+ pub mod runtime;
+@@ -66,7 +66,9 @@ impl Hooks for Mod {
+     /// `/dysoncubeproject status|set|add`, upstream's five usages at permission level 4.
+     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+         for usage in support::USAGES {
+-            event.commands.push(Command::op(usage, 4));
++            event
++                .commands
++                .push(Command::op(usage, 4).executes(|host, _source, command| run_command(host, command)));
+         }
+     }
+ 
+@@ -82,33 +84,14 @@ impl Hooks for Mod {
+         support::generate_spheres(host);
+     }
+ 
+-    /// The command body: typed arguments in, the same readout text out.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        if event.cancelled {
+-            return Flow::Continue;
+-        }
+-        let Some(dimension) = event.command.dimension.id(host) else {
+-            return Flow::Continue;
+-        };
+-        let Some(level) = host.level(&dimension) else {
+-            return Flow::Continue;
+-        };
+-        let handled = support::run_command(
+-            host,
+-            level,
+-            &event.command.literals,
+-            &event.command.arguments,
+-        );
+-        if handled {
+-            Flow::Cancel
+-        } else {
+-            Flow::Continue
+-        }
+-    }
++}
++
++/// The command body: typed arguments in, the same readout text out. The executor of every usage.
++fn run_command(host: &mut dyn ServerHost, command: &mod_api::CommandInvocation) -> Option<i32> {
++    let dimension = command.dimension.id(host)?;
++    let level = host.level(dimension)?;
++    let handled = support::run_command(host, level, &command.literals, &command.arguments);
++    handled.then_some(1)
+ }
+ 
+ /// The controller's block: its placement refusal and its teardown.
+@@ -121,9 +104,10 @@ impl BlockPart for ReceiverBlock {
+     /// keeps the stack, as vanilla's `null` does.
+     fn state_for_placement(
+         &self,
+-        level: &dyn LevelHost,
++        level: mod_api::LevelSide<'_>,
+         event: &mut StateForPlacementEvent<'_>,
+     ) -> Option<Option<BlockState>> {
++        let (mod_api::LevelSide::Server(level) | mod_api::LevelSide::Client(level)) = level;
+         let anchor = [
+             event.context.pos.x,
+             event.context.pos.y,
+@@ -190,11 +174,35 @@ impl BlockEntityPart for ReceiverEntity {
+     }
+ 
+     /// One server tick of the receiver: generate, pull, push down.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        let Some(level) = support::level_in_place(host) else {
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        let Some((pos, handle, before)) = event
++            .subject
++            .with_view(|view| (view.position(), view.handle(), view.nbt().clone()))
++        else {
+             return;
+         };
+-        support::receiver_tick(host, level, event.pos, &mut event.entity.nbt);
++        let mut nbt = before.clone();
++        {
++            let host = event.subject.host();
++            let Some(level) = support::level_in_place(host) else {
++                return;
++            };
++            support::receiver_tick(host, level, pos, &mut nbt);
++        }
++        // The tick no longer commits the payload it was lent: write back the fields the tick
++        // changed and mark the chunk unsaved, as the reply did.
++        let changed = event.subject.with_view(|mut view| {
++            let mut changed = false;
++            for (key, value) in nbt.iter() {
++                if before.get(key) != Some(value) {
++                    changed |= view.set_nbt(key.clone(), Some(value.clone()));
++                }
++            }
++            changed
++        });
++        if changed == Some(true) {
++            let _ = handle.set_changed(event.subject.host());
++        }
+     }
+ }
+ 

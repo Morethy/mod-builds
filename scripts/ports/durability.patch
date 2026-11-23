@@ -1,0 +1,26 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 310d43a..c141c30 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -79,9 +79,9 @@ impl Hooks for Mod {
+         let Some(living) = host.living(entity) else { return; };
+         let mut bars = Vec::new();
+         for slot in Slot::ALL {
+-            let Some(stack) = living.equipment(host, api_slot(slot)) else { continue; };
+-            let max = host.max_damage(stack.item()).unwrap_or(0);
+-            let id = stack.item().id(host);
++            let Some((item, damage)) = living.with_equipment(host, api_slot(slot), |stack| (stack.item(), stack.damage())) else { continue; };
++            let max = host.max_damage(item).unwrap_or(0);
++            let id = item.id(host).unwrap_or_default();
+             // Prefer the game's localised item name (铜头盔, 石斧, ...), which is
+             // short and already names the piece. Fall back to the slot label.
+             let name = host
+@@ -91,7 +91,7 @@ impl Hooks for Mod {
+             bars.push(Bar {
+                 slot,
+                 item: name,
+-                remaining: remaining(max, stack.damage()),
++                remaining: remaining(max, damage),
+                 max,
+             });
+         }

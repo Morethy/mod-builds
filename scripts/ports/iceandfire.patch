@@ -1,0 +1,96 @@
+diff --git a/src/glue.rs b/src/glue.rs
+index e1e2751..ea5ec87 100644
+--- a/src/glue.rs
++++ b/src/glue.rs
+@@ -22,7 +22,7 @@ use std::collections::HashMap;
+ use std::sync::{LazyLock, Mutex};
+ 
+ use mod_api::{
+-    BlockUpdateFlags, Compound, EntityRef, EntityTickPreEvent, Flow, LevelHost, LevelRef,
++    BlockUpdateFlags, Compound, EntityRef, Flow, LevelHost, LevelRef,
+     LevelWriteHost, OnBlockPlacedByEvent, PlayerRef, ServerHost, Tag, TickBlockEvent,
+ };
+ 
+@@ -194,11 +194,11 @@ pub(crate) fn level_tick(host: &mut dyn ServerHost, level: LevelRef) {
+ 
+ /// A fire dragon is about to tick: the port replaces the template's AI with its own
+ /// flight and targeting, then cancels the vanilla tick.
+-pub(crate) fn dragon_tick(host: &mut dyn ServerHost, event: &mut EntityTickPreEvent<'_>) -> Flow {
+-    if event.kind != DRAGON {
++pub(crate) fn dragon_tick(host: &mut dyn ServerHost, entity: u32, kind: &str) -> Flow {
++    if kind != DRAGON {
+         return Flow::Continue;
+     }
+-    let Some(entity) = host.entity(event.entity) else {
++    let Some(entity) = host.entity(entity) else {
+         return Flow::Continue;
+     };
+     let Some(position) = entity.position(host) else {
+@@ -363,9 +363,16 @@ fn bond(host: &mut dyn ServerHost, entity: EntityRef, position: [f64; 3]) -> (bo
+ 
+ /// The living, non-spectator players of `level`.
+ fn players_in(host: &mut dyn ServerHost, level: LevelRef) -> Vec<Nearby> {
+-    let Some(players) = level.online_players(host) else {
++    let mut players = Vec::new();
++    if level
++        .visit_online_players(host, &mut |player| {
++            players.push(player);
++            std::ops::ControlFlow::Continue(())
++        })
++        .is_err()
++    {
+         return Vec::new();
+-    };
++    }
+     players
+         .into_iter()
+         .filter(|player| {
+diff --git a/src/lib.rs b/src/lib.rs
+index f68b798..0b2dcab 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -39,16 +39,21 @@ impl Hooks for Mod {
+         r.block_part(egg_block, DragonEggBlock);
+         let egg_item = r.item_key(glue::EGG_ITEM);
+         r.item_part(egg_item, RedDragonEgg);
++        // Each dragon is told alone, right before its own tick, as the single-entity hook did.
++        r.entity_tick_each(glue::DRAGON);
+     }
+ 
+     /// The game tells no entity's tick unless a mod says it wants them: without this
+     /// `entity_tick_pre` never fires (its own doc says so on `entity_tick_listened`).
+     fn entity_tick_listened(
+         &self,
+-        _host: &mut dyn ServerHost,
++        host: mod_api::HostSide<'_>,
+         event: &mut EntityTickListenedEvent,
+     ) {
+-        event.listened = true;
++        // Only the server's dragons are flown here, as before the client was asked too.
++        if let mod_api::HostSide::Server(_) = host {
++            event.listened = true;
++        }
+     }
+ 
+     /// A fire dragon is about to tick: fly it at its target, then cancel its
+@@ -56,10 +61,17 @@ impl Hooks for Mod {
+     /// The port is the dragon's AI (see `notes.md`).
+     fn entity_tick_pre(
+         &self,
+-        host: &mut dyn ServerHost,
++        host: mod_api::HostSide<'_>,
+         event: &mut EntityTickPreEvent<'_>,
+-    ) -> Flow {
+-        glue::dragon_tick(host, event)
++    ) {
++        let mod_api::HostSide::Server(host) = host else {
++            return;
++        };
++        for (&entity, &kind) in event.entities.iter().zip(event.kinds.iter()) {
++            if matches!(glue::dragon_tick(host, entity, kind), Flow::Cancel) {
++                event.canceled.push(entity);
++            }
++        }
+     }
+ 
+     /// A level finished its tick: arm the eggs placed this tick (the level's own tick
