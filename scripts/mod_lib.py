@@ -13,9 +13,8 @@ nothing of the mods. This runs in the sandbox (scripts/sandbox.sh): no network, 
 The build is Starling's own, from the base's checkout (MOD_LIB_SOURCE): `tools/android_native_sdk.py mods OUT
 X.hmod --profile PROFILE --abi ABI`, with -C prefer-dynamic, so the game's crates are the ones the APK ships and only
 the mod compiles. Only a mod that route takes is built: no `[native.*]` tables (mixins, bridges, modules), no build
-script, no features, no crate but horizon-mod-api and the few of the game's own it may share (GAME_CRATES). Any other
-is told to use the whole-game Compile, for good, and so is one whose build compiled a crate of the game's again: its
-library would name the game's symbols as no APK has them.
+script, no features, no crate but the mod API, crates of its own inside its package and those the game's Cargo.lock
+has (the build has no network). Any other is told to use the whole-game Compile, for good.
 
 The registry's other mods come here too (store.py `plan`), only to be told apart: one with a `mod.wasm` is answered
 "doesn't run on Starling", which the game's catalogs read to leave it out; one of content alone is no native mod.
@@ -231,32 +230,60 @@ def native_of(folder, manifest):
         raise Refused(f"is not a native mod: {e}")
 
 
-def check(manifest, cargo, folder):
-    """Refused, for good, when this route won't build it."""
+def check(manifest, cargo, folder, known=frozenset()):
+    """Refused, for good, when this route won't build it. `known`: the crates in the game's Cargo.lock, which the
+    build (offline) has."""
     tables = sorted(k for k, v in (manifest.get("native") or {}).items() if isinstance(v, (list, dict)))
-    why = f"has [native.{', native.'.join(tables)}]" if tables else refusal(cargo, folder)
+    why = f"has [native.{', native.'.join(tables)}]" if tables else refusal(cargo, folder, known)
     if why:
         raise Refused(f"{why}: it {WHOLE_GAME}")
 
 
-def refusal(cargo, folder):
-    """Why the API route won't build this crate, or None (the launcher's `project_refusal`)."""
+def lock_crates(source):
+    """The crates the game's Cargo.lock names: the ones a build here has without the network."""
+    try:
+        lock = tomllib.loads((source / "Cargo.lock").read_text())
+    except (OSError, ValueError):
+        return frozenset()
+    return frozenset(p.get("name") for p in lock.get("package", []) if isinstance(p, dict))
+
+
+def refusal(cargo, folder, known=frozenset(), root=None):
+    """Why the API route won't build this crate, or None (the launcher's `project_refusal`). Starling: besides the
+    mod API, a mod may use any crate the game's Cargo.lock has (`known`; the build has no network), and crates of
+    its own by a `path` inside its package (`root`), which are held to the same rules but may choose features."""
+    own = root is not None
+    root = root or folder
     package = cargo.get("package") or {}
     build = package.get("build")
     if (build is not None and build is not False) or (build is None and (folder / "build.rs").is_file()):
         return "has a build script"
     if cargo.get("build-dependencies"):
         return "has build dependencies"
-    if cargo.get("features"):
+    if cargo.get("features") and not own:
         return "has features"
     for table in dependency_tables(cargo):
         for key, value in table.items():
             krate = value.get("package", key) if isinstance(value, dict) else key
-            if krate not in API_PACKAGES | GAME_CRATES:
-                return f"uses the crate {krate}"
-            if isinstance(value, dict) and (value.get("features") or value.get("default-features") is False):
-                return f"chooses features of {krate}"
-            if krate in GAME_CRATES and isinstance(value, dict) and set(value) - {"version", "package"}:
+            if krate in API_PACKAGES:
+                continue
+            if isinstance(value, dict) and "git" in value:
+                return f"takes {krate} from git"
+            if isinstance(value, dict) and "path" in value:
+                path = (folder / value["path"]).resolve()
+                if not path.is_relative_to(root.resolve()) or not (path / "Cargo.toml").is_file():
+                    return f"takes {krate} from outside its package"
+                try:
+                    inner = tomllib.loads((path / "Cargo.toml").read_text())
+                except (OSError, ValueError) as e:
+                    return f"has a crate of its own that won't read ({krate}: {e})"
+                if (why := refusal(inner, path, known, root)):
+                    return why
+                continue
+            if krate not in GAME_CRATES and krate not in known:
+                return f"uses the crate {krate}, which the game doesn't have"
+            if isinstance(value, dict) and set(value) - {"version", "package", "features", "default-features",
+                                                          "optional"}:
                 return f"takes {krate} from elsewhere than the game's own"
     return None
 
@@ -290,7 +317,7 @@ def build_one(row, mods, source, result, build, profile):
         if (port := store.port_digest(mod)):
             status["port"] = port
         cargo = native_of(folder, manifest)
-        check(manifest, cargo, folder)
+        check(manifest, cargo, folder, lock_crates(source))
         if not sunrise_game(source) and not (folder / "horizon-mod.toml").is_file():
             raise Refused("is made for a newer Starling")
         package = adopted(hmod, folder, work / f"{mod}.smod", mod) if sunrise_game(source) else hmod

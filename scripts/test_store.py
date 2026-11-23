@@ -105,14 +105,26 @@ class Builds(unittest.TestCase):
         for line in ("serde_json = '1'\n", "sha2 = { version = '0.10' }\n", "log = '0.4'\n"):
             status, _ = self.build(hmod({**files, "Cargo.toml": CARGO + line}))
             self.assertEqual(status["state"], "done", (line, status))
-        for line in ("serde_json = { version = '1', features = ['raw_value'] }\n",
-                     "log = { git = 'https://example.com/log' }\n"):
+        # Features of a crate the game has are taken (serde's derive, say).
+        status, _ = self.build(hmod({**files, "Cargo.toml": CARGO + "serde_json = { version = '1', features = ['raw_value'] }\n"}))
+        self.assertEqual(status["state"], "done", status)
+        for line in ("log = { git = 'https://example.com/log' }\n", "rand = '0.8'\n",
+                     "core = { path = '../outside' }\n"):
             status, _ = self.build(hmod({**files, "Cargo.toml": CARGO + line}))
             self.assertEqual((status["state"], status["settled"]), ("failed", True), line)
             self.assertIn("whole-game Compile", status["error"], line)
         # The game's crates compiled again: no APK has them so.
         status, _ = self.build(hmod({**files, "Cargo.toml": CARGO + "serde_json = '1'\n", "src/again.rs": ""}))
         self.assertEqual(status["state"], "done", status)
+
+    def test_a_crate_of_the_mods_own_inside_its_package_is_taken_by_the_same_rules(self):
+        files = {"horizon-mod.toml": MANIFEST, "src/lib.rs": "", "core/src/lib.rs": ""}
+        own = "[package]\nname = 'core'\nversion = '1.0.0'\n[features]\naudio = []\n[dependencies]\nserde_json = '1'\n"
+        status, _ = self.build(hmod({**files, "Cargo.toml": CARGO + "core = { path = 'core' }\n", "core/Cargo.toml": own}))
+        self.assertEqual(status["state"], "done", status)
+        for inner in (own + "rand = '0.8'\n", own + "[build-dependencies]\ncc = '1'\n"):
+            status, _ = self.build(hmod({**files, "Cargo.toml": CARGO + "core = { path = 'core' }\n", "core/Cargo.toml": inner}))
+            self.assertEqual((status["state"], status["settled"]), ("failed", True), inner)
 
     def test_a_wasm_mod_is_told_it_does_not_run_on_starling_and_content_alone_is_no_native_mod(self):
         plain = "id = 'zoom'\nversion = '3.0.3'\napi = '0.2'\n"
@@ -273,7 +285,8 @@ class Plan(unittest.TestCase):
         self.assertEqual(len(store.plan(self.catalog, BUILD, ["arm64-v8a"], maybe, "26.3")), 1)
         for error, again in (("This mod has [native.mixin]: it needs the whole-game Compile.", 0),
                              ("This mod uses the crate serde_json: it needs the whole-game Compile.", 1),
-                             ("This mod uses the crate rand: it needs the whole-game Compile.", 0)):
+                             ("This mod uses the crate rand: it needs the whole-game Compile.", 1),
+                             ("This mod uses the crate rand, which the game doesn't have: it needs the whole-game Compile.", 0)):
             good = {"mods": [], "failed": [{"job": store.job_of("a" * 64, "arm64-v8a"), "settled": True, "error": error}]}
             self.assertEqual(len(store.plan(self.catalog, BUILD, ["arm64-v8a"], good, "26.3")), again, error)
         self.assertEqual(len(store.plan(self.catalog, BUILD, ["arm64-v8a", "x86_64"], None, "26.3")), 2)
