@@ -357,7 +357,9 @@ def build_one(row, mods, source, result, build, profile):
         if not (isinstance(name, str) and store.LIBRARY.fullmatch(name) and (out / name).is_file()):
             raise ValueError(f"the build named no plain library: {name!r}")
         words = str(identity).split(" ")
-        if len(words) != 4 or words[:3] != [build, mod, version]:
+        # Four words on Starling's Horizon-based game (0.9.0); five on the Sunrise-based one, whose loader also
+        # wants the panic strategy (`<build> <mod> <version> <rustc> unwind`).
+        if not (len(words) == 4 or (len(words) == 5 and words[4] == "unwind")) or words[:3] != [build, mod, version]:
             raise ValueError(f"the library's identity {identity!r} is not {build[:12]} {mod} {version}")
         library = result / f"{job}.so"
         shutil.copyfile(out / name, library)
