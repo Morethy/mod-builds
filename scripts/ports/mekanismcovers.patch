@@ -1,0 +1,117 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 892b25a..79f5a2c 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -118,7 +118,7 @@ impl Hooks for Mod {
+ 
+     /// The registry and its tags were (re)published: the special recipe matches without a host, so
+     /// keep its view of which item places which block.
+-    fn tags_updated(&self, host: HostSide, event: &mut TagsUpdatedEvent) {
++    fn tags_updated(&self, host: &dyn mod_api::ReloadContext, event: &mut TagsUpdatedEvent) {
+         support::reload(host, event);
+     }
+ 
+diff --git a/src/support.rs b/src/support.rs
+index 4be85a6..e60db1b 100644
+--- a/src/support.rs
++++ b/src/support.rs
+@@ -12,7 +12,7 @@
+ 
+ use mod_api::{
+     self, BlockEntityRef, BlockShapeKind, Component, ComponentTypesEvent, CraftingGrid,
+-    CraftingRecipeCodec, CraftingRecipeKind, Hand, Host, HostBlockStates, HostSide,
++    CraftingRecipeKind, Hand, Host, HostBlockStates, HostSide,
+     HostTransaction, ItemDrop, ItemKey, ItemPlace, ItemResource, ItemStack, LevelHost, LevelRef,
+     Registrar, RegistrationContext, ServerHost, Tag, TagsUpdatedEvent, Text,
+ };
+@@ -47,14 +47,25 @@ static PLACED: std::sync::RwLock<Vec<Placed>> = std::sync::RwLock::new(Vec::new(
+ static BLOCK_ITEMS: std::sync::RwLock<Vec<(String, ItemKey)>> = std::sync::RwLock::new(Vec::new());
+ 
+ /// Re-reads the item registry: which item places which block, and each block's own item.
+-pub(crate) fn refresh_registry(host: &dyn Host) {
++pub(crate) fn refresh_registry(host: &dyn mod_api::ReloadContext) {
+     let mut placed = Vec::new();
+     let mut block_items = Vec::new();
++    // Starling's port: Sunrise's reload context names blocks through the block registry, not
++    // through a key's own read.
++    let block_ids: std::collections::HashMap<mod_api::BlockKey, String> = host
++        .registry_entries("minecraft:block")
++        .unwrap_or_default()
++        .into_iter()
++        .filter_map(|id| {
++            let id = id.to_string();
++            host.block_key(&id).map(|key| (key, id))
++        })
++        .collect();
+     for item in host.item_keys() {
+         let Some(block) = host.item_block(item) else {
+             continue;
+         };
+-        let block_id = block.id(host);
++        let block_id = block_ids.get(&block).cloned().unwrap_or_default();
+         // Same test [`may_cover`] makes at the click: an unknown state is treated as having a
+         // block entity, so an item is never accepted on a guess.
+         let block_entity = host
+@@ -241,7 +252,7 @@ fn is_full_cube(boxes: &[[f64; 6]]) -> bool {
+ /// The block id at `pos`, when it is a Mekanism transmitter.
+ pub(crate) fn transmitter_at(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> Option<String> {
+     let block = level.block(host, pos)?;
+-    let id = block.id(host);
++    let id = block.id(host).unwrap_or_default().to_owned();
+     runtime::is_transmitter(&id).then_some(id)
+ }
+ 
+@@ -352,9 +363,6 @@ pub(crate) struct CoverRecipe {
+ impl CraftingRecipeKind for CoverRecipe {
+     type Value = SpecialCover;
+ 
+-    fn codec(&self) -> Option<CraftingRecipeCodec<Self::Value>> {
+-        Some(CraftingRecipeCodec::wire())
+-    }
+ 
+     fn decode(&self, json: &str) -> Result<Self::Value, String> {
+         use mod_api::serde_json::Value;
+@@ -382,11 +390,11 @@ impl CraftingRecipeKind for CoverRecipe {
+         ))
+     }
+ 
+-    fn matches(&self, _value: &Self::Value, grid: CraftingGrid) -> bool {
++    fn matches(&self, _context: &dyn mod_api::LoopContext, _value: &Self::Value, grid: CraftingGrid) -> bool {
+         runtime::special(&cells_of(&grid)).is_some()
+     }
+ 
+-    fn assemble(&self, _value: &Self::Value, grid: CraftingGrid) -> Option<ItemStack> {
++    fn assemble(&self, _context: &dyn mod_api::LoopContext, _value: &Self::Value, grid: CraftingGrid) -> Option<ItemStack> {
+         match runtime::special(&cells_of(&grid))? {
+             Plan::Fill(block) => {
+                 let mut out = ItemStack::new(self.cover, 1)?;
+@@ -399,6 +407,7 @@ impl CraftingRecipeKind for CoverRecipe {
+ 
+     fn remaining_items(
+         &self,
++        _context: &dyn mod_api::CraftingRemainders,
+         _value: &Self::Value,
+         grid: CraftingGrid,
+     ) -> Option<Vec<Option<ItemStack>>> {
+@@ -445,17 +454,13 @@ pub(crate) fn register_components(
+     _context: &RegistrationContext,
+     event: &mut ComponentTypesEvent<'_>,
+ ) {
+-    if !event.types.iter().any(|known| known == runtime::COMPONENT) {
+-        event.types.push(runtime::COMPONENT.to_owned());
+-    }
++    // Starling's port: Sunrise keeps the known types to itself; registering again is harmless.
++    event.register(runtime::COMPONENT.to_owned().into());
+ }
+ 
+ /// Keep the host-free recipe's registry view fresh after every registry/tag load.
+-pub(crate) fn reload(host: HostSide, _event: &mut TagsUpdatedEvent) {
+-    match host {
+-        HostSide::Server(host) => refresh_registry(host),
+-        HostSide::Client(host) => refresh_registry(host),
+-    }
++pub(crate) fn reload(host: &dyn mod_api::ReloadContext, _event: &mut TagsUpdatedEvent) {
++    refresh_registry(host);
+ }
+ 
+ /// The cover item: attach on a transmitter, tooltip the worn block.

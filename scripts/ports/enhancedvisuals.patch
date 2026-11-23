@@ -1,0 +1,109 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 0d8bc9d..09f0f8d 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -26,7 +26,7 @@ use effects::{
+ };
+ use mod_api::{
+     self, ClientHost, ClientTickPostEvent, ClipBlock, ClipFluid, EntityRef, ExplosionPrimeEvent,
+-    GuiLayer, GuiLayerDrawEvent, GuiLayerPlacement, Hooks, LevelRandomHost, LevelRef,
++    GuiLayerPlacement, Hooks, LevelRandomHost, LevelRef,
+     LivingDamagePreEvent, PotionSplashEvent, RegisterGuiLayersEvent, Registrar,
+     RegistrationContext, ScreenRenderPostEvent, ServerHost, SettingSpec, ShaderParamsEvent,
+     SoundPlay,
+@@ -42,7 +42,8 @@ const LAYER: &str = "enhancedvisuals:hud";
+ /// on different threads and both reach it.
+ #[derive(Default)]
+ pub struct EnhancedVisuals {
+-    state: Mutex<State>,
++    // Starling's port: shared with the HUD layer's draw callback.
++    state: std::sync::Arc<Mutex<State>>,
+ }
+ 
+ impl EnhancedVisuals {
+@@ -203,43 +204,38 @@ impl Hooks for EnhancedVisuals {
+     /// The splatters and overlays go above every vanilla layer, so the hotbar and chat never
+     /// cover them, and F1 hides them with the rest of the HUD.
+     fn register_gui_layers(&self, _: &RegistrationContext, event: &mut RegisterGuiLayersEvent<'_>) {
+-        event.layers.push(GuiLayer {
+-            id: LAYER.to_owned(),
+-            placement: GuiLayerPlacement::AboveAll,
+-        });
+-    }
+-
+-    /// One frame of the HUD: the overlay, then every splat above it.
+-    fn gui_layer_draw(&self, _: &dyn ClientHost, event: &mut GuiLayerDrawEvent<'_>) {
+-        if event.layer != LAYER {
+-            return;
+-        }
+-        let items: Vec<DrawItem> = {
+-            let state = self.state();
+-            effects::draw_list(&state)
+-        };
+-        if items.is_empty() {
+-            return;
+-        }
+-        let [width, height] = event.draw.size();
+-        for item in items {
+-            let dst = item.dest(width, height);
+-            if item.fill {
+-                event.draw.fill(dst, item.tint);
+-                continue;
+-            }
+-            // A sprite the resources do not have draws nothing; the frame still runs.
+-            let _ = event
+-                .draw
+-                .sprite(item.sprite, item.src, dst, Some(item.tint));
+-        }
++        // One frame of the HUD: the overlay, then every splat above it.
++        let state = self.state.clone();
++        event.layers.register(
++            LAYER.to_owned(),
++            GuiLayerPlacement::AboveAll,
++            Box::new(move |_host, draw| {
++                let items: Vec<DrawItem> = {
++                    let state = state.lock().unwrap_or_else(|e| e.into_inner());
++                    effects::draw_list(&state)
++                };
++                if items.is_empty() {
++                    return;
++                }
++                let [width, height] = draw.size();
++                for item in items {
++                    let dst = item.dest(width, height);
++                    if item.fill {
++                        draw.fill(dst, item.tint);
++                        continue;
++                    }
++                    // A sprite the resources do not have draws nothing; the frame still runs.
++                    let _ = draw.sprite(item.sprite, item.src, dst, Some(item.tint));
++                }
++            }),
++        );
+     }
+ 
+     /// The world names the damage type of a hit on a player; the next client tick that sees
+     /// the health drop draws it.
+     fn living_damage_pre(
+         &self,
+-        _level: &mut dyn LevelRandomHost,
++        _level: &mut dyn mod_api::HitHost,
+         event: &mut LivingDamagePreEvent<'_>,
+     ) {
+         if !event.kind.ends_with("player") {
+@@ -493,7 +489,14 @@ fn read_input(host: &dyn ClientHost) -> Input {
+ fn nearby_enderman(host: &dyn ClientHost, level: LevelRef, pos: [f64; 3]) -> Option<f32> {
+     let box_min = [pos[0] - 16.0, pos[1] - 16.0, pos[2] - 16.0];
+     let box_max = [pos[0] + 16.0, pos[1] + 16.0, pos[2] + 16.0];
+-    let found = level.entities_in(host, box_min, box_max)?;
++    // Starling's port: the box's entities are visited, then scanned as before.
++    let mut found = Vec::new();
++    level
++        .visit_entities_in(host, box_min, box_max, &mut |entity| {
++            found.push(entity);
++            core::ops::ControlFlow::Continue(())
++        })
++        .ok()?;
+     let mut nearest: Option<f32> = None;
+     for entity in found {
+         // The API names no entity types, so an enderman is recognised by its shape: 2.9 blocks

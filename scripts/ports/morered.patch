@@ -1,0 +1,209 @@
+diff --git a/src/support.rs b/src/support.rs
+index e449ec6..f798e99 100644
+--- a/src/support.rs
++++ b/src/support.rs
+@@ -998,7 +998,7 @@ fn signal_toward(host: &dyn ServerHost, level: LevelRef, pos: [i32; 3], from_rea
+     }
+     if let Some(attached) = wire_attached_of(&view) {
+         // The wire's per-face power is the same cache its `block_signal` answers from.
+-        let dimension = level.dimension().id(host).unwrap_or_default();
++        let dimension = level.dimension().id(host).unwrap_or_default().to_owned();
+         let power = with_state(|state| state.wire_power.get(&key_of(&dimension, pos)).copied())
+             .unwrap_or([0u8; 6]);
+         return wire_signal(power, attached, toward_reader);
+@@ -1148,11 +1148,10 @@ impl BlockPart for RedstonePart {
+     /// turns its output toward the clicked quadrant; a post attaches to the
+     /// clicked face's opposite; a fresh wire attaches to the face it was clicked
+     /// against.
+-    fn state_for_placement(
+-        &self,
+-        level: &dyn LevelHost,
++    fn state_for_placement(&self, level: mod_api::LevelSide<'_>,
+         event: &mut StateForPlacementEvent<'_>,
+     ) -> Option<Option<BlockState>> {
++        let (mod_api::LevelSide::Server(level) | mod_api::LevelSide::Client(level)) = level;
+         let view = level_view(level, event.state)?;
+         let clicked = to_dir(event.context.face);
+         if post_of(&view).is_some() {
+@@ -1206,7 +1205,7 @@ impl BlockPart for ClickPart {
+         event: &mut UseItemOnEvent<'_>,
+     ) -> Option<InteractionResult> {
+         let stack = event.click.stack?;
+-        let acted = if stack.item().id(&*host) == SPOOL_ITEM {
++        let acted = if stack.item().id(&*host).unwrap_or_default() == SPOOL_ITEM {
+             spool_click_at(host, event.click, stack)
+         } else {
+             rotate_with_rod(host, event.click, stack)
+@@ -2196,7 +2195,7 @@ fn mark_cables_near_cached(dimension: &str, pos: [i32; 3]) {
+ 
+ /// Apply the queued wires and plates for this level's dimension.
+ pub fn on_level_tick_post(host: &mut dyn ServerHost, level: LevelRef) {
+-    let Some(dimension) = level.dimension().id(host) else {
++    let Some(dimension) = level.dimension().id(host).map(str::to_owned) else {
+         return;
+     };
+     let dimension = dimension.as_str();
+@@ -2246,13 +2245,13 @@ pub fn on_loot_drops(host: &mut dyn ServerHost, event: &mut LootDropsEvent<'_>)
+     if count == 0 {
+         event
+             .drops
+-            .retain(|drop| drop.item().id(&*host) != view.name);
++            .retain(|drop| drop.item().id(&*host).unwrap_or_default() != view.name);
+         return;
+     }
+     for drop in event
+         .drops
+         .iter_mut()
+-        .filter(|drop| drop.item().id(&*host) == view.name)
++        .filter(|drop| drop.item().id(&*host).unwrap_or_default() == view.name)
+     {
+         let _ = drop.set_count(count);
+     }
+@@ -2331,23 +2330,28 @@ impl BlockEntityPart for WireEntityPart {
+         Some(encode_wire_power([0u8; 6]))
+     }
+ 
+-    fn block_entity_on_load(&self, host: HostSide<'_>, event: &mut BlockEntityOnLoadEvent) {
+-        let HostSide::Server(host) = host else {
+-            return;
+-        };
++    fn block_entity_on_load(&self, event: &mut BlockEntityOnLoadEvent<'_>) {
+         if WIRE_TYPE.get() != Some(&event.id) {
+             return;
+         }
+-        let Some(level) = event.entity.level(&*host) else {
++        // Starling's port: the block entity is lent through the event's subject.
++        let mod_api::BlockEntitySideScope::Server(scope) = &mut event.subject else {
++            return;
++        };
++        let Some(entity) = scope.with_view(|view| view.handle()) else {
++            return;
++        };
++        let host = scope.host();
++        let Some(level) = entity.level(&*host) else {
+             return;
+         };
+-        let Some(dimension) = level.dimension().id(&*host) else {
++        let Some(dimension) = level.dimension().id(&*host).map(str::to_owned) else {
+             return;
+         };
+-        let Some(pos) = event.entity.position(&*host) else {
++        let Some(pos) = entity.position(&*host) else {
+             return;
+         };
+-        let Some(data) = event.entity.data(&*host) else {
++        let Some(data) = entity.data(&*host) else {
+             return;
+         };
+         with_state(|state| {
+@@ -2381,23 +2385,28 @@ impl BlockEntityPart for CableEntityPart {
+         Some(encode_cable_power(CablePower::NONE))
+     }
+ 
+-    fn block_entity_on_load(&self, host: HostSide<'_>, event: &mut BlockEntityOnLoadEvent) {
+-        let HostSide::Server(host) = host else {
+-            return;
+-        };
++    fn block_entity_on_load(&self, event: &mut BlockEntityOnLoadEvent<'_>) {
+         if CABLE_TYPE.get() != Some(&event.id) {
+             return;
+         }
+-        let Some(level) = event.entity.level(&*host) else {
++        // Starling's port: the block entity is lent through the event's subject.
++        let mod_api::BlockEntitySideScope::Server(scope) = &mut event.subject else {
++            return;
++        };
++        let Some(entity) = scope.with_view(|view| view.handle()) else {
++            return;
++        };
++        let host = scope.host();
++        let Some(level) = entity.level(&*host) else {
+             return;
+         };
+-        let Some(dimension) = level.dimension().id(&*host) else {
++        let Some(dimension) = level.dimension().id(&*host).map(str::to_owned) else {
+             return;
+         };
+-        let Some(pos) = event.entity.position(&*host) else {
++        let Some(pos) = entity.position(&*host) else {
+             return;
+         };
+-        let Some(data) = event.entity.data(&*host) else {
++        let Some(data) = entity.data(&*host) else {
+             return;
+         };
+         with_state(|state| {
+@@ -2432,23 +2441,28 @@ impl BlockEntityPart for BitwiseEntityPart {
+         Some(encode_channel_power(ChannelPower::NONE))
+     }
+ 
+-    fn block_entity_on_load(&self, host: HostSide<'_>, event: &mut BlockEntityOnLoadEvent) {
+-        let HostSide::Server(host) = host else {
+-            return;
+-        };
++    fn block_entity_on_load(&self, event: &mut BlockEntityOnLoadEvent<'_>) {
+         if BITWISE_TYPE.get() != Some(&event.id) {
+             return;
+         }
+-        let Some(level) = event.entity.level(&*host) else {
++        // Starling's port: the block entity is lent through the event's subject.
++        let mod_api::BlockEntitySideScope::Server(scope) = &mut event.subject else {
++            return;
++        };
++        let Some(entity) = scope.with_view(|view| view.handle()) else {
++            return;
++        };
++        let host = scope.host();
++        let Some(level) = entity.level(&*host) else {
+             return;
+         };
+-        let Some(dimension) = level.dimension().id(&*host) else {
++        let Some(dimension) = level.dimension().id(&*host).map(str::to_owned) else {
+             return;
+         };
+-        let Some(pos) = event.entity.position(&*host) else {
++        let Some(pos) = entity.position(&*host) else {
+             return;
+         };
+-        let Some(data) = event.entity.data(&*host) else {
++        let Some(data) = entity.data(&*host) else {
+             return;
+         };
+         with_state(|state| {
+@@ -2484,23 +2498,28 @@ impl BlockEntityPart for PostEntityPart {
+         Some(encode_post_links(&PostLinks::default()))
+     }
+ 
+-    fn block_entity_on_load(&self, host: HostSide<'_>, event: &mut BlockEntityOnLoadEvent) {
+-        let HostSide::Server(host) = host else {
+-            return;
+-        };
++    fn block_entity_on_load(&self, event: &mut BlockEntityOnLoadEvent<'_>) {
+         if POST_TYPE.get() != Some(&event.id) {
+             return;
+         }
+-        let Some(level) = event.entity.level(&*host) else {
++        // Starling's port: the block entity is lent through the event's subject.
++        let mod_api::BlockEntitySideScope::Server(scope) = &mut event.subject else {
++            return;
++        };
++        let Some(entity) = scope.with_view(|view| view.handle()) else {
++            return;
++        };
++        let host = scope.host();
++        let Some(level) = entity.level(&*host) else {
+             return;
+         };
+-        let Some(dimension) = level.dimension().id(&*host) else {
++        let Some(dimension) = level.dimension().id(&*host).map(str::to_owned) else {
+             return;
+         };
+-        let Some(pos) = event.entity.position(&*host) else {
++        let Some(pos) = entity.position(&*host) else {
+             return;
+         };
+-        let Some(data) = event.entity.data(&*host) else {
++        let Some(data) = entity.data(&*host) else {
+             return;
+         };
+         with_state(|state| {

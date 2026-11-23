@@ -1,0 +1,563 @@
+diff --git a/src/contents.rs b/src/contents.rs
+index 91d1b1f..785a7f1 100644
+--- a/src/contents.rs
++++ b/src/contents.rs
+@@ -383,7 +383,7 @@ impl Contents {
+ 
+ /// The stack's item id.
+ pub fn item_id(host: &dyn Host, stack: &ItemStack) -> String {
+-    stack.item().id(host).to_string()
++    stack.item().id(host).unwrap_or_default().to_string()
+ }
+ 
+ /// `stack` with `count` (a count of 0 is nothing).
+diff --git a/src/crafting.rs b/src/crafting.rs
+index c6d82f8..d00d5d8 100644
+--- a/src/crafting.rs
++++ b/src/crafting.rs
+@@ -10,7 +10,7 @@
+ use std::collections::HashMap;
+ 
+ use mod_api::serde_json::Value;
+-use mod_api::{CraftingGrid, CraftingRecipeCodec, CraftingRecipeKind, ItemKey, ItemStack, Registrar, Tag};
++use mod_api::{CraftingGrid, CraftingRecipeKind, ItemKey, ItemStack, Registrar, Tag};
+ 
+ use crate::contents::{Nbt, custom_data, get_int, put, set_custom_data};
+ 
+@@ -216,10 +216,6 @@ impl UpgradeNextTier {
+ impl CraftingRecipeKind for UpgradeNextTier {
+     type Value = Shaped;
+ 
+-    fn codec(&self) -> Option<CraftingRecipeCodec<Shaped>> {
+-        Some(CraftingRecipeCodec::wire())
+-    }
+-
+     fn decode(&self, json: &str) -> Result<Shaped, String> {
+         let d: Value = mod_api::serde_json::from_str(json).map_err(|e| e.to_string())?;
+         let ids = |v: &Value| -> Result<Vec<String>, String> {
+@@ -279,14 +275,14 @@ impl CraftingRecipeKind for UpgradeNextTier {
+         Ok(mod_api::serde_json::json!({"pattern": v.pattern, "key": key, "result": {"id": v.result, "count": v.count}, "copy": v.copy}).to_string())
+     }
+ 
+-    fn matches(&self, v: &Shaped, grid: CraftingGrid) -> bool {
++    fn matches(&self, _context: &dyn mod_api::LoopContext, v: &Shaped, grid: CraftingGrid) -> bool {
+         if !v.ingredients.is_empty() {
+             return self.shapeless(v, &grid).is_some();
+         }
+         self.layout(v, &grid).is_some()
+     }
+ 
+-    fn assemble(&self, v: &Shaped, grid: CraftingGrid) -> Option<ItemStack> {
++    fn assemble(&self, _context: &dyn mod_api::LoopContext, v: &Shaped, grid: CraftingGrid) -> Option<ItemStack> {
+         if !v.ingredients.is_empty() {
+             let kept = self.shapeless(v, &grid)?;
+             let mut out = ItemStack::new(*self.keys.get(&v.result)?, v.count.max(1))?;
+@@ -407,10 +403,6 @@ pub fn set_colors(stack: &mut ItemStack, main: i32, accent: i32) {
+ impl CraftingRecipeKind for StorageDye {
+     type Value = Dye;
+ 
+-    fn codec(&self) -> Option<CraftingRecipeCodec<Dye>> {
+-        Some(CraftingRecipeCodec::wire())
+-    }
+-
+     fn decode(&self, json: &str) -> Result<Dye, String> {
+         let d: Value = mod_api::serde_json::from_str(json).map_err(|e| e.to_string())?;
+         let storage: Vec<String> = d["storage"].as_array().ok_or("no storage")?.iter().filter_map(|x| x.as_str().map(String::from)).collect();
+@@ -431,7 +423,7 @@ impl CraftingRecipeKind for StorageDye {
+             "main_key": v.main_key, "accent_key": v.accent_key}).to_string())
+     }
+ 
+-    fn matches(&self, v: &Dye, grid: CraftingGrid) -> bool {
++    fn matches(&self, _context: &dyn mod_api::LoopContext, v: &Dye, grid: CraftingGrid) -> bool {
+         let mut storage = 0;
+         let mut dyes = 0;
+         for s in grid.cells.iter().flatten() {
+@@ -446,7 +438,7 @@ impl CraftingRecipeKind for StorageDye {
+         storage == 1 && dyes > 0
+     }
+ 
+-    fn assemble(&self, v: &Dye, grid: CraftingGrid) -> Option<ItemStack> {
++    fn assemble(&self, _context: &dyn mod_api::LoopContext, v: &Dye, grid: CraftingGrid) -> Option<ItemStack> {
+         let w = grid.width as usize;
+         let mut storage = None;
+         let mut column_dyes: Vec<(usize, u32)> = Vec::new();
+diff --git a/src/lib.rs b/src/lib.rs
+index 1b093af..f252e0e 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -129,7 +129,7 @@ impl Shared {
+                         Family::ShulkerBox => "minecraft:block.shulker_box.open",
+                         _ => "minecraft:block.barrel.open",
+                     };
+-                    level.play_sound(host, sound, at, SoundSource::Blocks, 0.5, 1.0);
++                    level.play_sound(host, sound, at, SoundSource::Blocks, 0.5, 1.0, None);
+                     if family == Family::Barrel {
+                         storage::change_props(host, level, pos, &[("open", "true")]);
+                     }
+@@ -158,7 +158,7 @@ impl Shared {
+             Family::ShulkerBox => "minecraft:block.shulker_box.close",
+             _ => "minecraft:block.barrel.close",
+         };
+-        level.play_sound(host, sound, at, SoundSource::Blocks, 0.5, 1.0);
++        level.play_sound(host, sound, at, SoundSource::Blocks, 0.5, 1.0, None);
+         if kind.family == Family::Barrel {
+             storage::change_props(host, level, *pos, &[("open", "false")]);
+         }
+@@ -206,7 +206,7 @@ impl Shared {
+         }
+     }
+ 
+-    fn click(&self, host: &mut dyn ServerHost, ev: &MenuClickedEvent) {
++    fn click(&self, host: &mut dyn ServerHost, ev: &MenuClickedEvent<'_>) {
+         let uuid = ev.uuid;
+         let Some(mut s) = lock(&self.sessions).get(&uuid).filter(|s| s.window == ev.window).cloned() else { return };
+         let Some(loc) = places::find(host, uuid, &s.loc, s.id) else {
+@@ -303,7 +303,7 @@ fn place(host: &mut dyn ServerHost, uuid: u128, hand: Hand, pos: [i32; 3], face:
+         "minecraft:air", "minecraft:cave_air", "minecraft:void_air", "minecraft:short_grass", "minecraft:fern",
+         "minecraft:snow", "minecraft:dead_bush", "minecraft:vine", "minecraft:water",
+     ];
+-    let id_at = |host: &dyn mod_api::Host, p: [i32; 3]| level.block(host, p).map(|k| k.id(host).to_string()).unwrap_or_default();
++    let id_at = |host: &dyn mod_api::Host, p: [i32; 3]| level.block(host, p).and_then(|k| k.id(host).map(str::to_string)).unwrap_or_default();
+     let target = if REPLACEABLE.contains(&id_at(&*host, pos).as_str()) {
+         pos
+     } else {
+@@ -337,7 +337,7 @@ fn place(host: &mut dyn ServerHost, uuid: u128, hand: Hand, pos: [i32; 3], face:
+         places::set_slot(host, player, slot, stack.clone().shrink(1));
+     }
+     let at = target.map(|v| f64::from(v) + 0.5);
+-    level.play_sound(host, "minecraft:block.wool.place", at, SoundSource::Blocks, 1.0, 0.8);
++    level.play_sound(host, "minecraft:block.wool.place", at, SoundSource::Blocks, 1.0, 0.8, None);
+     true
+ }
+ 
+@@ -361,7 +361,7 @@ fn pick_up(host: &mut dyn ServerHost, uuid: u128, dim: &str, pos: [i32; 3]) -> b
+         _ => places::give_or_drop(host, player, &st),
+     }
+     let at = pos.map(|v| f64::from(v) + 0.5);
+-    level.play_sound(host, "minecraft:item.armor.equip_leather", at, SoundSource::Blocks, 0.5, 1.0);
++    level.play_sound(host, "minecraft:item.armor.equip_leather", at, SoundSource::Blocks, 0.5, 1.0, None);
+     true
+ }
+ 
+@@ -406,7 +406,7 @@ impl ItemPart for StorageItemPart {
+         let used = c.slots.iter().flatten().count();
+         event.lines.push((mod_api::Text::literal(format!("§7{used} of {} slots used", kind.slots)), 0xFFAAAAAA));
+         for u in c.upgrades.iter().flatten() {
+-            let name = host.hover_name(u);
++            let Ok(name) = host.hover_name(u).map(|t| host.text_string(&t)) else { continue };
+             event.lines.push((mod_api::Text::literal(format!("§9{name}")), 0xFF5555FF));
+         }
+         let unknown = c.unknown_count();
+@@ -432,7 +432,7 @@ impl BlockPart for StorageBlockPart {
+         // An empty hand goes on to use_without_item (the vanilla TRY_WITH_EMPTY_HAND), where sneaking takes it.
+         let empty = host
+             .player(click.player)
+-            .and_then(|p| mod_api::LivingRef::new(p.entity()).hand_item(&*host, Hand::Main))
++            .and_then(|p| mod_api::LivingRef::new(p.entity()).with_hand_item(&*host, Hand::Main, |stack| stack.project()).flatten())
+             .is_none_or(|s| s.count() == 0);
+         if empty {
+             return None;
+@@ -493,7 +493,7 @@ impl ItemPart for PlacedItemPart {
+             event.lines.push((mod_api::Text::literal(format!("§7{used} of {} slots used", c.slots.len())), 0xFFAAAAAA));
+         }
+         for u in c.upgrades.iter().flatten() {
+-            let name = host.hover_name(u);
++            let Ok(name) = host.hover_name(u).map(|t| host.text_string(&t)) else { continue };
+             event.lines.push((mod_api::Text::literal(format!("§9{name}")), 0xFF5555FF));
+         }
+         let unknown = c.unknown_count();
+@@ -508,7 +508,8 @@ struct StorageBlock(Arc<Shared>);
+ 
+ #[mod_api::sunrise_part]
+ impl BlockPart for StorageBlock {
+-    fn state_for_placement(&self, level: &dyn LevelHost, event: &mut StateForPlacementEvent<'_>) -> Option<Option<BlockState>> {
++    fn state_for_placement(&self, level: mod_api::LevelSide<'_>, event: &mut StateForPlacementEvent<'_>) -> Option<Option<BlockState>> {
++        let (mod_api::LevelSide::Server(level) | mod_api::LevelSide::Client(level)) = level;
+         let block = level.state_block(event.state)?.to_string();
+         let kind = storage::kind_of_block(&block)?;
+         let ctx = event.context;
+@@ -549,14 +550,30 @@ impl BlockPart for StorageEntity {}
+ 
+ #[mod_api::sunrise_part]
+ impl BlockEntityPart for StorageEntity {
+-    fn block_entity_on_load(&self, host: HostSide<'_>, event: &mut BlockEntityOnLoadEvent) {
+-        let HostSide::Server(host) = host else { return };
+-        if let (Some(level), Some(pos)) = (event.entity.level(&*host), event.entity.position(&*host)) {
++    fn block_entity_on_load(&self, event: &mut BlockEntityOnLoadEvent<'_>) {
++        // Starling's port: the block entity is lent through the event's subject.
++        let mod_api::BlockEntitySideScope::Server(scope) = &mut event.subject else { return };
++        if let Some((level, pos)) = scope.with_view(|view| (view.level(), view.position())) {
+             self.0.placed.note(level, pos);
+         }
+     }
+ }
+ 
++/// A click in an open storage's menu.
++struct Clicks(Arc<Shared>);
++
++#[mod_api::sunrise_part]
++impl mod_api::MenuPart for Clicks {
++    fn menu_clicked(&self, host: &mut dyn ServerHost, event: &mut MenuClickedEvent<'_>) -> Flow {
++        if lock(&self.0.sessions).get(&event.uuid).is_some_and(|s| s.window == event.window) {
++            self.0.click(host, event);
++            Flow::Cancel
++        } else {
++            Flow::Continue
++        }
++    }
++}
++
+ impl Shared {
+     /// StorageBlockBase.use: opens the storage (a double chest's main half); a packed storage doesn't open; a limited
+     /// barrel's front takes the held stack (twice in 10 ticks: every stack of that item) instead.
+@@ -597,6 +614,11 @@ struct Mod {
+ #[mod_api::sunrise_mod]
+ impl Hooks for Mod {
+     fn register(&self, r: &mut dyn Registrar, cx: &RegistrationContext) {
++        // Starling's port: Sunrise asks the menu type's Part about a click; the storages open the
++        // chest menus `open_menu` opens, one to six rows.
++        for rows in 1..=6 {
++            r.menu_part(&format!("minecraft:generic_9x{rows}"), Clicks(self.shared.clone()));
++        }
+         let has = |ns: &str| cx.mods().iter().any(|p| p.namespaces().any(|n| n == ns));
+         let backpacks = has("sophisticatedbackpacks");
+         let storage_loaded = has("sophisticatedstorage");
+@@ -627,8 +649,8 @@ impl Hooks for Mod {
+             let key = r.block_key(s.id);
+             r.block_part(key, StorageBlock(self.shared.clone()));
+             r.block_container(&key, ModContainer { slots: 1, ..Default::default() });
+-            r.block_capability_before_game(&ITEMS, &key, |host, at: BlockSide, _, _| {
+-                storage::Handler::new(&*host, at.level, at.pos).map(|h| Box::new(h) as Box<dyn ResourceHandler<ItemResource>>)
++            r.block_capability_before_game(&ITEMS, &key, |_host, at: BlockSide, _, _, offer| {
++                offer.offer(|| Box::new(storage::Handler::new(at.level, at.pos)) as Box<dyn ResourceHandler<ItemResource>>);
+             });
+             storage_blocks.push(s.id);
+         }
+@@ -748,17 +770,21 @@ impl Hooks for Mod {
+     /// The jar's creative tab lists every wood of a chest or barrel (WoodStorageBlockBase.addCreativeTabItems); the
+     /// tab's json leaves them out, so they come here, after its shulker boxes, blocks and upgrades. (The dyed variants
+     /// the jar lists too are left out: Horizon draws storage untinted.)
+-    fn build_creative_mode_tab_contents(&self, host: &mut dyn ClientHost, event: &mut BuildCreativeModeTabContentsEvent<'_>) {
++    fn build_creative_mode_tab_contents(&self, host: HostSide<'_>, event: &mut BuildCreativeModeTabContentsEvent<'_>) {
+         if event.tab != "sophisticatedstorage:main" {
+             return;
+         }
+-        let h: &dyn Host = &*host;
++        // Starling's port: the tab is edited through its handle, on either side.
++        let h: &dyn Host = match &host {
++            HostSide::Server(host) => &**host,
++            HostSide::Client(host) => &**host,
++        };
+         for kind in storage_items::STORAGE.iter().filter(|k| storage_items::wooden(k)) {
+             let Some(st) = storage::new_stack(h, kind.id) else { continue };
+             for w in storage_items::WOODS {
+                 let mut s = st.clone();
+                 storage::set_wood(&mut s, kind, w);
+-                event.items.push(s);
++                let _ = event.edit.insert(h, mod_api::CreativeTabPlacement::Last, s, mod_api::CreativeTabVisibility::Both);
+             }
+         }
+     }
+@@ -780,10 +806,6 @@ impl Hooks for Mod {
+         Flow::Cancel
+     }
+ 
+-    fn menu_clicked(&self, host: &mut dyn ServerHost, event: &mut MenuClickedEvent) {
+-        self.shared.click(host, event);
+-    }
+-
+     fn menu_closed(&self, host: &mut dyn ServerHost, event: &mut MenuClosedEvent) {
+         let prev = {
+             let mut sessions = lock(&self.shared.sessions);
+@@ -807,7 +829,9 @@ impl Hooks for Mod {
+         if !matches!(event.action, KeyAction::Press) {
+             return;
+         }
+-        let Some((key, _)) = host.mod_key("sophisticatedcore", KEY) else { return };
++        // Starling's port: Sunrise's key mappings are handles.
++        let Ok(mapping) = host.mod_key_mapping("sophisticatedcore", KEY) else { return };
++        let Some(key) = mapping.binding(&*host).ok().map(|(name, _)| name.to_owned()) else { return };
+         if event.key != key {
+             return;
+         }
+diff --git a/src/places.rs b/src/places.rs
+index b707417..524dd25 100644
+--- a/src/places.rs
++++ b/src/places.rs
+@@ -67,7 +67,7 @@ pub fn set_worn(host: &mut dyn Host, uuid: u128, slot: &str, stack: Option<ItemS
+ /// reads as empty unless `complete` says the read was whole (`give` and the pickup check it).
+ pub fn inventory(host: &mut dyn ServerHost, player: PlayerRef) -> Vec<Option<ItemStack>> {
+     let mut inv = vec![None; 41];
+-    match player.inventory_slots(&*host) {
++    match player.with_inventory(host, |view| view.iter().filter_map(|(slot, stack)| stack.project().map(|stack| (slot, stack))).collect::<Vec<_>>()) {
+         Some(slots) => {
+             for (slot, stack) in slots {
+                 if (slot as usize) < 41 {
+@@ -95,7 +95,7 @@ pub fn inventory(host: &mut dyn ServerHost, player: PlayerRef) -> Vec<Option<Ite
+ 
+ /// Whether `inventory` reads every slot as it is (no slot holds an item the game can't hand over).
+ pub fn complete(host: &dyn Host, player: PlayerRef) -> bool {
+-    player.inventory_slots(host).is_some()
++    player.with_inventory(host, |view| view.iter().filter_map(|(slot, stack)| stack.project().map(|stack| (slot, stack))).collect::<Vec<_>>()).is_some()
+ }
+ 
+ pub fn set_slot(host: &mut dyn ServerHost, player: PlayerRef, slot: u32, stack: Option<ItemStack>) -> bool {
+@@ -177,7 +177,8 @@ pub fn give(host: &mut dyn ServerHost, player: PlayerRef, stack: &ItemStack) ->
+         // Some slot can't be read: the game's own Inventory.add knows what is where. What doesn't fit is thrown to
+         // the player (only they may pick it up), so nothing is left over.
+         return match player.give_stack(host, stack.clone()) {
+-            Ok(()) => 0,
++            Ok(None) => 0,
++            Ok(Some(rest)) => rest.count(),
+             Err(e) => {
+                 eprintln!("[sophisticatedcore] give_stack: {e:?}");
+                 stack.count()
+diff --git a/src/storage.rs b/src/storage.rs
+index b2e717c..65a73b7 100644
+--- a/src/storage.rs
++++ b/src/storage.rs
+@@ -36,7 +36,7 @@ pub fn kind_of_block(id: &str) -> Option<&'static StorageItem> {
+ }
+ 
+ pub fn block_id(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> String {
+-    level.block(host, pos).map(|k| k.id(host)).unwrap_or_default()
++    level.block(host, pos).and_then(|k| k.id(host).map(str::to_owned)).unwrap_or_default()
+ }
+ 
+ pub fn add(a: [i32; 3], b: [i32; 3]) -> [i32; 3] {
+@@ -626,7 +626,7 @@ pub fn use_tool(host: &mut dyn ServerHost, player: PlayerRef, slot: u32, held: &
+             places::set_slot(host, player, slot, left);
+         }
+         let at = pos.map(|v| f64::from(v) + 0.5);
+-        level.play_sound(host, "minecraft:item.armor.equip_leather", at, SoundSource::Blocks, 1.0, 1.2);
++        level.play_sound(host, "minecraft:item.armor.equip_leather", at, SoundSource::Blocks, 1.0, 1.2, None);
+         return true;
+     }
+     let Some((_, to)) = tier_upgrade(&held_id) else { return false };
+@@ -662,7 +662,7 @@ pub fn use_tool(host: &mut dyn ServerHost, player: PlayerRef, slot: u32, held: &
+                 places::set_slot(host, player, slot, held.clone().shrink(need));
+             }
+             let at = pos.map(|v| f64::from(v) + 0.5);
+-            level.play_sound(host, "minecraft:block.smithing_table.use", at, SoundSource::Blocks, 1.0, 1.0);
++            level.play_sound(host, "minecraft:block.smithing_table.use", at, SoundSource::Blocks, 1.0, 1.0, None);
+             true
+         }
+         None => false,
+@@ -789,35 +789,44 @@ pub fn look_point(host: &dyn Host, player: PlayerRef, pos: [i32; 3], facing: &st
+ /// what goes in passes the void upgrade. Reads the block entity's stack once and writes it back on each change.
+ pub struct Handler {
+     level: LevelRef,
+-    pos: [i32; 3],
+-    kind: &'static StorageItem,
++    at: [i32; 3],
++    /// Starling's port: Sunrise offers the capability from a read of the level alone, so the
++    /// storage behind it (its main half and kind, and whether it is packed) is found on first use;
++    /// a packed or missing storage then answers as an empty one.
++    site: Mutex<Option<Option<([i32; 3], &'static StorageItem)>>>,
+     cache: Mutex<Option<(ItemStack, Contents)>>,
+ }
+ 
+ impl Handler {
+-    pub fn new(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> Option<Handler> {
+-        let main = main_pos(host, level, pos);
+-        let kind = kind_of_block(&block_id(host, level, main))?;
+-        let st = read_be(host, level, main)?;
+-        if is_packed(&st) {
+-            return None;
+-        }
+-        Some(Handler { level, pos: main, kind, cache: Mutex::new(None) })
++    pub fn new(level: LevelRef, pos: [i32; 3]) -> Handler {
++        Handler { level, at: pos, site: Mutex::new(None), cache: Mutex::new(None) }
++    }
++
++    /// The storage's main half and kind, as the old provider found them.
++    fn site(&self, host: &dyn Host) -> Option<([i32; 3], &'static StorageItem)> {
++        *self.site.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(|| {
++            let main = main_pos(host, self.level, self.at);
++            let kind = kind_of_block(&block_id(host, self.level, main))?;
++            let st = read_be(host, self.level, main)?;
++            (!is_packed(&st)).then_some((main, kind))
++        })
+     }
+ 
+     fn with<R>(&self, host: &dyn Host, f: impl FnOnce(&ItemStack, &Contents) -> R) -> Option<R> {
++        let (pos, kind) = self.site(host)?;
+         let mut g = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+         if g.is_none() {
+-            let st = read_be(host, self.level, self.pos)?;
+-            let c = Contents::read(host, &st, self.kind);
++            let st = read_be(host, self.level, pos)?;
++            let c = Contents::read(host, &st, kind);
+             *g = Some((st, c));
+         }
+         g.as_ref().map(|(s, c)| f(s, c))
+     }
+ 
+     fn store(&self, host: &mut dyn ServerHost, tx: &Transaction, mut st: ItemStack, c: Contents) -> bool {
+-        c.write(&*host, &mut st, self.kind);
+-        let Some(be) = host.block_entity(self.level, self.pos) else { return false };
++        let Some((pos, kind)) = self.site(&*host) else { return false };
++        c.write(&*host, &mut st, kind);
++        let Some(be) = host.block_entity(self.level, pos) else { return false };
+         let ok = be.set_item_slot(host, tx, 0, Some(st.clone())).is_ok_and(|b| b);
+         if ok {
+             *self.cache.lock().unwrap_or_else(|e| e.into_inner()) = Some((st, c));
+@@ -826,7 +835,8 @@ impl Handler {
+     }
+ 
+     fn limit(&self, host: &dyn Host, c: &Contents, stack: &ItemStack) -> u32 {
+-        upgrades::limit(host, stack, upgrades::multiplier(host, self.kind, &c.upgrades))
++        let Some((_, kind)) = self.site(host) else { return 0 };
++        upgrades::limit(host, stack, upgrades::multiplier(host, kind, &c.upgrades))
+     }
+ 
+     /// The void upgrade's answer for `stack`: Some(true) voids it all, Some(false) only what doesn't fit.
+@@ -853,21 +863,25 @@ impl ResourceHandler<ItemResource> for Handler {
+     fn amount(&self, host: &mut dyn ServerHost, index: usize) -> u32 {
+         self.with(&*host, |_, c| movable(c, index).map_or(0, |s| s.count())).unwrap_or(0)
+     }
+-    fn capacity(&self, host: &mut dyn ServerHost, _index: usize, resource: &ItemResource) -> u32 {
++    fn capacity(&self, host: &mut dyn ServerHost, _index: usize, resource: Option<&ItemResource>) -> u32 {
++        // The general limit, which Horizon's API never asked for, is unknown here.
++        let Some(resource) = resource else {
++            return u32::MAX;
++        };
+         let h: &dyn Host = &*host;
+         self.with(h, |_, c| self.limit(h, c, resource.as_stack())).unwrap_or(0)
+     }
+     fn is_valid(&self, host: &mut dyn ServerHost, _index: usize, resource: &ItemResource) -> bool {
+-        crate::menu::may_store(&*host, self.kind, resource.as_stack())
++        self.site(&*host).is_some_and(|(_, kind)| crate::menu::may_store(&*host, kind, resource.as_stack()))
+     }
+-    fn insert(&self, host: &mut dyn ServerHost, tx: &Transaction, index: usize, resource: &ItemResource, amount: u32) -> u32 {
++    fn insert_at(&self, host: &mut dyn ServerHost, tx: &Transaction, index: usize, resource: &ItemResource, amount: u32) -> u32 {
+         let h: &dyn Host = &*host;
+         let Some((st, mut c, lim, void)) = self.with(h, |s, c| {
+             (s.clone(), c.clone(), self.limit(h, c, resource.as_stack()), self.void(h, c, resource.as_stack()))
+         }) else {
+             return 0;
+         };
+-        if !crate::menu::may_store(&*host, self.kind, resource.as_stack()) {
++        if !self.site(&*host).is_some_and(|(_, kind)| crate::menu::may_store(&*host, kind, resource.as_stack())) {
+             return 0;
+         }
+         if void == Some(true) {
+@@ -888,7 +902,7 @@ impl ResourceHandler<ItemResource> for Handler {
+         }
+         if void == Some(false) { amount } else { put }
+     }
+-    fn extract(&self, host: &mut dyn ServerHost, tx: &Transaction, index: usize, resource: &ItemResource, amount: u32) -> u32 {
++    fn extract_at(&self, host: &mut dyn ServerHost, tx: &Transaction, index: usize, resource: &ItemResource, amount: u32) -> u32 {
+         let Some((st, mut c)) = self.with(&*host, |s, c| (s.clone(), c.clone())) else { return 0 };
+         let Some(slot) = c.slots.get_mut(index) else { return 0 };
+         let Some(cur) = slot.clone() else { return 0 };
+@@ -902,14 +916,20 @@ impl ResourceHandler<ItemResource> for Handler {
+         }
+         take
+     }
+-    fn insert_any(&self, host: &mut dyn ServerHost, tx: &Transaction, resource: &ItemResource, amount: u32) -> u32 {
++    fn insert(&self, host: &mut dyn ServerHost, tx: &Transaction, resource: &ItemResource, amount: u32) -> Result<u32, mod_api::Overanswered> {
++        Ok(self.insert_anywhere(host, tx, resource, amount))
++    }
++}
++
++impl Handler {
++    fn insert_anywhere(&self, host: &mut dyn ServerHost, tx: &Transaction, resource: &ItemResource, amount: u32) -> u32 {
+         let h: &dyn Host = &*host;
+         let Some((st, mut c, lim, void)) = self.with(h, |s, c| {
+             (s.clone(), c.clone(), self.limit(h, c, resource.as_stack()), self.void(h, c, resource.as_stack()))
+         }) else {
+             return 0;
+         };
+-        if !crate::menu::may_store(&*host, self.kind, resource.as_stack()) {
++        if !self.site(&*host).is_some_and(|(_, kind)| crate::menu::may_store(&*host, kind, resource.as_stack())) {
+             return 0;
+         }
+         if void == Some(true) {
+@@ -975,7 +995,7 @@ fn hopper(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3], kind: &Stor
+             if fits == 0 {
+                 continue;
+             }
+-            let got = host.transaction(|host, tx| Ok::<u32, ()>(src.extract(host, tx, i, &res, fits))).unwrap_or(0);
++            let got = host.transaction(|host, tx| Ok::<u32, ()>(src.extract_at(host, tx, i, &res, fits))).unwrap_or(0);
+             if got > 0 {
+                 contents::insert(&mut c.slots, &stack, got, lim);
+                 left -= got;
+@@ -995,7 +1015,7 @@ fn hopper(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3], kind: &Stor
+             let Some(st) = c.slots[i].clone().filter(|s| !contents::is_unknown(s)) else { continue };
+             let res = ItemResource::of(&st);
+             let n = st.count().min(left);
+-            let put = host.transaction(|host, tx| Ok::<u32, ()>(dst.insert_any(host, tx, &res, n))).unwrap_or(0);
++            let put = host.transaction(|host, tx| Ok::<u32, ()>(dst.insert(host, tx, &res, n).unwrap_or(0))).unwrap_or(0);
+             if put > 0 {
+                 c.slots[i] = st.clone().shrink(put);
+                 left -= put;
+@@ -1016,7 +1036,13 @@ fn magnet(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3], kind: &Stor
+     let center = pos.map(|v| f64::from(v) + 0.5);
+     let min = [center[0] - r, center[1] - r, center[2] - r];
+     let max = [center[0] + r, center[1] + r, center[2] + r];
+-    let Some(ents) = level.entities_in(&*host, min, max) else { return false };
++    let mut ents = Vec::new();
++    if level.visit_entities_in(&*host, min, max, &mut |e| {
++        ents.push(e);
++        core::ops::ControlFlow::Continue(())
++    }).is_err() {
++        return false;
++    }
+     let m = upgrades::multiplier(&*host, kind, &c.upgrades);
+     let mut changed = false;
+     for e in ents {
+@@ -1024,7 +1050,7 @@ fn magnet(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3], kind: &Stor
+         if item.pickup_delay(&*host).unwrap_or(0) > 0 {
+             continue;
+         }
+-        let Some(st) = item.stack(&*host) else { continue };
++        let Some(st) = item.with_stack(&*host, |stack| stack.project()).flatten() else { continue };
+         let wanted = ups.iter().any(|(u, k)| k.kind == Kind::Magnet && upgrades::matches(&*host, u, k, &st));
+         if !wanted || !crate::menu::may_store(&*host, kind, &st) {
+             continue;
+diff --git a/src/ticking.rs b/src/ticking.rs
+index 4d28cc3..7e37ebf 100644
+--- a/src/ticking.rs
++++ b/src/ticking.rs
+@@ -111,14 +111,20 @@ fn take_items(host: &mut dyn ServerHost, uuid: u128, list: &mut [Carried], r: f6
+     let Some(player) = host.player(uuid) else { return false };
+     let Some((dim, min, max)) = player_box(&*host, player, r, if magnet_only { r } else { 0.5 }) else { return false };
+     let Some(level) = host.level(&dim) else { return false };
+-    let Some(ents) = level.entities_in(&*host, min, max) else { return false };
++    let mut ents = Vec::new();
++    if level.visit_entities_in(&*host, min, max, &mut |e| {
++        ents.push(e);
++        core::ops::ControlFlow::Continue(())
++    }).is_err() {
++        return false;
++    }
+     let mut changed = false;
+     for e in ents {
+         let Some(item) = host.item_entity(e) else { continue };
+         if item.pickup_delay(&*host).unwrap_or(0) > 0 {
+             continue;
+         }
+-        let Some(orig) = item.stack(&*host) else { continue };
++        let Some(orig) = item.with_stack(&*host, |stack| stack.project()).flatten() else { continue };
+         let mut left = orig.count();
+         for c in list.iter_mut() {
+             if left == 0 {
+@@ -432,7 +438,7 @@ pub fn interact(host: &mut dyn ServerHost, uuid: u128, loc: &Loc, level: mod_api
+             if fits == 0 {
+                 continue;
+             }
+-            let got = host.transaction(|host, tx| Ok::<u32, ()>(handler.extract(host, tx, i, &res, fits))).unwrap_or(0);
++            let got = host.transaction(|host, tx| Ok::<u32, ()>(handler.extract_at(host, tx, i, &res, fits))).unwrap_or(0);
+             if got > 0 {
+                 contents::insert(&mut c.contents.slots, &stack, got, lim);
+                 moved_in += 1;
+@@ -447,7 +453,7 @@ pub fn interact(host: &mut dyn ServerHost, uuid: u128, loc: &Loc, level: mod_api
+             }
+             let res = mod_api::ItemResource::of(&stack);
+             let n = stack.count();
+-            let put = host.transaction(|host, tx| Ok::<u32, ()>(handler.insert_any(host, tx, &res, n))).unwrap_or(0);
++            let put = host.transaction(|host, tx| Ok::<u32, ()>(handler.insert(host, tx, &res, n).unwrap_or(0))).unwrap_or(0);
+             if put > 0 {
+                 c.contents.slots[i] = stack.clone().shrink(put);
+                 moved_out += 1;

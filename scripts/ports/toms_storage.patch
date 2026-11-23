@@ -1,0 +1,363 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index fa300c6..76b522b 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -104,6 +104,12 @@ fn dir_named(s: &str) -> Option<Direction> {
+     })
+ }
+ 
++/// Starling's port: the `facing` of a block state written as `id[facing=north,...]`.
++fn state_facing(state: &str) -> Option<Direction> {
++    let props = state.split_once('[')?.1.trim_end_matches(']');
++    props.split(',').find_map(|kv| kv.strip_prefix("facing=")).and_then(dir_named)
++}
++
+ fn dir_name(d: Direction) -> &'static str {
+     match d {
+         Direction::Down => "down",
+@@ -124,7 +130,7 @@ fn dist2(a: [i32; 3], b: [i32; 3]) -> i32 {
+ }
+ 
+ fn block_id(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> String {
+-    level.block(host, pos).map(|k| k.id(host)).unwrap_or_default()
++    level.block(host, pos).and_then(|k| k.id(host).map(str::to_owned)).unwrap_or_default()
+ }
+ 
+ fn is_cable_like(id: &str) -> bool {
+@@ -302,13 +308,37 @@ fn handlers(host: &mut dyn ServerHost, level: LevelRef, invs: &[Inv]) -> Vec<(Ha
+ /// MergedStorage: the network as one handler.
+ struct Merged {
+     level: LevelRef,
+-    invs: Vec<Inv>,
++    net: Net,
++}
++
++/// Starling's port: Sunrise offers a capability from a read of the level alone, so the network
++/// behind a merged view is found when the view is used, as the old provider found it.
++enum Net {
++    /// A connector's network, without the asker's own inventory.
++    Connector { pos: [i32; 3], asker: Option<[i32; 3]> },
++    /// A cable connector's: its connector's network.
++    Cable { pos: [i32; 3] },
++}
++
++impl Merged {
++    fn invs(&self, host: &mut dyn ServerHost) -> Vec<Inv> {
++        match self.net {
++            Net::Connector { pos, asker } => {
++                network(host, self.level, pos).into_iter().filter(|i| Some(i.pos) != asker).collect()
++            }
++            Net::Cable { pos } => {
++                let (_, master) = cable_walk(&*host, self.level, pos, true);
++                master.map_or_else(Vec::new, |master| network(host, self.level, master))
++            }
++        }
++    }
+ }
+ 
+ impl Merged {
+     fn at(&self, host: &mut dyn ServerHost, index: usize) -> Option<(Handler, usize)> {
+         let mut i = index;
+-        for (h, n) in handlers(host, self.level, &self.invs) {
++        let invs = self.invs(host);
++        for (h, n) in handlers(host, self.level, &invs) {
+             if i < n {
+                 return Some((h, i));
+             }
+@@ -320,7 +350,8 @@ impl Merged {
+ 
+ impl ResourceHandler<ItemResource> for Merged {
+     fn size(&self, host: &mut dyn ServerHost) -> usize {
+-        handlers(host, self.level, &self.invs).iter().map(|(_, n)| n).sum()
++        let invs = self.invs(host);
++        handlers(host, self.level, &invs).iter().map(|(_, n)| n).sum()
+     }
+     fn resource(&self, host: &mut dyn ServerHost, index: usize) -> Option<ItemResource> {
+         let (h, i) = self.at(host, index)?;
+@@ -329,20 +360,21 @@ impl ResourceHandler<ItemResource> for Merged {
+     fn amount(&self, host: &mut dyn ServerHost, index: usize) -> u32 {
+         self.at(host, index).map_or(0, |(h, i)| h.amount(host, i))
+     }
+-    fn capacity(&self, host: &mut dyn ServerHost, index: usize, resource: &ItemResource) -> u32 {
++    fn capacity(&self, host: &mut dyn ServerHost, index: usize, resource: Option<&ItemResource>) -> u32 {
+         self.at(host, index).map_or(0, |(h, i)| h.capacity(host, i, resource))
+     }
+     fn is_valid(&self, host: &mut dyn ServerHost, index: usize, resource: &ItemResource) -> bool {
+         self.at(host, index).is_some_and(|(h, i)| h.is_valid(host, i, resource))
+     }
+-    fn insert(&self, host: &mut dyn ServerHost, tx: &Transaction, index: usize, resource: &ItemResource, amount: u32) -> u32 {
+-        self.at(host, index).map_or(0, |(h, i)| h.insert(host, tx, i, resource, amount))
++    fn insert_at(&self, host: &mut dyn ServerHost, tx: &Transaction, index: usize, resource: &ItemResource, amount: u32) -> u32 {
++        self.at(host, index).map_or(0, |(h, i)| h.insert_at(host, tx, i, resource, amount))
+     }
+-    fn extract(&self, host: &mut dyn ServerHost, tx: &Transaction, index: usize, resource: &ItemResource, amount: u32) -> u32 {
+-        self.at(host, index).map_or(0, |(h, i)| h.extract(host, tx, i, resource, amount))
++    fn extract_at(&self, host: &mut dyn ServerHost, tx: &Transaction, index: usize, resource: &ItemResource, amount: u32) -> u32 {
++        self.at(host, index).map_or(0, |(h, i)| h.extract_at(host, tx, i, resource, amount))
+     }
+-    fn insert_any(&self, host: &mut dyn ServerHost, tx: &Transaction, resource: &ItemResource, amount: u32) -> u32 {
+-        net_insert(host, tx, self.level, &self.invs, resource, amount)
++    fn insert(&self, host: &mut dyn ServerHost, tx: &Transaction, resource: &ItemResource, amount: u32) -> Result<u32, mod_api::Overanswered> {
++        let invs = self.invs(host);
++        Ok(net_insert(host, tx, self.level, &invs, resource, amount))
+     }
+ }
+ 
+@@ -362,17 +394,17 @@ impl ResourceHandler<ItemResource> for Forward {
+     fn amount(&self, host: &mut dyn ServerHost, index: usize) -> u32 {
+         cap(host, self.level, self.inv).map_or(0, |h| h.amount(host, index))
+     }
+-    fn capacity(&self, host: &mut dyn ServerHost, index: usize, resource: &ItemResource) -> u32 {
++    fn capacity(&self, host: &mut dyn ServerHost, index: usize, resource: Option<&ItemResource>) -> u32 {
+         cap(host, self.level, self.inv).map_or(0, |h| h.capacity(host, index, resource))
+     }
+     fn is_valid(&self, host: &mut dyn ServerHost, index: usize, resource: &ItemResource) -> bool {
+         cap(host, self.level, self.inv).is_some_and(|h| h.is_valid(host, index, resource))
+     }
+-    fn insert(&self, host: &mut dyn ServerHost, tx: &Transaction, index: usize, resource: &ItemResource, amount: u32) -> u32 {
+-        cap(host, self.level, self.inv).map_or(0, |h| h.insert(host, tx, index, resource, amount))
++    fn insert_at(&self, host: &mut dyn ServerHost, tx: &Transaction, index: usize, resource: &ItemResource, amount: u32) -> u32 {
++        cap(host, self.level, self.inv).map_or(0, |h| h.insert_at(host, tx, index, resource, amount))
+     }
+-    fn extract(&self, host: &mut dyn ServerHost, tx: &Transaction, index: usize, resource: &ItemResource, amount: u32) -> u32 {
+-        cap(host, self.level, self.inv).map_or(0, |h| h.extract(host, tx, index, resource, amount))
++    fn extract_at(&self, host: &mut dyn ServerHost, tx: &Transaction, index: usize, resource: &ItemResource, amount: u32) -> u32 {
++        cap(host, self.level, self.inv).map_or(0, |h| h.extract_at(host, tx, index, resource, amount))
+     }
+ }
+ 
+@@ -386,7 +418,7 @@ fn net_insert(host: &mut dyn ServerHost, tx: &Transaction, level: LevelRef, invs
+                 return went;
+             }
+             if h.resource(host, i).is_some_and(|r| r.matches(res.as_stack())) {
+-                went += h.insert(host, tx, i, res, amount - went);
++                went += h.insert_at(host, tx, i, res, amount - went);
+             }
+         }
+     }
+@@ -394,7 +426,7 @@ fn net_insert(host: &mut dyn ServerHost, tx: &Transaction, level: LevelRef, invs
+         if went >= amount {
+             break;
+         }
+-        went += h.insert_any(host, tx, res, amount - went);
++        went += h.insert(host, tx, res, amount - went).unwrap_or(0);
+     }
+     went
+ }
+@@ -407,7 +439,7 @@ fn net_extract(host: &mut dyn ServerHost, tx: &Transaction, level: LevelRef, inv
+                 return got;
+             }
+             if h.resource(host, i).is_some_and(|r| r.matches(res.as_stack())) {
+-                got += h.extract(host, tx, i, res, amount - got);
++                got += h.extract_at(host, tx, i, res, amount - got);
+             }
+         }
+     }
+@@ -424,7 +456,7 @@ struct Entry {
+ }
+ 
+ fn res_key(host: &dyn Host, stack: &ItemStack) -> String {
+-    format!("{}|{:?}", stack.item().id(host), stack.components())
++    format!("{}|{:?}", stack.item().id(host).unwrap_or_default(), stack.components())
+ }
+ 
+ fn contents(host: &mut dyn ServerHost, level: LevelRef, invs: &[Inv]) -> Vec<Entry> {
+@@ -438,7 +470,7 @@ fn contents(host: &mut dyn ServerHost, level: LevelRef, invs: &[Inv]) -> Vec<Ent
+             }
+             let Some(sample) = r.to_stack(1) else { continue };
+             let key = res_key(&*host, &sample);
+-            let id = sample.item().id(&*host);
++            let id = sample.item().id(&*host).unwrap_or_default().to_owned();
+             map.entry(key.clone()).or_insert(Entry { key, id, sample, total: 0 }).total += u64::from(amount);
+         }
+     }
+@@ -557,7 +589,7 @@ fn group(n: u64) -> String {
+ /// The player's main inventory, 0..9 the hotbar and 9..36 the rest.
+ fn inventory(host: &dyn Host, player: PlayerRef) -> Vec<Option<ItemStack>> {
+     let mut inv = vec![None; 36];
+-    for (slot, stack) in player.inventory_slots(host).unwrap_or_default() {
++    for (slot, stack) in player.with_inventory(host, |view| view.iter().filter_map(|(slot, stack)| stack.project().map(|stack| (slot, stack))).collect::<Vec<_>>()).unwrap_or_default() {
+         if (slot as usize) < 36 {
+             inv[slot as usize] = Some(stack);
+         }
+@@ -581,9 +613,10 @@ fn give(host: &mut dyn ServerHost, player: PlayerRef, stack: &ItemStack) -> u32
+     // `inventory_slots` answers None for the whole inventory when a slot holds an item the game can't hand to a mod
+     // (a mod that isn't installed). Every slot would then look empty and be written over: the game's own
+     // Inventory.add places it instead (what doesn't fit is thrown to the player).
+-    if player.inventory_slots(&*host).is_none() {
++    if player.with_inventory(host, |view| view.iter().filter_map(|(slot, stack)| stack.project().map(|stack| (slot, stack))).collect::<Vec<_>>()).is_none() {
+         return match player.give_stack(host, stack.clone()) {
+-            Ok(()) => 0,
++            Ok(None) => 0,
++            Ok(Some(rest)) => rest.count(),
+             Err(_) => stack.count(),
+         };
+     }
+@@ -668,7 +701,8 @@ struct Placement;
+ #[mod_api::sunrise_part]
+ impl BlockPart for Placement {
+     /// AbstractStorageTerminalBlock / InventoryCableConnectorBlock / InventoryProxyBlock.getStateForPlacement.
+-    fn state_for_placement(&self, level: &dyn LevelHost, event: &mut StateForPlacementEvent<'_>) -> Option<Option<BlockState>> {
++    fn state_for_placement(&self, level: mod_api::LevelSide<'_>, event: &mut StateForPlacementEvent<'_>) -> Option<Option<BlockState>> {
++        let (mod_api::LevelSide::Server(level) | mod_api::LevelSide::Client(level)) = level;
+         let block = level.state_block(event.state)?.to_string();
+         let ctx = event.context;
+         let toward = opposite(ctx.face);
+@@ -710,8 +744,35 @@ impl BlockPart for Tile {}
+ #[mod_api::sunrise_part]
+ impl BlockEntityPart for Tile {}
+ 
++/// Starling's port: the mod's state lives behind an `Arc`, so the menu type's Part (Sunrise asks it
++/// about clicks) reaches the same sessions as the mod's hooks.
++#[derive(Default)]
++struct Mod(Arc<ModInner>);
++
++impl std::ops::Deref for Mod {
++    type Target = ModInner;
++    fn deref(&self) -> &ModInner {
++        &self.0
++    }
++}
++
++/// A click in an open terminal's view.
++struct Clicks(Arc<ModInner>);
++
++#[mod_api::sunrise_part]
++impl mod_api::MenuPart for Clicks {
++    fn menu_clicked(&self, host: &mut dyn ServerHost, event: &mut MenuClickedEvent<'_>) -> Flow {
++        if lock(&self.0.sessions).get(&event.uuid).is_some_and(|s| s.window == event.window) {
++            self.0.click(host, event);
++            Flow::Cancel
++        } else {
++            Flow::Continue
++        }
++    }
++}
++
+ #[derive(Default)]
+-struct Mod {
++struct ModInner {
+     shared: Arc<Shared>,
+     sessions: Mutex<HashMap<u128, Session>>,
+     /// Client: the search typed into the open terminal, and whether it changed.
+@@ -726,7 +787,7 @@ fn level_of(host: &dyn Host, dim: &str) -> Option<LevelRef> {
+     host.level(dim)
+ }
+ 
+-impl Mod {
++impl ModInner {
+     fn queue(&self, job: Job) {
+         lock(&self.shared.jobs).push(job);
+     }
+@@ -895,7 +956,7 @@ impl Mod {
+ 
+     /// StorageTerminalMenu's clicks, without a cursor: a stored item goes to the inventory (a stack, half
+     /// with the right button), an inventory stack goes in (one with the right button), shift does the same.
+-    fn click(&self, host: &mut dyn ServerHost, ev: &MenuClickedEvent) {
++    fn click(&self, host: &mut dyn ServerHost, ev: &MenuClickedEvent<'_>) {
+         let uuid = ev.uuid;
+         let (crafting, page, per_page, dim, term) = {
+             let sessions = lock(&self.sessions);
+@@ -1129,6 +1190,8 @@ fn bound(stack: &ItemStack) -> Option<(String, [i32; 3])> {
+ #[mod_api::sunrise_mod]
+ impl Hooks for Mod {
+     fn register(&self, r: &mut dyn Registrar, _cx: &RegistrationContext) {
++        // The terminal's view is the six-row menu `open_menu` opens.
++        r.menu_part("minecraft:generic_9x6", Clicks(self.0.clone()));
+         for b in [TERMINAL, CRAFTING].iter().chain(CABLE_CONNECTORS.iter()).chain(SIX_WAY.iter()).chain(["toms_storage:ts.level_emitter"].iter()) {
+             let key = r.block_key(b);
+             r.block_part(key, Placement);
+@@ -1141,31 +1204,31 @@ impl Hooks for Mod {
+         }
+         // The connector answers for its network, a cable connector for its connector's network.
+         let conn = r.block_key(CONNECTOR);
+-        r.block_capability(&ITEMS, &conn, |host, at: BlockSide, _, _| {
++        r.block_capability(&ITEMS, &conn, |_host, at: BlockSide, _, _, offer| {
+             // Not the asker's own inventory: a hopper on the connector is on its network too.
+             let asker = at.side.map(|d| add(at.pos, vec_of(d)));
+-            let invs: Vec<Inv> = network(host, at.level, at.pos).into_iter().filter(|i| Some(i.pos) != asker).collect();
+-            Some(Box::new(Merged { level: at.level, invs }) as Box<dyn ResourceHandler<ItemResource>>)
++            offer.offer(|| Box::new(Merged { level: at.level, net: Net::Connector { pos: at.pos, asker } }) as Box<dyn ResourceHandler<ItemResource>>);
+         });
+         for cc in CABLE_CONNECTORS {
+             let key = r.block_key(cc);
+-            r.block_capability(&ITEMS, &key, |host, at: BlockSide, _, _| {
+-                let (_, master) = cable_walk(&*host, at.level, at.pos, true);
+-                let invs = network(host, at.level, master?);
+-                Some(Box::new(Merged { level: at.level, invs }) as Box<dyn ResourceHandler<ItemResource>>)
++            r.block_capability(&ITEMS, &key, |_host, at: BlockSide, _, _, offer| {
++                offer.offer(|| Box::new(Merged { level: at.level, net: Net::Cable { pos: at.pos } }) as Box<dyn ResourceHandler<ItemResource>>);
+             });
+         }
+         let proxy = r.block_key(PROXY);
+-        r.block_capability(&ITEMS, &proxy, |host, at: BlockSide, _, _| {
+-            let f = facing_of(&*host, at.level, at.pos)?;
++        r.block_capability(&ITEMS, &proxy, |host, at: BlockSide, state, _, offer| {
++            // Starling's port: the same checks, from the level read Sunrise offers here.
++            let Some(f) = host.state_string(state).as_deref().and_then(state_facing) else {
++                return;
++            };
+             if at.side == Some(f) {
+-                return None;
++                return;
+             }
+             let inv = Inv { pos: add(at.pos, vec_of(f)), side: Some(opposite(f)) };
+-            if block_id(&*host, at.level, inv.pos).starts_with(NS) {
+-                return None;
++            if host.block_state(inv.pos).and_then(|s| host.state_block(s)).is_some_and(|id| id.starts_with(NS)) {
++                return;
+             }
+-            Some(Box::new(Forward { level: at.level, inv }) as Box<dyn ResourceHandler<ItemResource>>)
++            offer.offer(|| Box::new(Forward { level: at.level, inv }) as Box<dyn ResourceHandler<ItemResource>>);
+         });
+         r.payload_handlers()
+             .registrar("1")
+@@ -1210,7 +1273,7 @@ impl Hooks for Mod {
+         if id != TERMINAL && id != CRAFTING {
+             return Flow::Continue;
+         }
+-        let held = click.stack.map(|s| s.item().id(&*host)).unwrap_or_default();
++        let held = click.stack.map(|s| s.item().id(&*host).unwrap_or_default().to_owned()).unwrap_or_default();
+         let sneaking = host.player(click.player).and_then(|p| p.entity().is_shift_key_down(&*host)) == Some(true);
+         if held == ADV_WIRELESS && sneaking {
+             // AdvWirelessTerminalItem.useOn: bind it to this terminal.
+@@ -1232,7 +1295,7 @@ impl Hooks for Mod {
+                         let _ = p.set_inventory_slot(host, slot, Some(st));
+                     }
+                 }
+-                if let Some(name) = host.player(click.player).and_then(|p| p.name(&*host)) {
++                if let Some(name) = host.player(click.player).and_then(|p| p.name(&*host).map(str::to_owned)) {
+                     host.commands().run_command(&format!("title {name} actionbar {{\"translate\":\"chat.toms_storage.terminal_bound\"}}"));
+                 }
+             }
+@@ -1249,7 +1312,7 @@ impl Hooks for Mod {
+     fn right_click_item(&self, host: HostSide<'_>, event: &mut RightClickItemEvent<'_>) -> Flow {
+         let HostSide::Server(host) = host else { return Flow::Continue };
+         let click = event.click;
+-        let held = click.stack.item().id(&*host);
++        let held = click.stack.item().id(&*host).unwrap_or_default().to_owned();
+         let target = if held == WIRELESS {
+             self.looked_terminal(&*host, click.player, WIRELESS_RANGE)
+         } else if held == ADV_WIRELESS {
+@@ -1268,7 +1331,7 @@ impl Hooks for Mod {
+         match target {
+             Some((dim, term, crafting)) => self.queue(Job::Open { uuid: click.player, dim, term, crafting }),
+             None => {
+-                if let Some(name) = host.player(click.player).and_then(|p| p.name(&*host)) {
++                if let Some(name) = host.player(click.player).and_then(|p| p.name(&*host).map(str::to_owned)) {
+                     host.commands().run_command(&format!("title {name} actionbar {{\"translate\":\"chat.toms_storage.terminal_out_of_range\"}}"));
+                 }
+             }
+@@ -1278,12 +1341,6 @@ impl Hooks for Mod {
+         Flow::Cancel
+     }
+ 
+-    fn menu_clicked(&self, host: &mut dyn ServerHost, event: &mut MenuClickedEvent) {
+-        if lock(&self.sessions).get(&event.uuid).is_some_and(|s| s.window == event.window) {
+-            self.click(host, event);
+-        }
+-    }
+-
+     fn menu_closed(&self, host: &mut dyn ServerHost, event: &mut MenuClosedEvent) {
+         self.closed(host, event.uuid, event.window);
+     }

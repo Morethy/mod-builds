@@ -1,0 +1,13 @@
+diff --git a/src/support.rs b/src/support.rs
+index bb69fa9..4bac3bc 100644
+--- a/src/support.rs
++++ b/src/support.rs
+@@ -46,7 +46,7 @@ pub fn on_gui_layer_pre(host: &dyn ClientHost, event: &mut GuiLayerPreEvent<'_>)
+     let Some(block) = level.block(host, runtime::block_at(eye)) else {
+         return;
+     };
+-    let Some(argb) = runtime::overlay_argb(&block.id(host)) else {
++    let Some(argb) = runtime::overlay_argb(block.id(host).unwrap_or_default()) else {
+         return;
+     };
+     let [width, height] = event.draw.size();

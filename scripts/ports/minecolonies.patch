@@ -1,0 +1,455 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 194094a..79e08d7 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -19,12 +19,15 @@
+ //! `minecolonies:citizen` rows only. The colony is **not** a global scan either: it is one
+ //! attachment per town hall block entity (`support::COLONY`), which is what the SDK exposes
+ //! instead of an enumeration of the world's block entities.
++use crate::starling_command::RunModCommandEvent;
+ use mod_api::{
+     self, EntityPlaceEvent, Flow, Hooks, HostSide, LevelTickPostEvent, PlayerDestroyedBlockEvent,
+-    RegisterCommandsEvent, Registrar, RegistrationContext, RunModCommandEvent, ServerHost,
++    RegisterCommandsEvent, Registrar, RegistrationContext, ServerHost,
+ };
+ 
+ #[cfg(not(target_arch = "wasm32"))]
++mod starling_tick;
++mod starling_command;
+ mod parts;
+ mod runtime;
+ mod support;
+@@ -71,13 +74,21 @@ impl Hooks for Mod {
+     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+         support::on_register_commands(event);
+     }
++}
+ 
+-    /// A parsed `/minecolonies …` usage: resolved arguments, no string splitting.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
++/// Starling's port: the old `run_mod_command` hook's body.
++pub(crate) fn starling_run_mod_command(
++    host: &mut dyn ServerHost,
++    event: &mut crate::starling_command::RunModCommandEvent<'_>,
++) -> Flow {
+         support::on_run_mod_command(host, event)
+     }
++
++/// Starling's port: every declared usage runs the old hook's body.
++pub(crate) fn starling_executor(
++    host: &mut dyn ServerHost,
++    source: &mod_api::CommandSource,
++    command: &mod_api::CommandInvocation,
++) -> Option<i32> {
++    crate::starling_command::execute(host, source, command, starling_run_mod_command)
+ }
+diff --git a/src/parts.rs b/src/parts.rs
+index bd35277..4b2260c 100644
+--- a/src/parts.rs
++++ b/src/parts.rs
+@@ -1,7 +1,7 @@
+ //! The citizen as an `EntityPart`: the game calls it for `minecolonies:citizen` rows only, so the
+ //! job is one entity type's moment and not a global hook (the retired `.hnmod` used the global
+ //! `entity_tick_listened`/`entity_tick_post` pair for it).
+-use mod_api::{self, EntityPart, GeneralEntityTickEvent, ServerHost};
++use mod_api::{self, BlockEntityTickEvent, EntityPart, GeneralEntityTickEvent};
+ 
+ use crate::support;
+ 
+@@ -12,12 +12,12 @@ pub(crate) struct CitizenWorker;
+ impl EntityPart for CitizenWorker {
+     /// The citizen's authoritative tick: one work step every `FARMER_DELAY_TICKS`, if it has a
+     /// colony, a job and its building.
+-    fn general_entity_tick(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut GeneralEntityTickEvent<'_>,
+-    ) {
+-        support::on_citizen_tick(host, event.entity);
++    fn general_entity_tick(&self, event: &mut GeneralEntityTickEvent<'_>) {
++        // Starling's port: the row is lent through the event's subject.
++        let Some(entity) = event.subject.with_view(|view| view.handle()) else {
++            return;
++        };
++        support::on_citizen_tick(event.subject.host(), entity);
+     }
+ }
+ 
+@@ -40,11 +40,9 @@ impl mod_api::BlockEntityPart for TownHallWorker {
+         event.ticks = true;
+     }
+ 
+-    fn block_entity_tick(
+-        &self,
+-        host: &mut dyn mod_api::ServerHost,
+-        event: &mut mod_api::BlockEntityTickEvent<'_>,
+-    ) {
+-        support::on_hall_tick(host, event.pos);
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        crate::starling_tick::run(event, |host, entity, tick_pos| {
++        support::on_hall_tick(host, tick_pos);
++    });
+     }
+ }
+diff --git a/minecolonies/src/starling_command.rs b/src/starling_command.rs
+new file mode 100644
+index 0000000..894f55f
+--- /dev/null
++++ b/src/starling_command.rs
+@@ -0,0 +1,31 @@
++//! Starling's port to Sunrise's API: Horizon's `run_mod_command` hook, which got every command of
++//! the mod in one event, is a per-usage executor in Sunrise. The old event is rebuilt here around
++//! the executor's arguments, so the mod's command code runs as it was written.
++use mod_api::{CommandInvocation, CommandSource, Flow, ServerHost};
++
++/// Horizon's `RunModCommandEvent`: the parsed command and who ran it.
++pub(crate) struct RunModCommandEvent<'a> {
++    pub command: &'a CommandInvocation,
++    pub source: &'a CommandSource,
++    /// Whether an earlier mod took the command: in Sunrise each usage has its own executor, so never.
++    pub cancelled: bool,
++}
++
++/// The executor of every usage the mod declares: the old hook's body (`run`), whose `Cancel` was a
++/// command it ran and `Continue` one it did not.
++pub(crate) fn execute(
++    host: &mut dyn ServerHost,
++    source: &CommandSource,
++    command: &CommandInvocation,
++    run: fn(&mut dyn ServerHost, &mut RunModCommandEvent<'_>) -> Flow,
++) -> Option<i32> {
++    let mut event = RunModCommandEvent {
++        command,
++        source,
++        cancelled: false,
++    };
++    match run(host, &mut event) {
++        Flow::Continue => None,
++        _ => Some(1),
++    }
++}
+diff --git a/minecolonies/src/starling_tick.rs b/src/starling_tick.rs
+new file mode 100644
+index 0000000..16e2c71
+--- /dev/null
++++ b/src/starling_tick.rs
+@@ -0,0 +1,63 @@
++//! Starling's port to Sunrise's API: code written for Horizon's, which handed a block entity's
++//! slots, compound and data slots (`ModBlockEntityFields`) to a tick or a menu button to change in
++//! place, runs here on a copy of them taken from Sunrise's view; what it changed is written back and
++//! the chunk marked unsaved, as Horizon's reply did.
++use mod_api::{BlockEntityScope, BlockEntityTickEvent, ServerHost};
++
++/// The block entity as Horizon's tick had it.
++pub(crate) type OldEntity = mod_api::item::containers::ModBlockEntityFields;
++
++/// Run `body` on a copy of the ticking block entity (its host, the copy, its position).
++pub(crate) fn run(
++    event: &mut BlockEntityTickEvent<'_>,
++    body: impl FnOnce(&mut dyn ServerHost, &mut OldEntity, [i32; 3]),
++) {
++    run_scope(&mut event.subject, body);
++}
++
++/// Run `body` on a copy of the block entity `subject` lends (a tick's, a menu button's).
++pub(crate) fn run_scope(
++    subject: &mut BlockEntityScope<'_>,
++    body: impl FnOnce(&mut dyn ServerHost, &mut OldEntity, [i32; 3]),
++) {
++    let Some((handle, pos, before)) = subject.with_view(|view| {
++        let items = (0..view.item_slots() as u32)
++            .map(|slot| view.item_slot(slot).and_then(|stack| stack.to_owned()))
++            .collect();
++        let entity = OldEntity {
++            items,
++            nbt: view.nbt().clone(),
++            data: view.data_slots().to_vec(),
++        };
++        (view.handle(), view.position(), entity)
++    }) else {
++        return;
++    };
++    let mut after = before.clone();
++    body(subject.host(), &mut after, pos);
++    let mut changed = false;
++    subject.with_view(|mut view| {
++        for (key, value) in after.nbt.iter() {
++            if before.nbt.get(key) != Some(value) && view.set_nbt(key.clone(), Some(value.clone())) {
++                changed = true;
++            }
++        }
++        for (key, _) in before.nbt.iter() {
++            if after.nbt.get(key).is_none() && view.set_nbt(key.clone(), None) {
++                changed = true;
++            }
++        }
++        for (slot, stack) in after.items.iter().enumerate() {
++            if before.items.get(slot) != Some(stack) {
++                let _ = view.set_item_slot(slot as u32, stack.clone());
++                changed = true;
++            }
++        }
++        if after.data != before.data && view.set_data_slots(&after.data) {
++            changed = true;
++        }
++    });
++    if changed {
++        let _ = handle.set_changed(subject.host());
++    }
++}
+diff --git a/src/support.rs b/src/support.rs
+index c02497c..2671afb 100644
+--- a/src/support.rs
++++ b/src/support.rs
+@@ -17,11 +17,12 @@
+ 
+ use std::sync::Mutex;
+ 
++use crate::starling_command::RunModCommandEvent;
+ use mod_api::{
+     AttachmentCodec, AttachmentError, AttachmentHolder, AttachmentQueries, AttachmentType,
+     BlockKey, BlockUpdateFlags, Command, CommandArgumentValue, CommandSource, Compound, EntityRef,
+     Flow, Hand, Holder, Host, HostTransaction, Identifier, ItemResource, ItemStack, LevelRef,
+-    MobRef, PlayerRef, RegisterCommandsEvent, RunModCommandEvent, ServerHost, SpawnReason, Tag,
++    MobRef, PlayerRef, RegisterCommandsEvent, ServerHost, SpawnReason, Tag,
+     Text,
+ };
+ 
+@@ -266,23 +267,47 @@ fn halls(host: &dyn Host) -> Vec<TownHall> {
+     found
+ }
+ 
+-/// Every `(hall position, colony)` in the dimension, in holder order.
+-fn colonies(host: &dyn Host) -> Vec<([i32; 3], Colony)> {
+-    let Ok(query) = host.query(&COLONY) else {
++/// Starling's port: every row of `key` with a copy of its value, in holder order. Sunrise's query
++/// is a cursor that lends each value; a row whose value can't be read is skipped, as before.
++fn attachment_rows<T: Clone + Send + Sync + 'static>(
++    host: &dyn Host,
++    key: &AttachmentType<T>,
++) -> Vec<(AttachmentHolder, T)> {
++    let Ok(query) = host.query(key) else {
+         return Vec::new();
+     };
++    let mut rows = query.iter();
++    let mut out = Vec::new();
++    loop {
++        match rows.try_next() {
++            Ok(Some(row)) => {
++                let Ok(scope) = host.attachment_read_scope() else {
++                    break;
++                };
++                if let Ok(value) = row.with_value(scope, T::clone) {
++                    out.push((row.holder, value));
++                }
++            }
++            Ok(None) => break,
++            // A value error consumes only its row; the others don't advance the cursor.
++            Err(mod_api::AttachmentRowError::Value(_)) => {}
++            Err(_) => break,
++        }
++    }
++    out
++}
++
++/// Every `(hall position, colony)` in the dimension, in holder order.
++fn colonies(host: &dyn Host) -> Vec<([i32; 3], Colony)> {
+     let mut found = Vec::new();
+-    for row in query.iter() {
+-        let Ok(row) = row else {
+-            continue;
+-        };
+-        let AttachmentHolder::BlockEntity(entity) = row.holder else {
++    for (holder, colony) in attachment_rows(host, &COLONY) {
++        let AttachmentHolder::BlockEntity(entity) = holder else {
+             continue;
+         };
+         let Some(pos) = entity.position(host) else {
+             continue;
+         };
+-        found.push((pos, row.value.clone()));
++        found.push((pos, colony));
+     }
+     found
+ }
+@@ -303,14 +328,11 @@ fn write_colony(host: &mut dyn ServerHost, pos: [i32; 3], colony: &Colony) {
+ /// One query answers every job — the marker says *which* hut it is (`Job::building`), so a new
+ /// job needs a constant, not a new attachment.
+ fn has_building(host: &dyn Host, colony: &Colony, building: &str) -> bool {
+-    let Ok(query) = host.query(&HUT) else {
+-        return false;
+-    };
+-    query.iter().flatten().any(|row| {
+-        if row.value.building != building {
++    attachment_rows(host, &HUT).into_iter().any(|(holder, value)| {
++        if value.building != building {
+             return false;
+         }
+-        let AttachmentHolder::BlockEntity(entity) = row.holder else {
++        let AttachmentHolder::BlockEntity(entity) = holder else {
+             return false;
+         };
+         let Some(pos) = entity.position(host) else {
+@@ -437,7 +459,7 @@ pub(crate) fn on_entity_place(
+     host: &mut dyn ServerHost,
+     event: &mut mod_api::EntityPlaceEvent,
+ ) -> Flow {
+-    let placed = event.state.block().id(host);
++    let placed = event.state.block().id(host).unwrap_or_default().to_owned();
+     if is_hut(&placed) {
+         queue(Pending {
+             dimension: host.dimension().to_owned(),
+@@ -463,7 +485,7 @@ pub(crate) fn on_entity_place(
+     let Some(player) = host.player(uuid) else {
+         return Flow::Continue;
+     };
+-    let Some(name) = player.name(host) else {
++    let Some(name) = player.name(host).map(str::to_owned) else {
+         return Flow::Continue;
+     };
+     let owner = Owner {
+@@ -501,7 +523,7 @@ fn complete(host: &mut dyn ServerHost, level: LevelRef, item: Pending) {
+     let Some(block) = level.block(host, pos) else {
+         return;
+     };
+-    let placed = block.id(host);
++    let placed = block.id(host).unwrap_or_default().to_owned();
+     let (uuid, owner, colony_name) = match kind {
+         PendingKind::Building { block } => {
+             if placed == block {
+@@ -552,7 +574,7 @@ pub(crate) fn on_player_destroyed_block(
+     host: &mut dyn ServerHost,
+     event: &mod_api::PlayerDestroyedBlockEvent,
+ ) {
+-    let broken = event.state.block().id(host);
++    let broken = event.state.block().id(host).unwrap_or_default().to_owned();
+     if !is_hut(&broken) {
+         return;
+     }
+@@ -566,7 +588,7 @@ pub(crate) fn on_player_destroyed_block(
+ /// write-back (HANDOVER §9d) — so the chest is filled here, as a delta, not from the job's tick.
+ pub(crate) fn on_level_tick_post(host: &mut dyn ServerHost, level: LevelRef) {
+     // `level.dimension().id(host)` is the level's own dimension name; `server_tick` has no level.
+-    let dimension = level.dimension().id(host);
++    let dimension = level.dimension().id(host).map(str::to_owned);
+     let mut queue = PENDING
+         .lock()
+         .expect("the pending-placement queue is never poisoned by a panic-free push");
+@@ -755,14 +777,13 @@ fn take_one(
+ fn plant(host: &mut dyn ServerHost, level: LevelRef, stump: [i32; 3], sapling: &str) {
+     let soil = level
+         .block(host, [stump[0], stump[1] - 1, stump[2]])
+-        .map(|block| block.id(host));
++        .and_then(|block| block.id(host).map(str::to_owned));
+     if !soil.as_deref().is_some_and(grows_a_sapling) {
+         return;
+     }
+     if level
+         .block(host, stump)
+-        .map(|block| block.id(host))
+-        .as_deref()
++        .and_then(|block| block.id(host))
+         != Some(AIR)
+     {
+         return;
+@@ -820,7 +841,11 @@ pub(crate) fn on_citizen_tick(host: &mut dyn ServerHost, entity: EntityRef) {
+     let Some(level) = entity.level(host) else {
+         return;
+     };
+-    let Some(tags) = entity.tags(host) else {
++    // Starling's port: the tags are lent; the colony tag is read from a copy.
++    let Some(tags) = entity
++        .tags(host)
++        .map(|tags| tags.iter_utf16().map(String::from_utf16_lossy).collect::<Vec<_>>())
++    else {
+         return;
+     };
+     let Some(colony_id) = read_colony_tag(&tags) else {
+@@ -961,8 +986,8 @@ fn ask_for(
+ /// The item id in an entity's main hand, or `None` for an empty hand (or an unreadable entity).
+ fn held_item(host: &dyn Host, entity: EntityRef) -> Option<String> {
+     let living = host.living(entity)?;
+-    let stack = living.hand_item(host, Hand::Main)?;
+-    Some(stack.item().id(host))
++    let stack = living.with_hand_item(host, Hand::Main, |stack| stack.project()).flatten()?;
++    Some(stack.item().id(host).unwrap_or_default().to_owned())
+ }
+ 
+ /// The item id in a roster citizen's main hand, resolved through its entity uuid.
+@@ -1232,7 +1257,7 @@ fn miner_work(
+     match miner_next(stand, colony, floor, |pos| {
+         level
+             .block(host, [pos.x, pos.y, pos.z])
+-            .map(|block| block.id(host))
++            .map(|block| block.id(host).unwrap_or_default().to_owned())
+     }) {
+         crate::runtime::Mining::Next(block) => {
+             let pos = [block.x, block.y, block.z];
+@@ -1283,7 +1308,7 @@ fn nearest_tree(
+                 }
+                 let Some(id) = level
+                     .block(host, [pos.x, pos.y, pos.z])
+-                    .map(|block| block.id(host))
++                    .map(|block| block.id(host).unwrap_or_default().to_owned())
+                 else {
+                     continue;
+                 };
+@@ -1301,7 +1326,7 @@ fn nearest_tree(
+     Some(tree_at(seed, &log, |pos| {
+         level
+             .block(host, [pos.x, pos.y, pos.z])
+-            .map(|block| block.id(host))
++            .map(|block| block.id(host).unwrap_or_default().to_owned())
+     }))
+ }
+ 
+@@ -1353,29 +1378,29 @@ pub(crate) fn on_register_commands(event: &mut RegisterCommandsEvent<'_>) {
+     for root in ["minecolonies", "mc"] {
+         event
+             .commands
+-            .push(Command::new(&format!("{root} colony info")));
++            .push(Command::new(&format!("{root} colony info")).executes(crate::starling_executor));
+         event
+             .commands
+-            .push(Command::new(&format!("{root} colony rename <name:text>")));
++            .push(Command::new(&format!("{root} colony rename <name:text>")).executes(crate::starling_executor));
+         event.commands.push(Command::new(&format!(
+             "{root} colony radius <chunks:integer>"
+-        )));
++        )).executes(crate::starling_executor));
+         event
+             .commands
+-            .push(Command::new(&format!("{root} requests")));
++            .push(Command::new(&format!("{root} requests")).executes(crate::starling_executor));
+         for citizen in ["citizen", "citizens"] {
+             event
+                 .commands
+-                .push(Command::new(&format!("{root} {citizen} hire [name:text]")));
++                .push(Command::new(&format!("{root} {citizen} hire [name:text]")).executes(crate::starling_executor));
+             event
+                 .commands
+-                .push(Command::new(&format!("{root} {citizen} list")));
++                .push(Command::new(&format!("{root} {citizen} list")).executes(crate::starling_executor));
+             event.commands.push(Command::new(&format!(
+                 "{root} job assign <citizen:word> <job:word>"
+-            )));
++            )).executes(crate::starling_executor));
+             event
+                 .commands
+-                .push(Command::new(&format!("{root} job info <citizen:word>")));
++                .push(Command::new(&format!("{root} job info <citizen:word>")).executes(crate::starling_executor));
+         }
+     }
+ }
+@@ -1554,6 +1579,7 @@ fn hire(host: &mut dyn ServerHost, player: PlayerRef, event: &RunModCommandEvent
+         .command
+         .dimension
+         .id(host)
++        .map(str::to_owned)
+         .unwrap_or_else(|| host.dimension().to_owned());
+     let Some(level) = host.level(&dimension) else {
+         feedback(host, "The citizen could not be registered.".to_owned());
