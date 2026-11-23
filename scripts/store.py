@@ -244,7 +244,18 @@ def index(build, listed, read, previous=None):
                 mods.append(row)
         elif f"{job}.json" not in names:
             failed.append(row)
+    built = {row["id"] for row in mods}
+    for mod, why in sorted(unplayable().items()):
+        if mod not in built:
+            failed.append({"state": "failed", "job": f"unplayable-{mod}", "id": mod, "error": why,
+                           "settled": True})
     return {"schema": SCHEMA, "build": build, "mods": mods, "failed": failed}
+
+
+def unplayable():
+    """scripts/unplayable.json: catalog mods no build plays (Horizon's WebAssembly mods), by id."""
+    rows = json.loads((pathlib.Path(__file__).parent / "unplayable.json").read_text(encoding="utf-8"))
+    return {k: v for k, v in rows.items() if ID.fullmatch(k)}
 
 
 def entry(status, job, asset):

@@ -1,0 +1,12 @@
+{
+ "#": "Catalog mods no build of the game plays, by id, and why: the index lists each as failed for good, so the game's catalog leaves it out. Horizon's WebAssembly mods (a [wasm] table and mod.wasm): Sunrise runs no WebAssembly.",
+ "coords_hud": "a Horizon WebAssembly mod, which this game doesn't run",
+ "fluxxy_pvp": "a Horizon WebAssembly mod, which this game doesn't run",
+ "fps_overlay": "a Horizon WebAssembly mod, which this game doesn't run",
+ "guard_villagers": "a Horizon WebAssembly mod, which this game doesn't run",
+ "jade_horizon": "a Horizon WebAssembly mod, which this game doesn't run",
+ "keystrokes": "a Horizon WebAssembly mod, which this game doesn't run",
+ "right_click_crops": "a Horizon WebAssembly mod, which this game doesn't run",
+ "world_atlas": "a Horizon WebAssembly mod, which this game doesn't run",
+ "zoom": "a Horizon WebAssembly mod, which this game doesn't run"
+}

@@ -219,7 +219,14 @@ class Index(unittest.TestCase):
         self.assertEqual([m["id"] for m in made["mods"]], ["veinminer"])
         row = made["mods"][0]
         self.assertEqual((row["file"], row["library"], row["source"]), (f"{a}.so", "libveinminer.so", done["source"]))
-        self.assertEqual([m["id"] for m in made["failed"]], ["wrench"])
+        self.assertEqual([m["id"] for m in made["failed"] if not m["job"].startswith("unplayable-")], ["wrench"])
+
+    def test_the_index_lists_the_unplayable_mods_as_failed_for_good(self):
+        made = store.index(BUILD, [], {}.get)
+        zoom = [row for row in made["failed"] if row["id"] == "zoom"]
+        self.assertEqual(len(zoom), 1)
+        self.assertTrue(zoom[0]["settled"])
+        self.assertNotIn("#", [row["id"] for row in made["failed"]])
 
     def test_the_index_reads_only_answers_it_doesnt_hold_and_drops_a_library_gone(self):
         a, done = self.status("veinminer", "0.3.0")
