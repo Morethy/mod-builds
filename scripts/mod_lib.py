@@ -40,14 +40,20 @@ FILES = 4000
 # A mod's build, at most.
 SECONDS = int(os.environ.get("MOD_LIB_SECONDS", "600"))
 # The game's crates a mod may depend on: android_native_sdk.py points this one at the base's checkout.
-API_PACKAGES = {"horizon-mod-api"}
+# Either naming: a game built on Sunrise (Starling since its sync with it) names its crates sunrise-*.
+API_PACKAGES = {"horizon-mod-api", "sunrise-mod-api"}
+MANIFESTS = ("sunrise-mod.toml", "horizon-mod.toml")
+# What a Horizon package names that a Sunrise game has under its own name (sunrise-mod-package's horizon.rs).
+RENAMED = re.compile(r"(?<![A-Za-z0-9_])horizon(?=[_-](?:mod|client|core|world|items|protocol|assets|hooks|platform"
+                     r"|shader|render|threads|look|optifine|part))")
+PIN = re.compile(r"^(\s*)horizon(\s*=)")
 # Crates of the game's own lock a mod may also depend on, plainly (a version, no features): the base's Cargo home holds
 # them and the game's build made them already, so the sandbox, without a network, compiles only the mod.
 GAME_CRATES = {"serde_json", "sha2", "log"}
 # A crate Cargo compiled, as its output says it.
 COMPILED = re.compile(r"^\s*Compiling (\S+) v", re.M)
 # What in a build's output says the mod's own code doesn't compile (for good), not the service.
-OWN_ERROR = re.compile(r"error\[E\d{4}\]|could not compile `hmod-")
+OWN_ERROR = re.compile(r"error\[E\d{4}\]|could not compile `[hs]mod-")
 WHOLE_GAME = "needs the whole-game Compile"
 # What the game's catalogs read (Starling's starling_store.rs NOT_ON_STARLING) to leave a mod out.
 NOT_ON_STARLING = "doesn't run on Starling"
@@ -85,9 +91,10 @@ def unpack(hmod, into):
 
 
 def mod_of(folder):
-    """The mod's id and version, and its horizon-mod.toml."""
+    """The mod's id and version, and its manifest (sunrise-mod.toml, or Horizon's horizon-mod.toml)."""
     try:
-        manifest = tomllib.loads((folder / "horizon-mod.toml").read_text())
+        name = next((n for n in MANIFESTS if (folder / n).is_file()), MANIFESTS[0])
+        manifest = tomllib.loads((folder / name).read_text())
     except (OSError, ValueError) as e:
         raise Refused(f"is not a mod: {e}")
     mod, version = manifest.get("id"), manifest.get("version")
@@ -96,6 +103,37 @@ def mod_of(folder):
     ):
         raise Refused("has no plain id and version")
     return mod, version, manifest
+
+
+def sunrise_game(source):
+    """Whether the base's game is built on Sunrise: its mod API crate has Sunrise's name."""
+    return (source / "crates" / "sunrise-mod-api").is_dir()
+
+
+def adopted(hmod, folder, into):
+    """The package as a Sunrise game builds it: a Horizon package (`folder`, unpacked) renamed into `into`, a
+    Sunrise one as it is."""
+    if (folder / "sunrise-mod.toml").is_file() or not (folder / "horizon-mod.toml").is_file():
+        return hmod
+    with zipfile.ZipFile(hmod) as old, zipfile.ZipFile(into, "w", zipfile.ZIP_DEFLATED) as new:
+        for entry in old.infolist():
+            if entry.is_dir():
+                continue
+            name, data = entry.filename, old.read(entry)
+            if name == "horizon-mod.toml":
+                native, lines = False, []
+                for line in data.decode("utf-8").splitlines(keepends=True):
+                    if line.lstrip().startswith("["):
+                        native = line.lstrip().startswith("[native]")
+                    lines.append(PIN.sub(r"\1sunrise\2", line) if native else line)
+                name, data = "sunrise-mod.toml", "".join(lines).encode("utf-8")
+            elif name == "Cargo.toml" or (name.startswith("src/") and name.endswith(".rs")):
+                try:
+                    data = RENAMED.sub("sunrise", data.decode("utf-8")).replace(".horizon/", ".sunrise/").encode("utf-8")
+                except UnicodeDecodeError:
+                    pass
+            new.writestr(name, data)
+    return into
 
 
 def native_of(folder, manifest):
@@ -167,9 +205,13 @@ def build_one(row, mods, source, result, build, profile):
         status.update(id=mod, version=version)
         cargo = native_of(folder, manifest)
         check(manifest, cargo, folder)
-        command = [sys.executable, str(source / "tools" / "android_native_sdk.py"), "mods", str(out), str(hmod),
+        package = adopted(hmod, folder, work / f"{mod}.smod") if sunrise_game(source) else hmod
+        if package != hmod:
+            cargo = tomllib.loads(RENAMED.sub("sunrise", (folder / "Cargo.toml").read_text()))
+        command = [sys.executable, str(source / "tools" / "android_native_sdk.py"), "mods", str(out), str(package),
                    "--profile", profile, "--abi", abi]
-        env = {**os.environ, "RUSTFLAGS": "-C prefer-dynamic", "HORIZON_GAME_BUILD_ID": build}
+        env = {**os.environ, "RUSTFLAGS": "-C prefer-dynamic", "HORIZON_GAME_BUILD_ID": build,
+               "SUNRISE_GAME_BUILD_ID": build}
         try:
             done = subprocess.run(command, cwd=source, env=env, capture_output=True, text=True, timeout=SECONDS)
         except subprocess.TimeoutExpired:
@@ -186,7 +228,7 @@ def build_one(row, mods, source, result, build, profile):
                                       "settled": bool(OWN_ERROR.search(said_by))})
         # Only the mod compiles beside the base. A crate of the game's that compiled again (a feature the mod's
         # dependencies turned on, say) is one the APK doesn't have, and the library would not open on a phone.
-        again = sorted(set(COMPILED.findall(done.stdout + "\n" + done.stderr)) - {f"hmod-{mod}"})
+        again = sorted(set(COMPILED.findall(done.stdout + "\n" + done.stderr)) - {f"hmod-{mod}", f"smod-{mod}"})
         if again:
             # Said, not refused: a build asked for by a phone (mod.yml) compiles android-activity, cpal, horizon-android
             # and horizon-client again every time, and its library opens on the phone all the same. Refusing it made
