@@ -1,8 +1,8 @@
 diff --git a/src/lib.rs b/src/lib.rs
-index 1b3a988..420adf1 100644
+index 8b91204..9a70c6d 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -126,7 +126,7 @@ fn rod_key(host: &dyn ClientHost) -> Option<ItemKey> {
+@@ -136,7 +136,7 @@ fn rod_key(host: &dyn ClientHost) -> Option<ItemKey> {
  
  /// An item's id (`minecraft:rotten_flesh`), for the junk list.
  fn item_id(host: &dyn ClientHost, key: ItemKey) -> Option<String> {

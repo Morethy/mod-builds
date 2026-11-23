@@ -1,5 +1,5 @@
 diff --git a/src/lib.rs b/src/lib.rs
-index 5507642..e7ebba5 100644
+index 538873b..b27b6e3 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -13,11 +13,14 @@
@@ -211,7 +211,7 @@ index 0000000..16e2c71
 +    }
 +}
 diff --git a/src/support.rs b/src/support.rs
-index a53ae90..2ed9e38 100644
+index 23bef22..7091311 100644
 --- a/src/support.rs
 +++ b/src/support.rs
 @@ -6,7 +6,7 @@
@@ -223,7 +223,7 @@ index a53ae90..2ed9e38 100644
      BlockSide, Capability, CommandSource, Compound, Direction, ENERGY, EnergyHandler, FLUIDS,
      FluidKey, FluidResource, FluidStack, Hand, Host, HostTransaction, Identifier,
      ItemComponentHandler, ItemPlace, ItemStack, ModContainer, ModEnergyBuffer, ModFluidTanks,
-@@ -191,7 +191,7 @@ pub(crate) fn declare(registrar: &mut dyn Registrar, context: &RegistrationConte
+@@ -201,7 +201,7 @@ pub(crate) fn declare(registrar: &mut dyn Registrar, context: &RegistrationConte
              lookup: machine.lookup,
          };
          if let Err(error) = registrar.block_entity_part(&kind, part) {
@@ -232,7 +232,7 @@ index a53ae90..2ed9e38 100644
          }
      }
      // The cube is storage only: a buffer and a block entity, no tick and no slots.
-@@ -208,7 +208,7 @@ pub(crate) fn declare(registrar: &mut dyn Registrar, context: &RegistrationConte
+@@ -218,7 +218,7 @@ pub(crate) fn declare(registrar: &mut dyn Registrar, context: &RegistrationConte
          .blocks(&[CABLE_TYPE])
          .build();
      if let Err(error) = registrar.block_entity_part(&kind, CablePart) {
@@ -241,7 +241,7 @@ index a53ae90..2ed9e38 100644
      }
      // Slice 4: one block entity holding one tank of one chemical, answered
      // through the port's own capability, and the item that carries a chemical.
-@@ -218,11 +218,16 @@ pub(crate) fn declare(registrar: &mut dyn Registrar, context: &RegistrationConte
+@@ -228,11 +228,16 @@ pub(crate) fn declare(registrar: &mut dyn Registrar, context: &RegistrationConte
          .block_entity_type(TANK_TYPE)
          .blocks(&[TANK_TYPE])
          .build();
@@ -259,7 +259,7 @@ index a53ae90..2ed9e38 100644
      });
      registrar.item_capability(&ITEM_CHEMICAL, GAUGE_DROPPER, |_, place| {
          Some(Box::new(ItemChemicalTank(place.clone())) as Box<dyn ResourceHandler<Chemical>>)
-@@ -264,12 +269,17 @@ pub(crate) fn declare(registrar: &mut dyn Registrar, context: &RegistrationConte
+@@ -274,12 +279,17 @@ pub(crate) fn declare(registrar: &mut dyn Registrar, context: &RegistrationConte
              .blocks(&[machine.kind])
              .build();
          let tank = machine.tank;
@@ -279,7 +279,7 @@ index a53ae90..2ed9e38 100644
          let part = GasPart {
              operation: machine.operation,
              capacity: machine.capacity,
-@@ -277,7 +287,7 @@ pub(crate) fn declare(registrar: &mut dyn Registrar, context: &RegistrationConte
+@@ -287,7 +297,7 @@ pub(crate) fn declare(registrar: &mut dyn Registrar, context: &RegistrationConte
              recipe_for: machine.recipe_for,
          };
          if let Err(error) = registrar.block_entity_part(&kind, part) {
@@ -288,7 +288,7 @@ index a53ae90..2ed9e38 100644
          }
      }
      // Slice 7: the basic factories. The same operations as the five machines
-@@ -323,7 +333,7 @@ pub(crate) fn declare(registrar: &mut dyn Registrar, context: &RegistrationConte
+@@ -333,7 +343,7 @@ pub(crate) fn declare(registrar: &mut dyn Registrar, context: &RegistrationConte
              lookup: factory.lookup,
          };
          if let Err(error) = registrar.block_entity_part(&kind, part) {
@@ -297,7 +297,7 @@ index a53ae90..2ed9e38 100644
          }
      }
      let gas_factories = [
-@@ -353,12 +363,17 @@ pub(crate) fn declare(registrar: &mut dyn Registrar, context: &RegistrationConte
+@@ -363,12 +373,17 @@ pub(crate) fn declare(registrar: &mut dyn Registrar, context: &RegistrationConte
              .blocks(&[factory.kind])
              .build();
          let tank = factory.tank;
@@ -317,7 +317,7 @@ index a53ae90..2ed9e38 100644
          let part = GasFactoryPart {
              operation: factory.operation,
              capacity: factory.capacity,
-@@ -366,7 +381,7 @@ pub(crate) fn declare(registrar: &mut dyn Registrar, context: &RegistrationConte
+@@ -376,7 +391,7 @@ pub(crate) fn declare(registrar: &mut dyn Registrar, context: &RegistrationConte
              recipe_for: factory.recipe_for,
          };
          if let Err(error) = registrar.block_entity_part(&kind, part) {
@@ -326,7 +326,7 @@ index a53ae90..2ed9e38 100644
          }
      }
      // Slice 8: the Chemical Washer — the same machine shape with a **fluid**
-@@ -384,21 +399,26 @@ pub(crate) fn declare(registrar: &mut dyn Registrar, context: &RegistrationConte
+@@ -394,21 +409,26 @@ pub(crate) fn declare(registrar: &mut dyn Registrar, context: &RegistrationConte
          .block_entity_type(WASHER_TYPE)
          .blocks(&[WASHER_TYPE])
          .build();
@@ -354,9 +354,31 @@ index a53ae90..2ed9e38 100644
 -        context.refuse("mekanism: the water fluid key was resolved twice");
 +        registrar.refuse("mekanism: the water fluid key was resolved twice");
      }
+     // Slice 9: the Chemical Crystallizer — the washer's consumer. One
+     // 10,000-unit tank answered through `mekanism:chemical` that takes a clean
+@@ -424,14 +444,19 @@ pub(crate) fn declare(registrar: &mut dyn Registrar, context: &RegistrationConte
+         .block_entity_type(CRYSTALLIZER_TYPE)
+         .blocks(&[CRYSTALLIZER_TYPE])
+         .build();
+-    registrar.block_entity_capability(&CHEMICAL, &kind, |_, at| {
++    registrar.block_entity_capability(&CHEMICAL, &kind, move |starling_level, starling_side, _, _, offer| {
++        let old = |_, at| {
+         Some(Box::new(CrystallizerTank {
+             side: at,
+             capacity: CRYSTALLIZER_TANK,
+         }) as Box<dyn ResourceHandler<Chemical>>)
++    };
++        if let Some(handler) = old(starling_level, starling_side) {
++            offer.offer(move || handler);
++        }
+     });
+     if let Err(error) = registrar.block_entity_part(&kind, CrystallizerPart) {
+-        context.refuse(&error.to_string());
++        registrar.refuse(&error.to_string());
+     }
  }
  
-@@ -425,6 +445,7 @@ pub(crate) fn washer_fluids() -> ModFluidTanks {
+@@ -458,6 +483,7 @@ pub(crate) fn washer_fluids() -> ModFluidTanks {
  pub(crate) fn container() -> ModContainer {
      let all = vec![INPUT_SLOT, UNUSED_SLOT, OUTPUT_SLOT];
      ModContainer {
@@ -364,7 +386,7 @@ index a53ae90..2ed9e38 100644
          slots: MENU_SLOTS,
          faces: std::array::from_fn(|_| all.clone()),
          inputs: vec![INPUT_SLOT],
-@@ -439,6 +460,7 @@ pub(crate) fn container() -> ModContainer {
+@@ -472,6 +498,7 @@ pub(crate) fn container() -> ModContainer {
  pub(crate) fn factory_container() -> ModContainer {
      let all = (0..FACTORY_SLOTS).collect::<Vec<_>>();
      ModContainer {
@@ -372,7 +394,15 @@ index a53ae90..2ed9e38 100644
          slots: FACTORY_SLOTS,
          faces: std::array::from_fn(|_| all.clone()),
          inputs: FACTORY_INPUT_SLOTS.to_vec(),
-@@ -744,7 +766,7 @@ fn tank_name(tank: &Tank) -> String {
+@@ -487,6 +514,7 @@ pub(crate) fn factory_container() -> ModContainer {
+ /// this port does not draw (the same deviation the washer records for its four).
+ pub(crate) fn crystallizer_container() -> ModContainer {
+     ModContainer {
++        insert_rules: Vec::new(),
+         slots: 1,
+         faces: std::array::from_fn(|_| vec![CRYSTAL_SLOT]),
+         inputs: Vec::new(),
+@@ -823,7 +851,7 @@ fn tank_name(tank: &Tank) -> String {
  /// A slot as the pure core's stack, empty when the slot is empty.
  fn slot_stack(host: &dyn Host, slot: Option<&ItemStack>) -> ItemAmount {
      match slot {
@@ -381,7 +411,7 @@ index a53ae90..2ed9e38 100644
          _ => ItemAmount::default(),
      }
  }
-@@ -761,7 +783,7 @@ fn set_slot(host: &dyn Host, items: &mut [Option<ItemStack>], slot: usize, value
+@@ -840,7 +868,7 @@ fn set_slot(host: &dyn Host, items: &mut [Option<ItemStack>], slot: usize, value
      }
      let same = items[slot]
          .as_ref()
@@ -390,7 +420,7 @@ index a53ae90..2ed9e38 100644
      if same {
          if let Some(current) = items[slot].as_mut() {
              let _ = current.set_count(value.count);
-@@ -834,16 +856,17 @@ impl BlockEntityPart for MachinePart {
+@@ -913,16 +941,17 @@ impl BlockEntityPart for MachinePart {
      /// pure core). An idle tick with no energy or no output room changes
      /// nothing, so it answers `Unchanged` and does not dirty its chunk (the
      /// retired bundle's `mark_modified` condition).
@@ -414,7 +444,7 @@ index a53ae90..2ed9e38 100644
          let limit = stack_limit(&*host, &output);
          let outcome = process_tick(
              &mut machine,
-@@ -855,12 +878,12 @@ impl BlockEntityPart for MachinePart {
+@@ -934,12 +963,12 @@ impl BlockEntityPart for MachinePart {
          );
          write_state(&mut saved, machine.energy, machine.progress);
          if let Tag::Compound(nbt) = saved {
@@ -431,7 +461,7 @@ index a53ae90..2ed9e38 100644
              machine.energy,
              machine.progress,
              self.operation,
-@@ -871,8 +894,9 @@ impl BlockEntityPart for MachinePart {
+@@ -950,8 +979,9 @@ impl BlockEntityPart for MachinePart {
              Outcome::Idle(IdleReason::NoEnergy | IdleReason::NoOutputSpace)
          );
          if idle && !resized {
@@ -442,7 +472,7 @@ index a53ae90..2ed9e38 100644
      }
  }
  
-@@ -900,9 +924,10 @@ impl BlockEntityPart for CablePart {
+@@ -979,9 +1009,10 @@ impl BlockEntityPart for CablePart {
      /// bundle planned every face first, which needs the neighbour's
      /// `can_extract`; without it a machine's stored energy would be planned as a
      /// pull that yields nothing and would starve the face that does give.
@@ -456,7 +486,7 @@ index a53ae90..2ed9e38 100644
          let energy = read_energy(&saved, CABLE_CAPACITY);
          let Some(level) = host.level(host.dimension()) else {
              return;
-@@ -953,9 +978,10 @@ impl BlockEntityPart for CablePart {
+@@ -1032,9 +1063,10 @@ impl BlockEntityPart for CablePart {
          if after != energy {
              write_energy(&mut saved, after);
              if let Tag::Compound(nbt) = saved {
@@ -468,7 +498,7 @@ index a53ae90..2ed9e38 100644
      }
  }
  
-@@ -990,17 +1016,18 @@ impl BlockEntityPart for GasPart {
+@@ -1069,17 +1101,18 @@ impl BlockEntityPart for GasPart {
      /// always written back (an idle tick never answers `Unchanged` after drawing
      /// gas), and an idle tick that drew nothing is `Unchanged`, as the other
      /// machines are.
@@ -493,7 +523,7 @@ index a53ae90..2ed9e38 100644
          let limit = stack_limit(&*host, &output);
          let pulled = {
              let mut tick = GasTick {
-@@ -1010,7 +1037,7 @@ impl BlockEntityPart for GasPart {
+@@ -1089,7 +1122,7 @@ impl BlockEntityPart for GasPart {
                  output: &output,
                  limit,
              };
@@ -502,7 +532,7 @@ index a53ae90..2ed9e38 100644
          };
          let outcome = process_gas_tick(
              &mut machine,
-@@ -1024,12 +1051,12 @@ impl BlockEntityPart for GasPart {
+@@ -1103,12 +1136,12 @@ impl BlockEntityPart for GasPart {
          write_state(&mut saved, machine.energy, machine.progress);
          write_tank(&mut saved, &tank);
          if let Tag::Compound(nbt) = saved {
@@ -519,7 +549,7 @@ index a53ae90..2ed9e38 100644
              machine.energy,
              machine.progress,
              self.operation,
-@@ -1042,8 +1069,9 @@ impl BlockEntityPart for GasPart {
+@@ -1121,8 +1154,9 @@ impl BlockEntityPart for GasPart {
              )
          );
          if idle && !resized && pulled == 0 {
@@ -530,7 +560,7 @@ index a53ae90..2ed9e38 100644
      }
  }
  
-@@ -1070,15 +1098,16 @@ impl BlockEntityPart for FactoryPart {
+@@ -1149,15 +1183,16 @@ impl BlockEntityPart for FactoryPart {
      /// spends three times what a single machine would. An idle tick where every
      /// process is out of energy or out of output room changes nothing and
      /// answers `Unchanged`, as the single machines do.
@@ -552,7 +582,7 @@ index a53ae90..2ed9e38 100644
          let ceiling = (self.operation.ticks - 1).max(0);
          for process in &mut processes {
              process.progress = process.progress.clamp(0, ceiling);
-@@ -1098,18 +1127,18 @@ impl BlockEntityPart for FactoryPart {
+@@ -1177,18 +1212,18 @@ impl BlockEntityPart for FactoryPart {
          );
          write_factory_state(&mut saved, energy, &processes);
          if let Tag::Compound(nbt) = saved {
@@ -574,7 +604,7 @@ index a53ae90..2ed9e38 100644
                  FACTORY_OUTPUT_SLOTS[index],
                  &process.output,
              );
-@@ -1121,8 +1150,9 @@ impl BlockEntityPart for FactoryPart {
+@@ -1200,8 +1235,9 @@ impl BlockEntityPart for FactoryPart {
              )
          });
          if idle && !resized {
@@ -585,7 +615,7 @@ index a53ae90..2ed9e38 100644
      }
  }
  
-@@ -1150,16 +1180,17 @@ impl BlockEntityPart for GasFactoryPart {
+@@ -1229,16 +1265,17 @@ impl BlockEntityPart for GasFactoryPart {
      /// worth each) through the chemical capability, then run all three. The
      /// factory holds none of the gas after a working tick: the tank is a buffer,
      /// as the single machines' 210-unit tanks are.
@@ -608,7 +638,7 @@ index a53ae90..2ed9e38 100644
          let ceiling = (self.operation.ticks - 1).max(0);
          for process in &mut processes {
              process.progress = process.progress.clamp(0, ceiling);
-@@ -1182,7 +1213,7 @@ impl BlockEntityPart for GasFactoryPart {
+@@ -1261,7 +1298,7 @@ impl BlockEntityPart for GasFactoryPart {
                  if want == 0 {
                      0
                  } else {
@@ -617,7 +647,7 @@ index a53ae90..2ed9e38 100644
                      let _ = insert_chemical(&mut tank, chemical, pulled, self.tank);
                      pulled
                  }
-@@ -1202,18 +1233,18 @@ impl BlockEntityPart for GasFactoryPart {
+@@ -1281,18 +1318,18 @@ impl BlockEntityPart for GasFactoryPart {
          write_factory_state(&mut saved, energy, &processes);
          write_tank(&mut saved, &tank);
          if let Tag::Compound(nbt) = saved {
@@ -639,7 +669,7 @@ index a53ae90..2ed9e38 100644
                  FACTORY_OUTPUT_SLOTS[index],
                  &process.output,
              );
-@@ -1227,8 +1258,9 @@ impl BlockEntityPart for GasFactoryPart {
+@@ -1306,8 +1343,9 @@ impl BlockEntityPart for GasFactoryPart {
              )
          });
          if idle && !resized && pulled == 0 {
@@ -650,7 +680,7 @@ index a53ae90..2ed9e38 100644
      }
  }
  
-@@ -1257,13 +1289,14 @@ impl BlockEntityPart for WasherPart {
+@@ -1336,13 +1374,14 @@ impl BlockEntityPart for WasherPart {
      /// An idle tick that only held its progress (no energy or no output room)
      /// changes nothing and answers `Unchanged`; a reset (no water, no recipe) is a
      /// change, so it is written back.
@@ -668,7 +698,7 @@ index a53ae90..2ed9e38 100644
          let outcome = process_wash_tick(
              &mut machine,
              WASHER_OPERATION,
-@@ -1277,15 +1310,16 @@ impl BlockEntityPart for WasherPart {
+@@ -1356,15 +1395,16 @@ impl BlockEntityPart for WasherPart {
          write_washer_fluid(&mut saved, &water);
          write_washer_tanks(&mut saved, &input, &output);
          if let Tag::Compound(nbt) = saved {
@@ -687,7 +717,54 @@ index a53ae90..2ed9e38 100644
      }
  }
  
-@@ -1438,7 +1472,7 @@ fn pull_chemical(host: &mut dyn ServerHost, pos: [i32; 3], chemical: &str, want:
+@@ -1464,18 +1504,19 @@ impl BlockEntityPart for CrystallizerPart {
+     /// output room) changes nothing and answers `Unchanged`; a reset (an empty
+     /// tank, a chemical with no row, too little slurry) is a change and is
+     /// written back.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        let resized = event.entity.items.len() != 1;
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        crate::starling_tick::run(event, |host, entity, tick_pos| {
++        let resized = (*entity).items.len() != 1;
+         if resized {
+-            event.entity.items.resize(1, None);
++            (*entity).items.resize(1, None);
+         }
+-        let mut saved = Tag::Compound(event.entity.nbt.clone());
++        let mut saved = Tag::Compound((*entity).nbt.clone());
+         let mut machine = read_machine(&saved, CRYSTALLIZER_CAPACITY);
+         machine.progress = machine.progress.clamp(0, (CRYSTALLIZER_TICKS - 1).max(0));
+         let mut tank = read_tank(&saved);
+-        let mut output = slot_stack(&*host, event.entity.items[CRYSTAL_SLOT].as_ref());
++        let mut output = slot_stack(&*host, (*entity).items[CRYSTAL_SLOT].as_ref());
+         let limit = stack_limit(&*host, &output);
+-        let pulled = crystallizer_draw(&machine, &mut tank, &output, limit, host, event.pos);
++        let pulled = crystallizer_draw(&machine, &mut tank, &output, limit, host, tick_pos);
+         let outcome = process_crystal_tick(
+             &mut machine,
+             CRYSTALLIZER_OPERATION,
+@@ -1487,16 +1528,17 @@ impl BlockEntityPart for CrystallizerPart {
+         write_state(&mut saved, machine.energy, machine.progress);
+         write_tank(&mut saved, &tank);
+         if let Tag::Compound(nbt) = saved {
+-            event.entity.nbt = nbt;
++            (*entity).nbt = nbt;
+         }
+-        set_slot(&*host, &mut event.entity.items, CRYSTAL_SLOT, &output);
++        set_slot(&*host, &mut (*entity).items, CRYSTAL_SLOT, &output);
+         let idle = matches!(
+             outcome,
+             Outcome::Idle(IdleReason::NoEnergy | IdleReason::NoOutputSpace)
+         );
+         if idle && pulled == 0 && !resized {
+-            *event.reply = BlockEntityTickReply::Unchanged;
++            // (unchanged: nothing is written back)
+         }
++    });
+     }
+ }
+ 
+@@ -1634,7 +1676,7 @@ fn pull_chemical(host: &mut dyn ServerHost, pos: [i32; 3], chemical: &str, want:
              if handler.resource(host, 0).as_ref() != Some(&chemical) {
                  continue;
              }
@@ -696,7 +773,7 @@ index a53ae90..2ed9e38 100644
              got = got.saturating_add(came);
          }
          Ok::<u32, ()>(got)
-@@ -1658,13 +1692,13 @@ impl ResourceHandler<Chemical> for WasherTanks {
+@@ -1854,13 +1896,13 @@ impl ResourceHandler<Chemical> for WasherTanks {
          }
      }
  
@@ -712,7 +789,7 @@ index a53ae90..2ed9e38 100644
          &self,
          host: &mut dyn ServerHost,
          _: &Transaction,
-@@ -1688,7 +1722,7 @@ impl ResourceHandler<Chemical> for WasherTanks {
+@@ -1884,7 +1926,7 @@ impl ResourceHandler<Chemical> for WasherTanks {
  
      /// A drain takes from the **output** tank only: the dirty one is
      /// automation's to fill, not to empty.
@@ -721,7 +798,7 @@ index a53ae90..2ed9e38 100644
          &self,
          host: &mut dyn ServerHost,
          _: &Transaction,
-@@ -1768,11 +1802,11 @@ impl ResourceHandler<Chemical> for ChemicalTank {
+@@ -1964,11 +2006,11 @@ impl ResourceHandler<Chemical> for ChemicalTank {
          }
      }
  
@@ -735,7 +812,7 @@ index a53ae90..2ed9e38 100644
          &self,
          host: &mut dyn ServerHost,
          _: &Transaction,
-@@ -1795,7 +1829,7 @@ impl ResourceHandler<Chemical> for ChemicalTank {
+@@ -1991,7 +2033,7 @@ impl ResourceHandler<Chemical> for ChemicalTank {
          }
      }
  
@@ -744,7 +821,32 @@ index a53ae90..2ed9e38 100644
          &self,
          host: &mut dyn ServerHost,
          _: &Transaction,
-@@ -1897,11 +1931,11 @@ impl ResourceHandler<Chemical> for ItemChemicalTank {
+@@ -2066,13 +2108,13 @@ impl ResourceHandler<Chemical> for CrystallizerTank {
+         }
+     }
+ 
+-    fn capacity(&self, _: &mut dyn ServerHost, index: usize, _: &Chemical) -> u32 {
++    fn capacity(&self, _: &mut dyn ServerHost, index: usize, _: Option<&Chemical>) -> u32 {
+         if index == 0 { self.capacity } else { 0 }
+     }
+ 
+     /// A fill goes in only when the tank's own predicate accepts the chemical: a
+     /// clean slurry the jar has a crystallizing row for.
+-    fn insert(
++    fn insert_at(
+         &self,
+         host: &mut dyn ServerHost,
+         _: &Transaction,
+@@ -2094,7 +2136,7 @@ impl ResourceHandler<Chemical> for CrystallizerTank {
+ 
+     /// The machine's tank is insert-only (upstream's `BasicChemicalTank.inputModern`):
+     /// a foreign drain takes nothing.
+-    fn extract(
++    fn extract_at(
+         &self,
+         _: &mut dyn ServerHost,
+         _: &Transaction,
+@@ -2187,11 +2229,11 @@ impl ResourceHandler<Chemical> for ItemChemicalTank {
          }
      }
  
@@ -758,7 +860,7 @@ index a53ae90..2ed9e38 100644
          &self,
          host: &mut dyn ServerHost,
          tx: &Transaction,
-@@ -1926,7 +1960,7 @@ impl ResourceHandler<Chemical> for ItemChemicalTank {
+@@ -2216,7 +2258,7 @@ impl ResourceHandler<Chemical> for ItemChemicalTank {
          }
      }
  
@@ -767,7 +869,7 @@ index a53ae90..2ed9e38 100644
          &self,
          host: &mut dyn ServerHost,
          tx: &Transaction,
-@@ -1955,7 +1989,7 @@ pub(crate) fn chemical_readout(host: &mut dyn ServerHost, pos: [i32; 3]) -> Stri
+@@ -2245,7 +2287,7 @@ pub(crate) fn chemical_readout(host: &mut dyn ServerHost, pos: [i32; 3]) -> Stri
      };
      let block = level
          .block(&*host, pos)
@@ -776,7 +878,7 @@ index a53ae90..2ed9e38 100644
      let Some(handler) = level.capability(host, &CHEMICAL, pos, None) else {
          return format!(
              "chemical: no chemical handler at {} {} {}",
-@@ -1968,7 +2002,7 @@ pub(crate) fn chemical_readout(host: &mut dyn ServerHost, pos: [i32; 3]) -> Stri
+@@ -2258,7 +2300,7 @@ pub(crate) fn chemical_readout(host: &mut dyn ServerHost, pos: [i32; 3]) -> Stri
      // The capacity the handler itself answers, asked with a probe chemical so an
      // empty tank can report it too.
      let probe = Chemical::new(CHEMICALS[0]).expect("a registered chemical");
@@ -785,7 +887,7 @@ index a53ae90..2ed9e38 100644
      match held {
          Some(chemical) => {
              format!("chemical: {block} holds {chemical} {amount}/{capacity} (answered by {owner})")
-@@ -2003,7 +2037,7 @@ pub(crate) fn chemical_insert(
+@@ -2293,7 +2335,7 @@ pub(crate) fn chemical_insert(
      };
      let block = level
          .block(&*host, pos)
@@ -794,7 +896,7 @@ index a53ae90..2ed9e38 100644
      let Some(handler) = level.capability(host, &CHEMICAL, pos, None) else {
          return format!(
              "chemical: no chemical handler at {} {} {}",
-@@ -2019,10 +2053,10 @@ pub(crate) fn chemical_insert(
+@@ -2309,10 +2351,10 @@ pub(crate) fn chemical_insert(
          return format!("chemical: unknown chemical {id}");
      }
      let went =
@@ -807,7 +909,7 @@ index a53ae90..2ed9e38 100644
      format!("chemical: inserted {went} {id} into {block} ({held}/{capacity})")
  }
  
-@@ -2082,21 +2116,21 @@ fn drain_tank_into_dropper(
+@@ -2372,21 +2414,21 @@ fn drain_tank_into_dropper(
      };
      let asked = dropper_move(amount);
      let moved = host.transaction(|host, tx| {
@@ -833,7 +935,7 @@ index a53ae90..2ed9e38 100644
      let dropper = item.amount(host, 0);
      format!(
          "chemical: drained {moved} {held} into the gauge dropper \
-@@ -2136,7 +2170,7 @@ fn water_resource() -> Option<FluidResource> {
+@@ -2426,7 +2468,7 @@ fn water_resource() -> Option<FluidResource> {
  /// A fluid's registry name for a readout (`minecraft:water`).
  fn fluid_name(host: &dyn Host, resource: &FluidResource) -> String {
      match resource.fluid().key() {
@@ -842,7 +944,7 @@ index a53ae90..2ed9e38 100644
          None => "an unresolved fluid".to_owned(),
      }
  }
-@@ -2149,7 +2183,7 @@ pub(crate) fn fluid_read(host: &mut dyn ServerHost, pos: [i32; 3]) -> String {
+@@ -2439,7 +2481,7 @@ pub(crate) fn fluid_read(host: &mut dyn ServerHost, pos: [i32; 3]) -> String {
      };
      let block = level
          .block(&*host, pos)
@@ -851,7 +953,7 @@ index a53ae90..2ed9e38 100644
      let Some(handler) = level.capability(host, &FLUIDS, pos, None) else {
          return format!(
              "fluid: no fluid handler at {} {} {}",
-@@ -2159,7 +2193,7 @@ pub(crate) fn fluid_read(host: &mut dyn ServerHost, pos: [i32; 3]) -> String {
+@@ -2449,7 +2491,7 @@ pub(crate) fn fluid_read(host: &mut dyn ServerHost, pos: [i32; 3]) -> String {
      let owner = handler.owner();
      let held = handler.resource(host, 0);
      let amount = handler.amount(host, 0);
@@ -860,7 +962,7 @@ index a53ae90..2ed9e38 100644
      match held {
          Some(resource) => {
              let name = fluid_name(&*host, &resource);
-@@ -2180,7 +2214,7 @@ pub(crate) fn fluid_insert(host: &mut dyn ServerHost, pos: [i32; 3], amount: u32
+@@ -2470,7 +2512,7 @@ pub(crate) fn fluid_insert(host: &mut dyn ServerHost, pos: [i32; 3], amount: u32
      };
      let block = level
          .block(&*host, pos)
@@ -869,7 +971,7 @@ index a53ae90..2ed9e38 100644
      let Some(handler) = level.capability(host, &FLUIDS, pos, None) else {
          return format!(
              "fluid: no fluid handler at {} {} {}",
-@@ -2191,10 +2225,10 @@ pub(crate) fn fluid_insert(host: &mut dyn ServerHost, pos: [i32; 3], amount: u32
+@@ -2481,10 +2523,10 @@ pub(crate) fn fluid_insert(host: &mut dyn ServerHost, pos: [i32; 3], amount: u32
          return "fluid: the water fluid key was not resolved at registration".to_owned();
      };
      let went = host
@@ -882,7 +984,7 @@ index a53ae90..2ed9e38 100644
      format!("fluid: inserted {went} {WATER} into {block} ({held}/{capacity})")
  }
  
-@@ -2204,14 +2238,14 @@ pub(crate) fn fluid_insert(host: &mut dyn ServerHost, pos: [i32; 3], amount: u32
+@@ -2494,14 +2536,14 @@ pub(crate) fn fluid_insert(host: &mut dyn ServerHost, pos: [i32; 3], amount: u32
  pub(crate) fn is_chemical_tank(host: &mut dyn ServerHost, pos: [i32; 3]) -> bool {
      host.level(host.dimension())
          .and_then(|level| level.block(&*host, pos))

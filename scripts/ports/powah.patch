@@ -1,8 +1,8 @@
 diff --git a/src/lib.rs b/src/lib.rs
-index 3f67ff9..178c00c 100644
+index f75a7f7..53e9928 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -27,15 +27,18 @@
+@@ -27,16 +27,18 @@
  //! Its `content_root` embedded-content helper has no successor: one `.hmod`
  //! carries the content and the code, which is what that helper existed to work
  //! around.
@@ -16,40 +16,119 @@ index 3f67ff9..178c00c 100644
  
 +use crate::starling_command::RunModCommandEvent;
  use mod_api::{
-     self, Flow, Hooks, HostSide, LevelTickPostEvent, RegisterCommandsEvent, Registrar,
--    RegistrationContext, RunModCommandEvent, ServerHost, Text, WorldLifecycleEvent,
-+    RegistrationContext, ServerHost, Text, WorldLifecycleEvent,
+     self, BlockDropsEvent, ComponentTypesEvent, Flow, Hooks, HostSide, LevelHost,
+-    LevelTickPostEvent, RegisterCommandsEvent, Registrar, RegistrationContext, RunModCommandEvent,
+-    ServerHost, Text, WorldLifecycleEvent,
++    LevelTickPostEvent, RegisterCommandsEvent, Registrar, RegistrationContext, ServerHost, Text, WorldLifecycleEvent,
  };
  
  use crate::powah::{Queue, SetOutcome};
-@@ -51,7 +54,7 @@ fn declare_idle(
+@@ -54,7 +56,7 @@ fn declare_idle(
      let kind = powah::declare(registrar, name);
-     let part = powah::IdlePart::new(Arc::clone(queue));
+     let part = powah::IdlePart::new(Arc::clone(queue), rules);
      if let Err(error) = registrar.block_entity_part(&kind, part) {
 -        context.refuse(&error.to_string());
 +        registrar.refuse(&error.to_string());
      }
  }
  
-@@ -84,7 +87,7 @@ impl Hooks for Mod {
+@@ -105,7 +107,7 @@ impl Hooks for Mod {
              let kind = powah::declare(registrar, name);
              let part = powah::FurnatorPart::new(Arc::clone(&self.queue), tier);
              if let Err(error) = registrar.block_entity_part(&kind, part) {
 -                context.refuse(&error.to_string());
 +                registrar.refuse(&error.to_string());
              }
+             declare_item(registrar, block);
          }
-         // Every energy cell tier: one buffer with the tier's own capacity and
-@@ -110,7 +113,7 @@ impl Hooks for Mod {
-         // jobs). Every furnator tier was declared above, where its tier's buffer is.
+@@ -166,7 +168,7 @@ impl Hooks for Mod {
+             let kind = powah::declare(registrar, name);
+             let part = powah::HopperPart::new(Arc::clone(&self.queue), tier);
+             if let Err(error) = registrar.block_entity_part(&kind, part) {
+-                context.refuse(&error.to_string());
++                registrar.refuse(&error.to_string());
+             }
+             declare_item(registrar, block);
+         }
+@@ -181,7 +183,7 @@ impl Hooks for Mod {
+             let kind = powah::declare(registrar, name);
+             let part = powah::SolarPart::new(Arc::clone(&self.queue), tier);
+             if let Err(error) = registrar.block_entity_part(&kind, part) {
+-                context.refuse(&error.to_string());
++                registrar.refuse(&error.to_string());
+             }
+             declare_item(registrar, block);
+         }
+@@ -197,14 +199,17 @@ impl Hooks for Mod {
+             registrar.block_capability_before_game(
+                 &mod_api::ENERGY,
+                 &cell,
+-                move |host, at, state, entity| {
+-                    powah::ender_capability(host, at, state, entity, powah::Kind::EnderCell(tier))
++                move |host, at, state, entity, offer| {
++                    // Starling: Sunrise offers the handler; the old provider answered it.
++                    if let Some(handler) = powah::ender_capability(host, at, state, entity, powah::Kind::EnderCell(tier)) {
++                        offer.offer(|| handler);
++                    }
+                 },
+             );
+             let kind = powah::declare(registrar, name);
+             let part = powah::EnderPart::new(Arc::clone(&self.queue), powah::Kind::EnderCell(tier));
+             if let Err(error) = registrar.block_entity_part(&kind, part) {
+-                context.refuse(&error.to_string());
++                registrar.refuse(&error.to_string());
+             }
+             declare_item(registrar, block);
+         }
+@@ -220,14 +225,17 @@ impl Hooks for Mod {
+             registrar.block_capability_before_game(
+                 &mod_api::ENERGY,
+                 &gate,
+-                move |host, at, state, entity| {
+-                    powah::ender_capability(host, at, state, entity, powah::Kind::EnderGate(tier))
++                move |host, at, state, entity, offer| {
++                    // Starling: Sunrise offers the handler; the old provider answered it.
++                    if let Some(handler) = powah::ender_capability(host, at, state, entity, powah::Kind::EnderGate(tier)) {
++                        offer.offer(|| handler);
++                    }
+                 },
+             );
+             let kind = powah::declare(registrar, name);
+             let part = powah::EnderPart::new(Arc::clone(&self.queue), powah::Kind::EnderGate(tier));
+             if let Err(error) = registrar.block_entity_part(&kind, part) {
+-                context.refuse(&error.to_string());
++                registrar.refuse(&error.to_string());
+             }
+             declare_item(registrar, block);
+         }
+@@ -244,7 +252,7 @@ impl Hooks for Mod {
+             let kind = powah::declare(registrar, name);
+             let part = powah::TransmitterPart::new(tier);
+             if let Err(error) = registrar.block_entity_part(&kind, part) {
+-                context.refuse(&error.to_string());
++                registrar.refuse(&error.to_string());
+             }
+             declare_item(registrar, block);
+         }
+@@ -288,7 +296,7 @@ impl Hooks for Mod {
+         // where its buffer is.
          let orb_kind = powah::declare(registrar, powah::ORB_TYPE);
          if let Err(error) = registrar.block_entity_part(&orb_kind, powah::OrbPart) {
 -            context.refuse(&error.to_string());
 +            registrar.refuse(&error.to_string());
          }
-         for (_, name) in powah::CELLS {
-             declare_idle(registrar, context, &self.queue, name);
-@@ -162,14 +165,13 @@ impl Hooks for Mod {
+         for (block, name) in powah::CABLES {
+             declare_idle(registrar, context, &self.queue, name, None);
+@@ -302,7 +310,7 @@ impl Hooks for Mod {
+     /// upstream's `PowahComponents.BOUND_PLAYER`), which the card's own `use` writes and the
+     /// transmitter's tick reads.
+     fn component_types(&self, _context: &RegistrationContext, event: &mut ComponentTypesEvent<'_>) {
+-        event.types.push(powah::BOUND_PLAYER.to_owned());
++        event.register(powah::BOUND_PLAYER.to_owned().into());
+     }
+ 
+     /// A block broke: its own item carries its buffer when it is one of the
+@@ -351,14 +359,13 @@ impl Hooks for Mod {
      fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
          powah::declare_commands(event.commands);
      }
@@ -70,7 +149,7 @@ index 3f67ff9..178c00c 100644
          let literals: Vec<&str> = event.command.literals.iter().map(String::as_str).collect();
          let pos = powah::block_pos(event.command.argument("pos"));
          let amount = powah::integer(event.command.argument("amount"));
-@@ -192,4 +194,12 @@ impl Hooks for Mod {
+@@ -424,4 +431,12 @@ impl Hooks for Mod {
          let _ = host.commands().feedback(Text::literal(line));
          Flow::Cancel
      }
@@ -84,27 +163,151 @@ index 3f67ff9..178c00c 100644
 +    crate::starling_command::execute(host, source, command, starling_run_mod_command)
  }
 diff --git a/src/powah.rs b/src/powah.rs
-index 9893095..e117491 100644
+index a1faf11..99fb5bd 100644
 --- a/src/powah.rs
 +++ b/src/powah.rs
-@@ -15,7 +15,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
- use std::sync::{Arc, Mutex};
- 
+@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
+ use mod_api::HostBlockStates;
  use mod_api::{
--    self, BlockEntityPart, BlockEntityTickEvent, BlockEntityTickReply, BlockEntityTicksEvent,
-+    self, BlockEntityPart, BlockEntityTickEvent, BlockEntityTicksEvent,
-     BlockEntityTypeKey, BlockPart, Command, CommandArgumentValue, Compound, Direction, ENERGY,
-     Host, HostTransaction, Identifier, LevelRef, ModContainer, ModEnergyBuffer, Registrar,
-     ServerHost, Tag, move_energy,
-@@ -180,6 +180,7 @@ pub(crate) fn declare(registrar: &mut dyn Registrar, name: &str) -> BlockEntityT
- /// has no GUI). Upstream has two slots — the charging slot is a gap.
+     self, AttachmentCodec, AttachmentError, AttachmentType, BlockDropsEvent, BlockEntityPart,
+-    BlockEntityTickEvent, BlockEntityTickReply, BlockEntityTicksEvent, BlockEntityTypeKey,
++    BlockEntityTickEvent, BlockEntityTicksEvent, BlockEntityTypeKey,
+     BlockFace, BlockPart, BlockSide, Command, CommandArgumentValue, Component, ComponentId,
+     Compound, Direction, ENERGY, EnergyHandler, Flow, Hand, Holder, Host, HostSide,
+     HostTransaction, Identifier, InteractionResult, ItemComponentHandler, ItemInteractMobEvent,
+@@ -365,6 +365,7 @@ pub(crate) fn keep_capacity(block: &str) -> Option<i32> {
+ pub(crate) fn cell_container() -> ModContainer {
+     let slots: Vec<usize> = (0..CELL_SLOTS).collect();
+     ModContainer {
++        insert_rules: Vec::new(),
+         slots: CELL_SLOTS,
+         faces: std::array::from_fn(|_| slots.clone()),
+         inputs: slots.clone(),
+@@ -380,6 +381,7 @@ pub(crate) fn cell_container() -> ModContainer {
+ pub(crate) fn discharger_container() -> ModContainer {
+     let slots: Vec<usize> = (0..DISCHARGER_SLOTS).collect();
+     ModContainer {
++        insert_rules: Vec::new(),
+         slots: DISCHARGER_SLOTS,
+         faces: std::array::from_fn(|_| slots.clone()),
+         inputs: slots.clone(),
+@@ -394,6 +396,7 @@ pub(crate) fn discharger_container() -> ModContainer {
+ pub(crate) fn solar_container() -> ModContainer {
+     let slots: Vec<usize> = (0..SOLAR_SLOTS).collect();
+     ModContainer {
++        insert_rules: Vec::new(),
+         slots: SOLAR_SLOTS,
+         faces: std::array::from_fn(|_| slots.clone()),
+         inputs: slots.clone(),
+@@ -490,7 +493,7 @@ fn with_payload_energy(
+     stack: &mod_api::ItemStack,
+     energy: i32,
+ ) -> Option<mod_api::ItemStack> {
+-    let block = stack.item().id(host);
++    let block = stack.item().id(host).unwrap_or_default().to_owned();
+     let buffer = item_buffer(&block)?;
+     let mut payload = Compound::new();
+     payload.insert("id".into(), Tag::String(block.as_str().into()));
+@@ -799,6 +802,7 @@ pub(crate) fn declare(registrar: &mut dyn Registrar, name: &str) -> BlockEntityT
+ /// the fuel.
  pub(crate) fn container() -> ModContainer {
      ModContainer {
 +        insert_rules: Vec::new(),
-         slots: SLOT_COUNT,
-         faces: std::array::from_fn(|_| vec![FUEL_SLOT]),
-         inputs: vec![FUEL_SLOT],
-@@ -303,7 +304,7 @@ fn input_ids(host: &dyn Host, items: &[Option<mod_api::ItemStack>]) -> Vec<Strin
+         slots: FURNATOR_SLOTS,
+         faces: std::array::from_fn(|_| vec![CHARGE_SLOT, FUEL_SLOT]),
+         inputs: vec![CHARGE_SLOT, FUEL_SLOT],
+@@ -896,6 +900,7 @@ pub(crate) fn hopper_battery(tier: HopperTier) -> ModEnergyBuffer {
+ pub(crate) fn ender_container() -> ModContainer {
+     let slots: Vec<usize> = (0..ENDER_SLOTS).collect();
+     ModContainer {
++        insert_rules: Vec::new(),
+         slots: ENDER_SLOTS,
+         faces: std::array::from_fn(|_| slots.clone()),
+         inputs: slots.clone(),
+@@ -923,6 +928,7 @@ pub(crate) fn transmitter_battery(tier: crate::runtime::TransmitterTier) -> ModE
+ pub(crate) fn transmitter_container() -> ModContainer {
+     let slots: Vec<usize> = (0..TRANSMITTER_SLOTS).collect();
+     ModContainer {
++        insert_rules: Vec::new(),
+         slots: TRANSMITTER_SLOTS,
+         faces: std::array::from_fn(|_| slots.clone()),
+         inputs: slots.clone(),
+@@ -1287,7 +1293,7 @@ impl EnergyHandler for EnderEnergy {
+ /// answer no handler at all, which is upstream's `getExternalStorage` answering null there — a
+ /// neighbour on those faces sees no energy capability, as `canSurvive` expects.
+ pub(crate) fn ender_capability(
+-    host: &mut dyn ServerHost,
++    host: &dyn mod_api::LevelHost,
+     at: BlockSide,
+     state: mod_api::BlockState,
+     entity: Option<mod_api::BlockEntityRef>,
+@@ -1351,35 +1357,37 @@ impl BlockEntityPart for EnderPart {
+     /// One server tick (`AbstractEnderTile.postTick`): queue the position for the level's move
+     /// phase, absorb an extender item from slot 0 (a cell only), then charge slots 1-2 out of the
+     /// channel.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        crate::starling_tick::run(event, |host, entity, tick_pos| {
+         if let Some(level) = level_now(host) {
+             self.queue
+                 .lock()
+                 .expect("the powah queue lock is held for one insert")
+-                .push(level, event.pos);
++                .push(level, tick_pos);
+         }
+         let Some(tier) = self.tier() else {
+-            *event.reply = BlockEntityTickReply::Unchanged;
++            // (unchanged: nothing is written back)
+             return;
+         };
+-        let resized = event.entity.items.len() != ENDER_SLOTS;
++        let resized = (*entity).items.len() != ENDER_SLOTS;
+         if resized {
+-            event.entity.items.resize(ENDER_SLOTS, None);
++            (*entity).items.resize(ENDER_SLOTS, None);
+         }
+-        let saved = Tag::Compound(std::mem::take(&mut event.entity.nbt));
++        let saved = Tag::Compound(std::mem::take(&mut (*entity).nbt));
+         let key = channel_key(&saved);
+         let mut changed = resized;
+         // `isExtender()`: only an ender cell takes an item into slot 0 (`onSlotChanged`).
+         if matches!(self.kind, Kind::EnderCell(_)) {
+-            changed |= absorb_extender(&mut *host, &mut event.entity.items, key, tier);
++            changed |= absorb_extender(&mut *host, &mut (*entity).items, key, tier);
+         }
+-        changed |= charge_from_channel(&mut *host, &mut event.entity.items, key, tier);
++        changed |= charge_from_channel(&mut *host, &mut (*entity).items, key, tier);
+         if let Tag::Compound(nbt) = saved {
+-            event.entity.nbt = nbt;
++            (*entity).nbt = nbt;
+         }
+         if !changed {
+-            *event.reply = BlockEntityTickReply::Unchanged;
++            // (unchanged: nothing is written back)
+         }
++    });
+     }
+ }
+ 
+@@ -1399,7 +1407,7 @@ fn absorb_extender(
+     let Some(stack) = items.get(ENDER_EXTENDER_SLOT).and_then(Option::as_ref) else {
+         return false;
+     };
+-    let id = stack.item().id(&*host);
++    let id = stack.item().id(&*host).unwrap_or_default().to_owned();
+     let Some(capacity) = cell_of(&id).map(|cell| cell.capacity) else {
+         return false;
+     };
+@@ -1434,7 +1442,7 @@ fn charge_from_channel(
+     let mut rooms = Vec::with_capacity(ENDER_CHARGE_SLOTS);
+     for slot in first..first + ENDER_CHARGE_SLOTS {
+         rooms.push(items.get(slot).and_then(Option::as_ref).map_or(0, |stack| {
+-            let id = stack.item().id(&*host);
++            let id = stack.item().id(&*host).unwrap_or_default().to_owned();
+             item_buffer(&id).map_or(0, |buffer| {
+                 // The item's own capability caps one call too (`Info.maxInsert`), and the pass's
+                 // per-slot limit and the room are both minima, so the cap folds into the room.
+@@ -1570,7 +1578,7 @@ fn input_ids(host: &dyn Host, items: &[Option<mod_api::ItemStack>]) -> Vec<Strin
          .iter()
          .skip(1)
          .flatten()
@@ -113,7 +316,7 @@ index 9893095..e117491 100644
          .collect()
  }
  
-@@ -321,7 +322,7 @@ pub(crate) fn read_orb(
+@@ -1588,7 +1596,7 @@ pub(crate) fn read_orb(
          // `items` with its container, but a freshly placed orb answers before its
          // first tick) reads as empty rather than as a missing orb.
          if let Ok(Some(stack)) = entity.item_slot(&*host, slot) {
@@ -122,7 +325,7 @@ index 9893095..e117491 100644
          }
      }
      let recipe = {
-@@ -339,15 +340,15 @@ pub(crate) fn read_orb(
+@@ -1606,15 +1614,15 @@ pub(crate) fn read_orb(
  /// the buffer the rods fill, and produce when it reaches the recipe's energy. The
  /// payload is left `Changed` only when something was written, so a waiting orb
  /// does not dirty its chunk every tick and a rod's fill survives it.
@@ -143,7 +346,7 @@ index 9893095..e117491 100644
      let ids: Vec<&str> = inputs.iter().map(String::as_str).collect();
      let step = crate::runtime::orb_step(&ids, energy, recorded.as_deref());
      let mut changed = resized;
-@@ -358,8 +359,8 @@ fn orb_tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) ->
+@@ -1625,8 +1633,8 @@ fn orb_tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) ->
              let output = host
                  .item_key(&Identifier::parse(recipe.output).expect("a registry id"))
                  .and_then(|item| mod_api::ItemStack::new(item, recipe.count.unsigned_abs()));
@@ -154,7 +357,7 @@ index 9893095..e117491 100644
              write_string(&mut saved, KEY_RECIPE, NO_RECIPE);
              changed = true;
          }
-@@ -381,7 +382,7 @@ fn orb_tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) ->
+@@ -1648,7 +1656,7 @@ fn orb_tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) ->
          changed = true;
      }
      if let Tag::Compound(nbt) = saved {
@@ -163,7 +366,7 @@ index 9893095..e117491 100644
      }
      changed
  }
-@@ -555,6 +556,7 @@ pub(crate) fn rod_of(block: &str) -> Option<RodTier> {
+@@ -2060,6 +2068,7 @@ pub(crate) fn rod_of(block: &str) -> Option<RodTier> {
  /// allows; there is no menu (no GUI in this port).
  pub(crate) fn orb_container() -> ModContainer {
      ModContainer {
@@ -171,7 +374,7 @@ index 9893095..e117491 100644
          slots: ORB_SLOTS,
          faces: std::array::from_fn(|_| (0..ORB_SLOTS).collect()),
          inputs: (1..ORB_SLOTS).collect(),
-@@ -661,16 +663,16 @@ pub(crate) fn level_now(host: &dyn ServerHost) -> Option<LevelRef> {
+@@ -2166,7 +2175,7 @@ pub(crate) fn level_now(host: &dyn ServerHost) -> Option<LevelRef> {
  
  /// The id of the block at `pos`, if there is one.
  pub(crate) fn block_at(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> Option<String> {
@@ -179,38 +382,69 @@ index 9893095..e117491 100644
 +    level.block(host, pos)?.id(host).map(str::to_owned)
  }
  
- /// The two usages `/powah` declares, both operator-only (level 2). They are
- /// administrative: `set` writes a machine's stored FE and `info` reads its fuel
- /// slot, at coordinates the caller chooses, so they are operator diagnostics
- /// rather than gameplay (review finding 2026-11-18).
+ /// What a solar panel at `pos` reads of the sky, upstream's three reads: `canSeeSky` at the block
+@@ -2189,24 +2198,24 @@ pub(crate) fn sky_at(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> Sky {
+ /// gameplay (review finding 2026-11-18). `channel` and `redstone` are the same kind of control:
+ /// upstream chooses them in the block's GUI, which this port does not have, so each packet's
+ /// effect (`SetChannelPacket`, `NextRedstoneModePacket`) is a command here.
 -pub(crate) fn declare_commands(commands: &mut Vec<Command>) {
 -    commands.push(Command::op("powah info <pos:block_pos>", 2));
 -    commands.push(Command::op("powah set <amount:integer> <pos:block_pos>", 2));
 +pub(crate) fn declare_commands(commands: &mut Vec<mod_api::CommandRegistration>) {
 +    commands.push(Command::op("powah info <pos:block_pos>", 2).executes(crate::starling_executor));
 +    commands.push(Command::op("powah set <amount:integer> <pos:block_pos>", 2).executes(crate::starling_executor));
+     commands.push(Command::op(
+         "powah item <amount:integer> <pos:block_pos>",
+         2,
+-    ));
++    ).executes(crate::starling_executor));
+     commands.push(Command::op(
+         "powah channel <channel:integer> <pos:block_pos>",
+         2,
+-    ));
++    ).executes(crate::starling_executor));
+     // The mode is a literal, one usage per mode, so the dispatcher refuses a word that names no
+     // mode (as `/powah channel` has the dispatcher refuse a non-integer).
+     for mode in crate::runtime::RedstoneMode::ALL {
+         commands.push(Command::op(
+             &format!("powah redstone {} <pos:block_pos>", mode.command_word()),
+             2,
+-        ));
++        ).executes(crate::starling_executor));
+     }
  }
  
- /// A machine's readout, or `None` when no Powah machine stands there. The block id
-@@ -688,7 +690,7 @@ pub(crate) fn info_line(host: &mut dyn ServerHost, pos: [i32; 3]) -> Option<Stri
+@@ -2313,7 +2322,7 @@ fn charge_readout_from(
+                 .item_slot(&*host, u32::try_from(slot).unwrap_or(u32::MAX))
+                 .ok()
+                 .flatten()?;
+-            let item = stack.item().id(&*host).to_owned();
++            let item = stack.item().id(&*host).unwrap_or_default().to_owned();
+             let capacity = item_buffer(&item).map_or(0, |buffer| buffer.capacity);
+             Some((
+                 item,
+@@ -2343,7 +2352,7 @@ pub(crate) fn info_line(host: &mut dyn ServerHost, pos: [i32; 3]) -> Option<Stri
                  .item_slot(&*host, FUEL_SLOT as u32)
                  .ok()
                  .flatten()
 -                .map(|stack| (stack.item().id(&*host), stack.count()));
 +                .map(|stack| (stack.item().id(&*host).unwrap_or_default().to_owned(), stack.count()));
-             (state.energy, state.carbon, fuel)
+             let charge = charge_readout(host, entity, slots);
+             (state.energy, state.carbon, fuel, charge)
          }
-         Kind::Cell(tier) => {
-@@ -792,12 +794,14 @@ impl BlockEntityPart for FurnatorPart {
-     /// then queue this position for the level's move phase. The payload is left
-     /// `Changed` only when something moved, so an idle furnator does not dirty its
-     /// chunk every tick.
+@@ -2579,14 +2588,16 @@ impl BlockEntityPart for FurnatorPart {
+     /// `FurnatorTile.postTick` runs the burn behind `checkRedstone()` and its
+     /// `extractFromSides` (this port's move phase) outside it: a shut gate stops the fuel and the
+     /// carbon, not the FE the buffer already holds.
 -    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
--        let changed = burn(host, event, self.tier);
--        self.enqueue(host, event.pos);
 +    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
 +        crate::starling_tick::run(event, |host, entity, tick_pos| {
-+        let changed = burn(host, entity, tick_pos, self.tier);
+         let open = level_now(host)
+-            .is_none_or(|level| gate_open(&*host, level, event.pos, &event.entity.nbt));
+-        let changed = open && burn(host, event, self.tier);
+-        self.enqueue(host, event.pos);
++            .is_none_or(|level| gate_open(&*host, level, tick_pos, &(*entity).nbt));
++        let changed = open && burn(host, entity, tick_pos, self.tier);
 +        self.enqueue(host, tick_pos);
          if !changed {
 -            *event.reply = BlockEntityTickReply::Unchanged;
@@ -220,10 +454,10 @@ index 9893095..e117491 100644
      }
  }
  
-@@ -841,14 +845,16 @@ impl BlockEntityPart for IdlePart {
- 
-     /// The cell stores its FE in its saved compound and the cable in nothing, so
-     /// neither has a rule of its own: both only queue the move phase.
+@@ -2650,18 +2661,19 @@ impl BlockEntityPart for IdlePart {
+     /// The cell and the rod store their FE in their saved compound and the cable
+     /// stores nothing: their only job is the move phase, plus the cell's item
+     /// charge and the clamp of a buffer that is out of its tier.
 -    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
 +    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
 +        crate::starling_tick::run(event, |host, entity, tick_pos| {
@@ -234,13 +468,202 @@ index 9893095..e117491 100644
 -                .push(level, event.pos);
 +                .push(level, tick_pos);
          }
--        *event.reply = BlockEntityTickReply::Unchanged;
-+        // (unchanged: nothing is written back)
+         let Some(rules) = self.rules else {
+-            *event.reply = BlockEntityTickReply::Unchanged;
++            // (unchanged: nothing is written back)
+             return;
+         };
+-        let mut saved = Tag::Compound(std::mem::take(&mut event.entity.nbt));
++        let mut saved = Tag::Compound(std::mem::take(&mut (*entity).nbt));
+         let before = int(&saved, KEY_ENERGY);
+         let mut energy = crate::runtime::clamp_energy(before, rules.capacity);
+         let charged = charge_items(
+@@ -2669,7 +2681,7 @@ impl BlockEntityPart for IdlePart {
+             rules.slots,
+             energy,
+             rules.transfer,
+-            &mut event.entity.items,
++            &mut (*entity).items,
+         );
+         energy -= charged;
+         let changed = energy != before;
+@@ -2677,11 +2689,12 @@ impl BlockEntityPart for IdlePart {
+             write_int(&mut saved, KEY_ENERGY, energy);
+         }
+         if let Tag::Compound(nbt) = saved {
+-            event.entity.nbt = nbt;
++            (*entity).nbt = nbt;
+         }
+         if !changed {
+-            *event.reply = BlockEntityTickReply::Unchanged;
++            // (unchanged: nothing is written back)
+         }
 +    });
      }
  }
  
-@@ -867,10 +873,12 @@ impl BlockEntityPart for OrbPart {
+@@ -2710,14 +2723,15 @@ impl BlockEntityPart for HopperPart {
+ 
+     /// One server tick: queue this position for the level's move phase (the faced container is
+     /// read there, where every block entity is back in the world) and clamp a doctored buffer.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        crate::starling_tick::run(event, |host, entity, tick_pos| {
+         if let Some(level) = level_now(host) {
+             self.queue
+                 .lock()
+                 .expect("the powah queue lock is held for one insert")
+-                .push(level, event.pos);
++                .push(level, tick_pos);
+         }
+-        let mut saved = Tag::Compound(std::mem::take(&mut event.entity.nbt));
++        let mut saved = Tag::Compound(std::mem::take(&mut (*entity).nbt));
+         let before = int(&saved, KEY_ENERGY);
+         let energy = crate::runtime::clamp_energy(before, self.tier.capacity);
+         let changed = energy != before;
+@@ -2725,11 +2739,12 @@ impl BlockEntityPart for HopperPart {
+             write_int(&mut saved, KEY_ENERGY, energy);
+         }
+         if let Tag::Compound(nbt) = saved {
+-            event.entity.nbt = nbt;
++            (*entity).nbt = nbt;
+         }
+         if !changed {
+-            *event.reply = BlockEntityTickReply::Unchanged;
++            // (unchanged: nothing is written back)
+         }
++    });
+     }
+ }
+ 
+@@ -2757,20 +2772,22 @@ impl BlockEntityPart for SolarPart {
+ 
+     /// One server tick: queue this position for the level's move phase, then charge the slot and
+     /// produce from the sky (`SolarTile.postTick`).
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        crate::starling_tick::run(event, |host, entity, tick_pos| {
+         if let Some(level) = level_now(host) {
+             self.queue
+                 .lock()
+                 .expect("the powah queue lock is held for one insert")
+-                .push(level, event.pos);
++                .push(level, tick_pos);
+         }
+         // `SolarTile.postTick` runs its generation behind `checkRedstone()`, after the item charge
+         // and `extractFromSides`: a shut gate stops the panel making FE, not the FE it holds.
+         let open = level_now(host)
+-            .is_none_or(|level| gate_open(&*host, level, event.pos, &event.entity.nbt));
+-        if !solar_tick(host, event, self.tier, open) {
+-            *event.reply = BlockEntityTickReply::Unchanged;
++            .is_none_or(|level| gate_open(&*host, level, tick_pos, &(*entity).nbt));
++        if !solar_tick(host, entity, tick_pos, self.tier, open) {
++            // (unchanged: nothing is written back)
+         }
++    });
+     }
+ }
+ 
+@@ -2779,15 +2796,15 @@ impl BlockEntityPart for SolarPart {
+ /// it is daylight. Answers whether anything changed.
+ fn solar_tick(
+     host: &mut dyn ServerHost,
+-    event: &mut BlockEntityTickEvent<'_>,
++    entity: &mut crate::starling_tick::OldEntity, tick_pos: [i32; 3],
+     tier: SolarTier,
+     open: bool,
+ ) -> bool {
+-    let resized = event.entity.items.len() != SOLAR_SLOTS;
++    let resized = (*entity).items.len() != SOLAR_SLOTS;
+     if resized {
+-        event.entity.items.resize(SOLAR_SLOTS, None);
++        (*entity).items.resize(SOLAR_SLOTS, None);
+     }
+-    let mut saved = Tag::Compound(std::mem::take(&mut event.entity.nbt));
++    let mut saved = Tag::Compound(std::mem::take(&mut (*entity).nbt));
+     let before = clamp_energy(int(&saved, KEY_ENERGY), tier.capacity);
+     let mut energy = before;
+     let charged = charge_items(
+@@ -2795,14 +2812,14 @@ fn solar_tick(
+         SOLAR_SLOTS,
+         energy,
+         tier.transfer,
+-        &mut event.entity.items,
++        &mut (*entity).items,
+     );
+     energy -= charged;
+     let produced = match (open, level_now(host)) {
+         (true, Some(level)) => crate::runtime::solar_production(
+             energy,
+             tier,
+-            sky_at(&*host, level, event.pos),
++            sky_at(&*host, level, tick_pos),
+             // Upstream's Lens of Ender stands in for the sky; the item and the panel's upgrade
+             // slot are not ported (see `notes.md`), so no panel this port places has one.
+             false,
+@@ -2815,7 +2832,7 @@ fn solar_tick(
+         write_int(&mut saved, KEY_ENERGY, energy);
+     }
+     if let Tag::Compound(nbt) = saved {
+-        event.entity.nbt = nbt;
++        (*entity).nbt = nbt;
+     }
+     resized || charged > 0 || produced > 0
+ }
+@@ -2845,14 +2862,14 @@ impl BlockEntityPart for TransmitterPart {
+     /// `checkRedstone()` — spend the tier's rate on the inventory of the player the card in slot 0
+     /// names, out of that buffer. A shut gate leaves the buffer alone: upstream returns before it
+     /// reads the card at all.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        crate::starling_tick::run(event, |host, entity, tick_pos| {
+         let open = level_now(host)
+-            .is_none_or(|level| gate_open(&*host, level, event.pos, &event.entity.nbt));
+-        let mut saved = Tag::Compound(std::mem::take(&mut event.entity.nbt));
++            .is_none_or(|level| gate_open(&*host, level, tick_pos, &(*entity).nbt));
++        let mut saved = Tag::Compound(std::mem::take(&mut (*entity).nbt));
+         let before = int(&saved, KEY_ENERGY);
+         let mut energy = crate::runtime::clamp_energy(before, self.tier.capacity);
+-        let card = event
+-            .entity
++        let card = (*entity)
+             .items
+             .get(TRANSMITTER_CARD_SLOT)
+             .and_then(Option::as_ref);
+@@ -2867,11 +2884,12 @@ impl BlockEntityPart for TransmitterPart {
+             write_int(&mut saved, KEY_ENERGY, energy);
+         }
+         if let Tag::Compound(nbt) = saved {
+-            event.entity.nbt = nbt;
++            (*entity).nbt = nbt;
+         }
+         if !changed {
+-            *event.reply = BlockEntityTickReply::Unchanged;
++            // (unchanged: nothing is written back)
+         }
++    });
+     }
+ }
+ 
+@@ -2891,7 +2909,7 @@ fn charge_bound_player(
+     let Some(card) = card else {
+         return 0;
+     };
+-    if card.item().id(&*host) != BINDING_CARD {
++    if card.item().id(&*host).unwrap_or_default() != BINDING_CARD {
+         return 0;
+     }
+     let Some(bound) = bound_player_of(card) else {
+@@ -2983,7 +3001,7 @@ impl ItemPart for CardPart {
+             return Some(InteractionResult::Pass);
+         }
+         let player = host.player(event.player)?;
+-        let name = player.name(&*host)?;
++        let name = player.name(&*host)?.to_owned();
+         let slot = hand_slot(&*host, player, event.hand)?;
+         let mut bound = event.stack.clone();
+         bound
+@@ -3070,10 +3088,12 @@ impl BlockEntityPart for OrbPart {
  
      /// One server tick: the recipe the inputs match, the buffer's value and the
      /// result, as `EnergizingOrbTile` decides them.
@@ -256,19 +679,19 @@ index 9893095..e117491 100644
      }
  }
  
-@@ -878,21 +886,21 @@ impl BlockEntityPart for OrbPart {
- /// production, and the state written back. Answers whether anything changed.
+@@ -3082,21 +3102,21 @@ impl BlockEntityPart for OrbPart {
+ /// written back. Answers whether anything changed.
  fn burn(
      host: &mut dyn ServerHost,
 -    event: &mut BlockEntityTickEvent<'_>,
 +    entity: &mut crate::starling_tick::OldEntity, tick_pos: [i32; 3],
      tier: FurnatorTier,
  ) -> bool {
--    let resized = event.entity.items.len() != SLOT_COUNT;
-+    let resized = (*entity).items.len() != SLOT_COUNT;
+-    let resized = event.entity.items.len() != FURNATOR_SLOTS;
++    let resized = (*entity).items.len() != FURNATOR_SLOTS;
      if resized {
--        event.entity.items.resize(SLOT_COUNT, None);
-+        (*entity).items.resize(SLOT_COUNT, None);
+-        event.entity.items.resize(FURNATOR_SLOTS, None);
++        (*entity).items.resize(FURNATOR_SLOTS, None);
      }
 -    let mut saved = Tag::Compound(std::mem::take(&mut event.entity.nbt));
 +    let mut saved = Tag::Compound(std::mem::take(&mut (*entity).nbt));
@@ -283,15 +706,59 @@ index 9893095..e117491 100644
          };
          let burn_time = fuel.peek();
          if state.load_fuel(burn_time) {
-@@ -903,19 +911,19 @@ fn burn(
-     let produced = state.tick(tier) > 0;
+@@ -3112,12 +3132,12 @@ fn burn(
+         kind_item_slots(Kind::Furnator(tier)),
+         state.energy,
+         tier.transfer,
+-        &mut event.entity.items,
++        &mut (*entity).items,
+     );
+     state.energy -= charged;
      write(&mut saved, &state);
      if let Tag::Compound(nbt) = saved {
 -        event.entity.nbt = nbt;
 +        (*entity).nbt = nbt;
      }
-     resized || took || produced
+     resized || took || produced || charged > 0
  }
+@@ -3144,7 +3164,7 @@ fn charge_items(
+         let Some(stack) = items[slot].as_ref() else {
+             continue;
+         };
+-        let id = stack.item().id(host);
++        let id = stack.item().id(host).unwrap_or_default().to_owned();
+         let Some(buffer) = item_buffer(&id) else {
+             continue;
+         };
+@@ -3221,9 +3241,15 @@ pub(crate) fn on_block_drops(level: &dyn LevelHost, event: &mut BlockDropsEvent<
+     let Some(item) = item_of(block) else {
+         return Flow::Continue;
+     };
+-    for drop in event.drops.iter_mut() {
+-        if drop.stack.item() == item {
+-            let _ = drop.stack.apply_components(&patch);
++    for i in 0..event.drops.len() {
++        let Some(mut stack) = event.drops.get(i).and_then(|d| d.stack()).and_then(|s| s.project()) else {
++            continue;
++        };
++        if stack.item() == item
++            && stack.apply_components(&patch).is_ok()
++            && let Some(mut drop) = event.drops.get_mut(i)
++        {
++            let _ = drop.set_stack(stack);
+         }
+     }
+     Flow::Continue
+@@ -3456,7 +3482,7 @@ pub(crate) fn set_item_energy(
+     let Ok(Some(stack)) = entity.item_slot(&*host, CHARGE_SLOT as u32) else {
+         return SetItemOutcome::NotChargeable;
+     };
+-    let item = stack.item().id(&*host).to_owned();
++    let item = stack.item().id(&*host).unwrap_or_default().to_owned();
+     let Some(buffer) = item_buffer(&item) else {
+         return SetItemOutcome::NotChargeable;
+     };
+@@ -3493,12 +3519,12 @@ pub(crate) fn set_item_energy(
  
  /// The fuel slot, as `AbstractGeneratorBlock.initBurn` reads it: the item's
  /// smelting burn time and the shrink (or the crafting remainder) that takes it.
@@ -306,13 +773,13 @@ index 9893095..e117491 100644
 +impl FuelSlot<'_> {
      /// The burn time the item in the fuel slot gives, 0 when there is none.
      fn peek(&self) -> u32 {
-         let Some(Some(stack)) = self.entity.items.first() else {
+         let Some(Some(stack)) = self.entity.items.get(FUEL_SLOT) else {
 diff --git a/powah/src/starling_command.rs b/src/starling_command.rs
 new file mode 100644
-index 0000000..9198ea5
+index 0000000..894f55f
 --- /dev/null
 +++ b/src/starling_command.rs
-@@ -0,0 +1,25 @@
+@@ -0,0 +1,31 @@
 +//! Starling's port to Sunrise's API: Horizon's `run_mod_command` hook, which got every command of
 +//! the mod in one event, is a per-usage executor in Sunrise. The old event is rebuilt here around
 +//! the executor's arguments, so the mod's command code runs as it was written.
@@ -322,6 +789,8 @@ index 0000000..9198ea5
 +pub(crate) struct RunModCommandEvent<'a> {
 +    pub command: &'a CommandInvocation,
 +    pub source: &'a CommandSource,
++    /// Whether an earlier mod took the command: in Sunrise each usage has its own executor, so never.
++    pub cancelled: bool,
 +}
 +
 +/// The executor of every usage the mod declares: the old hook's body (`run`), whose `Cancel` was a
@@ -332,7 +801,11 @@ index 0000000..9198ea5
 +    command: &CommandInvocation,
 +    run: fn(&mut dyn ServerHost, &mut RunModCommandEvent<'_>) -> Flow,
 +) -> Option<i32> {
-+    let mut event = RunModCommandEvent { command, source };
++    let mut event = RunModCommandEvent {
++        command,
++        source,
++        cancelled: false,
++    };
 +    match run(host, &mut event) {
 +        Flow::Continue => None,
 +        _ => Some(1),
@@ -340,29 +813,33 @@ index 0000000..9198ea5
 +}
 diff --git a/powah/src/starling_tick.rs b/src/starling_tick.rs
 new file mode 100644
-index 0000000..4de1a43
+index 0000000..16e2c71
 --- /dev/null
 +++ b/src/starling_tick.rs
 @@ -0,0 +1,63 @@
-+//! Starling's port to Sunrise's API: a block entity tick written for Horizon's, which handed the
-+//! tick the block entity's slots, compound and data slots to change in place, runs here on a copy
-+//! of them taken from the tick's view; what it changed is written back and the chunk marked
-+//! unsaved, as Horizon's reply did.
-+use mod_api::{BlockEntityTickEvent, Compound, ItemStack, ServerHost};
++//! Starling's port to Sunrise's API: code written for Horizon's, which handed a block entity's
++//! slots, compound and data slots (`ModBlockEntityFields`) to a tick or a menu button to change in
++//! place, runs here on a copy of them taken from Sunrise's view; what it changed is written back and
++//! the chunk marked unsaved, as Horizon's reply did.
++use mod_api::{BlockEntityScope, BlockEntityTickEvent, ServerHost};
 +
 +/// The block entity as Horizon's tick had it.
-+pub(crate) struct OldEntity {
-+    pub items: Vec<Option<ItemStack>>,
-+    pub nbt: Compound,
-+    pub data: Vec<i32>,
-+}
++pub(crate) type OldEntity = mod_api::item::containers::ModBlockEntityFields;
 +
 +/// Run `body` on a copy of the ticking block entity (its host, the copy, its position).
 +pub(crate) fn run(
 +    event: &mut BlockEntityTickEvent<'_>,
 +    body: impl FnOnce(&mut dyn ServerHost, &mut OldEntity, [i32; 3]),
 +) {
-+    let Some((handle, pos, before)) = event.subject.with_view(|view| {
++    run_scope(&mut event.subject, body);
++}
++
++/// Run `body` on a copy of the block entity `subject` lends (a tick's, a menu button's).
++pub(crate) fn run_scope(
++    subject: &mut BlockEntityScope<'_>,
++    body: impl FnOnce(&mut dyn ServerHost, &mut OldEntity, [i32; 3]),
++) {
++    let Some((handle, pos, before)) = subject.with_view(|view| {
 +        let items = (0..view.item_slots() as u32)
 +            .map(|slot| view.item_slot(slot).and_then(|stack| stack.to_owned()))
 +            .collect();
@@ -375,14 +852,10 @@ index 0000000..4de1a43
 +    }) else {
 +        return;
 +    };
-+    let mut after = OldEntity {
-+        items: before.items.clone(),
-+        nbt: before.nbt.clone(),
-+        data: before.data.clone(),
-+    };
-+    body(event.subject.host(), &mut after, pos);
++    let mut after = before.clone();
++    body(subject.host(), &mut after, pos);
 +    let mut changed = false;
-+    event.subject.with_view(|mut view| {
++    subject.with_view(|mut view| {
 +        for (key, value) in after.nbt.iter() {
 +            if before.nbt.get(key) != Some(value) && view.set_nbt(key.clone(), Some(value.clone())) {
 +                changed = true;
@@ -404,6 +877,6 @@ index 0000000..4de1a43
 +        }
 +    });
 +    if changed {
-+        let _ = handle.set_changed(event.subject.host());
++        let _ = handle.set_changed(subject.host());
 +    }
 +}

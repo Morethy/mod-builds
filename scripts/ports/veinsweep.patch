@@ -1,8 +1,13 @@
 diff --git a/src/lib.rs b/src/lib.rs
-index 32dcb43..68036e2 100644
+index cd39fac..8e97cc7 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -8,7 +8,7 @@
+@@ -5,10 +5,12 @@
+ // `BreakBlockEvent`）；连锁破坏使用 `PlayerRef::destroy_block`，走游戏自己的
+ // `ServerPlayerGameMode.destroyBlock`：权限、工具判定、掉落、耐久、统计/经验、
+ // 粒子和音效都与手动挖一块完全一致。
++mod starling_command;
++use crate::starling_command::RunModCommandEvent;
  use mod_api::{
      self, BreakBlockEvent, ClientHost, ClientTickPostEvent, Command, CommandArgumentValue,
      CommandSource, Flow, Hooks, Host, HostBlockStates, KeyConflictContext, KeyRegistration,
@@ -11,28 +16,24 @@ index 32dcb43..68036e2 100644
      SettingSpec, Text,
  };
  use std::collections::{HashSet, VecDeque};
-@@ -140,7 +140,9 @@ impl Hooks for VeinSweep {
+@@ -135,7 +137,7 @@ impl Hooks for VeinSweep {
      fn client_tick_post(&self, host: &mut dyn ClientHost, _event: &mut ClientTickPostEvent) {
          // 只有“正在游玩、且没有打开界面”时才把按键算作按下；
          // 其余时候清零，避免退出界面后残留按下状态。
 -        let held = host.on(ID) && host.playing() && host.is_down(ID, TRIGGER_MAPPING);
-+        let held = host.on(ID) && host.playing() && host
-+                .mod_key_mapping(ID, TRIGGER_MAPPING)
-+                .is_ok_and(|key| key.is_down(&*host).unwrap_or(false));
++        let held = host.on(ID) && host.playing() && host.mod_key_mapping(ID, TRIGGER_MAPPING).is_ok_and(|m| m.is_down(&*host).unwrap_or(false));
          TRIGGER_HELD.store(held, Ordering::Relaxed);
          // 用 UUID 记住按键属于本机哪名玩家：客户端读不到玩家名，UUID 两端一致。
          let owner = if held {
-@@ -154,49 +156,22 @@ impl Hooks for VeinSweep {
-     }
- 
-     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
--        event.commands.push(Command::op(
--            "veinsweep blacklist add <block:resource:minecraft:block>",
--            2,
+@@ -152,46 +154,13 @@ impl Hooks for VeinSweep {
+         event.commands.push(Command::op(
+             "veinsweep blacklist add <block:resource:minecraft:block>",
+             2,
 -        ));
--        event.commands.push(Command::op(
--            "veinsweep blacklist remove <block:resource:minecraft:block>",
--            2,
++        ).executes(crate::starling_executor));
+         event.commands.push(Command::op(
+             "veinsweep blacklist remove <block:resource:minecraft:block>",
+             2,
 -        ));
 -        event.commands.push(Command::new("veinsweep blacklist list"));
 -        event.commands.push(Command::op("veinsweep blacklist clear", 2));
@@ -69,26 +70,13 @@ index 32dcb43..68036e2 100644
 -            }
 -        }
 -        Flow::Cancel
-+        event.commands.push(
-+            Command::op(
-+                "veinsweep blacklist add <block:resource:minecraft:block>",
-+                2,
-+            )
-+            .executes(run_command),
-+        );
-+        event.commands.push(
-+            Command::op(
-+                "veinsweep blacklist remove <block:resource:minecraft:block>",
-+                2,
-+            )
-+            .executes(run_command),
-+        );
-+        event.commands.push(Command::new("veinsweep blacklist list").executes(run_command));
-+        event.commands.push(Command::op("veinsweep blacklist clear", 2).executes(run_command));
++        ).executes(crate::starling_executor));
++        event.commands.push(Command::new("veinsweep blacklist list").executes(crate::starling_executor));
++        event.commands.push(Command::op("veinsweep blacklist clear", 2).executes(crate::starling_executor));
      }
  
      fn break_block(
-@@ -237,7 +212,7 @@ impl Hooks for VeinSweep {
+@@ -232,7 +201,7 @@ impl Hooks for VeinSweep {
  
          // 连锁只由「触发条件 + 破坏方块」触发，与手里拿着什么无关；
          // 并且只在**同种方块**内部扩散：按方块 ID 比较（忽略朝向等状态）。
@@ -97,65 +85,105 @@ index 32dcb43..68036e2 100644
          let blacklist = blacklist(host);
          if blacklist.contains(&origin) {
              return Flow::Continue;
-@@ -330,7 +305,7 @@ fn can_chain(
+@@ -322,7 +291,7 @@ fn can_chain(
      {
          return false;
      }
 -    state.block().id(host) == origin
-+    state.block().id(host) == Some(origin)
++    state.block().id(host).unwrap_or_default() == origin
  }
  
  /// 矿脉模式：固定 26 向 BFS，把整条同种矿脉挖完（上限是硬约束）。
-@@ -552,6 +527,39 @@ fn setting_number(host: &dyn Host, key: &str, default: f64) -> f64 {
- 
- /// 触发键状态是否属于这次破坏的玩家。
- ///
-+fn run_command(
-+    host: &mut dyn ServerHost,
-+    source: &CommandSource,
-+    command: &mod_api::CommandInvocation,
-+) -> Option<i32> {
-+    if command.literals.first().map(String::as_str) != Some(ID) {
-+        return None;
-+    }
-+    let action = command.literals.get(2).map(String::as_str).unwrap_or("");
-+    let reply = match action {
-+        "add" => match command.argument("block") {
-+            Some(CommandArgumentValue::Id(block)) => add_block(host, &block.to_string()),
-+            _ => Text::translate("veinsweep.command.usage.add", Vec::new()),
-+        },
-+        "remove" => match command.argument("block") {
-+            Some(CommandArgumentValue::Id(block)) => remove_block(host, &block.to_string()),
-+            _ => Text::translate("veinsweep.command.usage.remove", Vec::new()),
-+        },
-+        "list" => list_blocks(host),
-+        "clear" => clear_blocks(host),
-+        _ => Text::translate("veinsweep.command.usage", Vec::new()),
-+    };
-+    match source {
-+        CommandSource::Player { player, .. } => {
-+            let _ = player.tell(host, reply);
-+        }
-+        _ => {
-+            let _ = host.commands().feedback(reply);
-+        }
-+    }
-+    Some(1)
-+}
-+
- /// 客户端只采样本机玩家的按键；LAN 里服务端会收到其他玩家的破坏事件，
- /// 这里用玩家 UUID 把触发限定在本机玩家身上，避免主机的按键带动别人。
- fn trigger_owner_is(player: mod_api::PlayerRef) -> bool {
-@@ -565,10 +573,8 @@ fn trigger_owner_is(player: mod_api::PlayerRef) -> bool {
+@@ -554,8 +523,7 @@ fn trigger_owner_is(player: mod_api::PlayerRef) -> bool {
+ /// 主手物品；空格或空气视为空手。
  fn hand_stack(host: &dyn Host, player: mod_api::PlayerRef) -> Option<mod_api::ItemStack> {
      let slot = player.selected_slot(host)? as u32;
-     player
+-    player
 -        .inventory_slots(host)?
--        .into_iter()
--        .find(|(index, _)| *index == slot)
--        .map(|(_, stack)| stack)
-+        .with_inventory(host, |view| view.get(slot).and_then(|stack| stack.project()))
-+        .flatten()
++    player.with_inventory(host, |view| view.iter().filter_map(|(slot, stack)| stack.project().map(|stack| (slot, stack))).collect::<Vec<_>>())?
+         .into_iter()
+         .find(|(index, _)| *index == slot)
+         .map(|(_, stack)| stack)
+@@ -685,3 +653,45 @@ fn clear_blocks(host: &mut dyn ServerHost) -> Text {
+     *lock_cache() = Some(Arc::new(HashSet::new()));
+     Text::translate("veinsweep.command.cleared", Vec::new())
  }
- 
- /// 剩余耐久是否仍高于保留值；没有耐久概念的物品（或空手）直接放行。
++
++/// Starling's port: the old `run_mod_command` hook's body.
++pub(crate) fn starling_run_mod_command(
++    host: &mut dyn ServerHost,
++    event: &mut crate::starling_command::RunModCommandEvent<'_>,
++) -> Flow {
++        if event.command.literals.first().map(String::as_str) != Some(ID) {
++            return Flow::Continue;
++        }
++        let action = event.command.literals.get(2).map(String::as_str).unwrap_or("");
++        let reply = match action {
++            "add" => match event.command.argument("block") {
++                Some(CommandArgumentValue::Id(block)) => add_block(host, &block.to_string()),
++                _ => Text::translate("veinsweep.command.usage.add", Vec::new()),
++            },
++            "remove" => match event.command.argument("block") {
++                Some(CommandArgumentValue::Id(block)) => remove_block(host, &block.to_string()),
++                _ => Text::translate("veinsweep.command.usage.remove", Vec::new()),
++            },
++            "list" => list_blocks(host),
++            "clear" => clear_blocks(host),
++            _ => Text::translate("veinsweep.command.usage", Vec::new()),
++        };
++        match event.source {
++            CommandSource::Player { player, .. } => {
++                let _ = player.tell(host, reply);
++            }
++            _ => {
++                let _ = host.commands().feedback(reply);
++            }
++        }
++        Flow::Cancel
++    }
++
++/// Starling's port: every declared usage runs the old hook's body.
++pub(crate) fn starling_executor(
++    host: &mut dyn ServerHost,
++    source: &mod_api::CommandSource,
++    command: &mod_api::CommandInvocation,
++) -> Option<i32> {
++    crate::starling_command::execute(host, source, command, starling_run_mod_command)
++}
+diff --git a/veinsweep/src/starling_command.rs b/src/starling_command.rs
+new file mode 100644
+index 0000000..894f55f
+--- /dev/null
++++ b/src/starling_command.rs
+@@ -0,0 +1,31 @@
++//! Starling's port to Sunrise's API: Horizon's `run_mod_command` hook, which got every command of
++//! the mod in one event, is a per-usage executor in Sunrise. The old event is rebuilt here around
++//! the executor's arguments, so the mod's command code runs as it was written.
++use mod_api::{CommandInvocation, CommandSource, Flow, ServerHost};
++
++/// Horizon's `RunModCommandEvent`: the parsed command and who ran it.
++pub(crate) struct RunModCommandEvent<'a> {
++    pub command: &'a CommandInvocation,
++    pub source: &'a CommandSource,
++    /// Whether an earlier mod took the command: in Sunrise each usage has its own executor, so never.
++    pub cancelled: bool,
++}
++
++/// The executor of every usage the mod declares: the old hook's body (`run`), whose `Cancel` was a
++/// command it ran and `Continue` one it did not.
++pub(crate) fn execute(
++    host: &mut dyn ServerHost,
++    source: &CommandSource,
++    command: &CommandInvocation,
++    run: fn(&mut dyn ServerHost, &mut RunModCommandEvent<'_>) -> Flow,
++) -> Option<i32> {
++    let mut event = RunModCommandEvent {
++        command,
++        source,
++        cancelled: false,
++    };
++    match run(host, &mut event) {
++        Flow::Continue => None,
++        _ => Some(1),
++    }
++}
