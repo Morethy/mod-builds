@@ -110,28 +110,109 @@ def sunrise_game(source):
     return (source / "crates" / "sunrise-mod-api").is_dir()
 
 
-def adopted(hmod, folder, into):
-    """The package as a Sunrise game builds it: a Horizon package (`folder`, unpacked) renamed into `into`, a
-    Sunrise one as it is."""
-    if (folder / "sunrise-mod.toml").is_file() or not (folder / "horizon-mod.toml").is_file():
+def apply_port(files, patch):
+    """`files` (name -> bytes) with the unified diff `patch` applied, or None when it does not apply exactly:
+    another version of the mod, or one its author ported already."""
+    out, name, lines, at, delta = dict(files), None, None, 0, 0
+    rows = patch.split(b"\n")
+    i = 0
+
+    def flush():
+        if name is not None and lines is not None:
+            out[name] = b"".join(lines)
+
+    while i < len(rows):
+        row = rows[i]
+        if row.startswith(b"--- "):
+            flush()
+            old = row[4:].strip().decode("utf-8", "replace")
+            fresh = rows[i + 1][4:].strip().decode("utf-8", "replace") if i + 1 < len(rows) else ""
+            i += 2
+            if fresh == "/dev/null":
+                if old[2:] not in out:
+                    return None
+                del out[old[2:]]
+                name, lines = None, None
+                continue
+            name = fresh[2:]
+            if old == "/dev/null":
+                lines = []
+            elif name in out:
+                lines = out[name].splitlines(keepends=True)
+            else:
+                return None
+            delta = 0
+            continue
+        if row.startswith(b"@@ ") and lines is not None:
+            try:
+                begin = int(row.split(b" ")[1].split(b",")[0][1:])
+            except (IndexError, ValueError):
+                return None
+            at = max(begin - 1, 0) + delta
+            i += 1
+            while i < len(rows) and rows[i][:1] in (b" ", b"+", b"-", b"\\"):
+                kind, body = rows[i][:1], rows[i][1:] + b"\n"
+                if kind == b"\\":
+                    # "No newline at end of file": the line before it has none.
+                    if rows[i - 1][:1] == b"+" and at > 0:
+                        lines[at - 1] = lines[at - 1].rstrip(b"\n")
+                    i += 1
+                    continue
+                if kind == b"+":
+                    lines.insert(at, body)
+                    at += 1
+                    delta += 1
+                else:
+                    if at >= len(lines) or lines[at].rstrip(b"\n") != body.rstrip(b"\n"):
+                        return None
+                    if kind == b"-":
+                        del lines[at]
+                        delta -= 1
+                    else:
+                        at += 1
+                i += 1
+            continue
+        i += 1
+    flush()
+    return out
+
+
+def adopted(hmod, folder, into, mod):
+    """The package as a Sunrise game builds it: a Horizon package (`folder`, unpacked) renamed as the game renames
+    it when it installs one, and Starling's port of the mod (scripts/ports/<id>.patch: what Sunrise's API changed
+    since the mod was written) applied when it applies. The package itself when neither changes it."""
+    horizon = (folder / "horizon-mod.toml").is_file() and not (folder / "sunrise-mod.toml").is_file()
+    port = pathlib.Path(__file__).resolve().parent / "ports" / f"{mod}.patch"
+    if not horizon and not port.is_file():
         return hmod
-    with zipfile.ZipFile(hmod) as old, zipfile.ZipFile(into, "w", zipfile.ZIP_DEFLATED) as new:
+    files = {}
+    with zipfile.ZipFile(hmod) as old:
         for entry in old.infolist():
             if entry.is_dir():
                 continue
             name, data = entry.filename, old.read(entry)
-            if name == "horizon-mod.toml":
+            if horizon and name == "horizon-mod.toml":
                 native, lines = False, []
                 for line in data.decode("utf-8").splitlines(keepends=True):
                     if line.lstrip().startswith("["):
                         native = line.lstrip().startswith("[native]")
                     lines.append(PIN.sub(r"\1sunrise\2", line) if native else line)
                 name, data = "sunrise-mod.toml", "".join(lines).encode("utf-8")
-            elif name == "Cargo.toml" or (name.startswith("src/") and name.endswith(".rs")):
+            elif horizon and (name == "Cargo.toml" or (name.startswith("src/") and name.endswith(".rs"))):
                 try:
                     data = RENAMED.sub("sunrise", data.decode("utf-8")).replace(".horizon/", ".sunrise/").encode("utf-8")
                 except UnicodeDecodeError:
                     pass
+            files[name] = data
+    if port.is_file():
+        ported = apply_port(files, port.read_bytes())
+        if ported is None:
+            print(f"{mod}: Starling's port does not apply to this package; built as it is", flush=True)
+        else:
+            files = ported
+            print(f"{mod}: built with Starling's port", flush=True)
+    with zipfile.ZipFile(into, "w", zipfile.ZIP_DEFLATED) as new:
+        for name, data in files.items():
             new.writestr(name, data)
     return into
 
@@ -205,7 +286,7 @@ def build_one(row, mods, source, result, build, profile):
         status.update(id=mod, version=version)
         cargo = native_of(folder, manifest)
         check(manifest, cargo, folder)
-        package = adopted(hmod, folder, work / f"{mod}.smod") if sunrise_game(source) else hmod
+        package = adopted(hmod, folder, work / f"{mod}.smod", mod) if sunrise_game(source) else hmod
         if package != hmod:
             cargo = tomllib.loads(RENAMED.sub("sunrise", (folder / "Cargo.toml").read_text()))
         command = [sys.executable, str(source / "tools" / "android_native_sdk.py"), "mods", str(out), str(package),
