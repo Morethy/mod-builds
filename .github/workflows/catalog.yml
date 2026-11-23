@@ -46,10 +46,15 @@ jobs:
           name: plan
           path: plan.json
           retention-days: 1
+  # Four runners, each a quarter of the plan (every fourth job): a full catalog took 35-40 minutes on one.
   build:
     needs: plan
     if: needs.plan.outputs.count != '0'
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     timeout-minutes: 300
     env:
       BUILD: ${{ inputs.build || vars.CATALOG_BUILD }}
@@ -62,6 +67,11 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: plan
+      - name: This runner's quarter of the plan
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          python3 -I -c 'import json,os,sys; p=json.load(open("plan.json")); n=int(os.environ["SHARD"]); json.dump(p[n::4], open("plan.json","w"), indent=1); print(len(p[n::4]), "of", len(p))'
       - name: The build's profile
         run: python3 scripts/store.py env
       - name: Make room
@@ -87,7 +97,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: result
+          name: result-${{ matrix.shard }}
           path: result/
           retention-days: 1
           compression-level: 1
@@ -112,7 +122,8 @@ jobs:
       - uses: actions/download-artifact@v4
         continue-on-error: true
         with:
-          name: result
+          pattern: result-*
+          merge-multiple: true
           path: result/
       - name: The answers
         run: python3 scripts/store.py publish result
