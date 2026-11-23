@@ -1,0 +1,511 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 65b75c3..d97cf00 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -9,17 +9,20 @@
+ //! later the item in slot 1 gains one level, up to 256. The block's level is seeded from the item
+ //! it was placed from, so an infused machine infuses more cheaply. The block, its item and the
+ //! machine family are the carried content in `assets/` and `data/` of this same package.
++mod starling_tick;
++mod starling_command;
++mod starling_screen;
+ pub mod runtime;
+ 
+ use std::array;
+ 
++use crate::starling_command::RunModCommandEvent;
++use crate::starling_screen::{Screen, ScreenEvent, ScreenDrawEvent};
+ use mod_api::{
+-    self, BlockEntityPart, BlockEntityRef, BlockEntityTickEvent, BlockEntityTickReply,
+-    BlockEntityTicksEvent, BlockPart, ClientHost, Command, CommandArgumentValue, CommandSource,
++    self, BlockEntityPart, BlockEntityRef, BlockEntityTickEvent, BlockEntityTicksEvent, BlockPart, ClientHost, Command, CommandArgumentValue, CommandSource,
+     ComponentTypesEvent, Compound, DimensionKey, Flow, Hooks, Host, HostTransaction, Identifier,
+     ItemPart, ItemStack, LevelRef, ModContainer, ModEnergyBuffer, OnBlockPlacedByEvent, PlayerRef,
+-    RegisterCommandsEvent, Registrar, RegistrationContext, RunModCommandEvent, Screen,
+-    ScreenDrawEvent, ScreenEvent, ServerHost, Tag, Text, TooltipEvent,
++    RegisterCommandsEvent, Registrar, RegistrationContext, ServerHost, Tag, Text, TooltipEvent,
+ };
+ 
+ use runtime::{CAPACITY, INFUSING_TICKS, MAX_INFUSE, MAX_INSERT, Machine};
+@@ -63,6 +66,7 @@ struct MachineItem;
+ /// (`MachineInfuserTileEntity`'s `WorldlyContainer`).
+ fn container() -> ModContainer {
+     ModContainer {
++        insert_rules: Vec::new(),
+         slots: SLOT_COUNT,
+         faces: array::from_fn(|_| vec![SHARD_SLOT, TARGET_SLOT]),
+         inputs: vec![SHARD_SLOT, TARGET_SLOT],
+@@ -111,15 +115,18 @@ impl BlockEntityPart for MachinePart {
+     }
+ 
+     /// One server tick: count an infusion down, or start one.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        infusion_tick(host, event);
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        crate::starling_tick::run(event, |host, entity, pos| infusion_tick(host, entity, pos));
+     }
+ 
++
++}
++
++impl crate::starling_screen::StarlingScreens for MachinePart {
+     /// The machine's two slots, at upstream's pixels.
+     fn screen(&self, _host: &dyn Host, _event: &mut ScreenEvent<'_>) -> Option<Screen> {
+         Some(screen())
+     }
+-
+     /// The buffer, the block's infused level and the countdown, from the menu's data slots
+     /// `[energy/32, capacity/32, infusing, infused]`.
+     fn screen_draw(&self, _host: &dyn ClientHost, event: &mut ScreenDrawEvent<'_>) {
+@@ -191,41 +198,41 @@ impl ItemPart for MachineItem {
+ 
+ /// One server tick of the machine: read its state, let [`runtime`] decide, and write back only
+ /// what moved (the tick answers `Changed` only then, so an idle machine never dirties the chunk).
+-fn infusion_tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
++fn infusion_tick(host: &mut dyn ServerHost, entity: &mut crate::starling_tick::OldEntity, tick_pos: [i32; 3]) {
+     let mut items_changed = false;
+-    if event.entity.items.len() < SLOT_COUNT {
+-        event.entity.items.resize(SLOT_COUNT, None);
++    if (*entity).items.len() < SLOT_COUNT {
++        (*entity).items.resize(SLOT_COUNT, None);
+         items_changed = true;
+     }
+-    let own_infused = read_int(&event.entity.nbt, KEY_INFUSED).clamp(0, MAX_INFUSE);
++    let own_infused = read_int(&(*entity).nbt, KEY_INFUSED).clamp(0, MAX_INFUSE);
+     let mut machine = Machine::new();
+-    machine.energy = read_int(&event.entity.nbt, KEY_ENERGY).clamp(0, CAPACITY);
+-    machine.infusing = read_int(&event.entity.nbt, KEY_INFUSING).clamp(0, INFUSING_TICKS);
++    machine.energy = read_int(&(*entity).nbt, KEY_ENERGY).clamp(0, CAPACITY);
++    machine.infusing = read_int(&(*entity).nbt, KEY_INFUSING).clamp(0, INFUSING_TICKS);
+     let before = machine;
+-    let has_shard = event.entity.items[SHARD_SLOT]
++    let has_shard = (*entity).items[SHARD_SLOT]
+         .as_ref()
+         .is_some_and(|stack| stack.count() > 0 && is_shard(&*host, stack));
+-    let target = target_level(&*host, &event.entity.items);
++    let target = target_level(&*host, &(*entity).items);
+     let tick = machine.tick(has_shard, target, own_infused);
+     if tick.consumed_shard {
+-        take_shard(&mut event.entity.items);
++        take_shard(&mut (*entity).items);
+         items_changed = true;
+     }
+     if tick.finished {
+-        items_changed |= raise_target(&*host, &mut event.entity.items);
++        items_changed |= raise_target(&*host, &mut (*entity).items);
+     }
+     if machine != before {
+-        write_int(&mut event.entity.nbt, KEY_ENERGY, machine.energy);
+-        write_int(&mut event.entity.nbt, KEY_INFUSING, machine.infusing);
++        write_int(&mut (*entity).nbt, KEY_ENERGY, machine.energy);
++        write_int(&mut (*entity).nbt, KEY_INFUSING, machine.infusing);
+     }
+     let mut data = machine.data_slots().to_vec();
+     data.push(own_infused);
+-    let data_changed = event.entity.data != data;
++    let data_changed = (*entity).data != data;
+     if data_changed {
+-        event.entity.data = data;
++        (*entity).data = data;
+     }
+     if machine == before && !data_changed && !items_changed {
+-        *event.reply = BlockEntityTickReply::Unchanged;
++        // (unchanged: nothing is written back)
+     }
+ }
+ 
+@@ -243,7 +250,7 @@ fn is_shard(host: &dyn Host, stack: &ItemStack) -> bool {
+ /// An infusable machine block item (`BaseBlock.isInfusable`), at any level: the runtime refuses
+ /// 256 itself. Other RFTools mods' machines are not in this port.
+ fn is_infusable(host: &dyn Host, stack: &ItemStack) -> bool {
+-    stack.count() > 0 && stack.item().id(host) == MACHINE_INFUSER
++    stack.count() > 0 && stack.item().id(host).unwrap_or_default() == MACHINE_INFUSER
+ }
+ 
+ /// The infused level of the machine in slot 1, or `None` when the slot holds nothing this port
+@@ -306,13 +313,13 @@ fn write_infused(stack: &mut ItemStack, level: i32) -> bool {
+ 
+ /// The five harness controls. Upstream has none: they let the in-game check read and set a
+ /// machine without a GUI (precedent `/quarryplus info|energy`, `/powah info|set`).
+-fn commands() -> Vec<Command> {
++fn commands() -> Vec<mod_api::CommandRegistration> {
+     vec![
+-        Command::new("rftoolsbase info <pos:block_pos> [nonce:word]"),
+-        Command::op("rftoolsbase energy <pos:block_pos> <amount:integer>", 2),
+-        Command::op("rftoolsbase infused <pos:block_pos> <amount:integer>", 2),
+-        Command::op("rftoolsbase level <pos:block_pos> <amount:integer>", 2),
+-        Command::op("rftoolsbase held <amount:integer>", 2),
++        Command::new("rftoolsbase info <pos:block_pos> [nonce:word]").executes(crate::starling_executor),
++        Command::op("rftoolsbase energy <pos:block_pos> <amount:integer>", 2).executes(crate::starling_executor),
++        Command::op("rftoolsbase infused <pos:block_pos> <amount:integer>", 2).executes(crate::starling_executor),
++        Command::op("rftoolsbase level <pos:block_pos> <amount:integer>", 2).executes(crate::starling_executor),
++        Command::op("rftoolsbase held <amount:integer>", 2).executes(crate::starling_executor),
+     ]
+ }
+ 
+@@ -469,7 +476,7 @@ fn dimension_level(host: &mut dyn ServerHost, dimension: DimensionKey) -> Option
+ /// The machine's block entity at `pos`, if the block there is ours.
+ fn machine_at(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> Option<BlockEntityRef> {
+     let block = level.block(host, pos)?;
+-    if block.id(host) != MACHINE_INFUSER {
++    if block.id(host) != Some(MACHINE_INFUSER) {
+         return None;
+     }
+     host.block_entity(level, pos)
+@@ -481,7 +488,7 @@ fn placed_level(host: &dyn ServerHost, pos: [i32; 3]) -> Option<LevelRef> {
+     host.levels().list_levels().into_iter().find(|level| {
+         level
+             .block(host, pos)
+-            .is_some_and(|b| b.id(host) == MACHINE_INFUSER)
++            .is_some_and(|b| b.id(host) == Some(MACHINE_INFUSER))
+     })
+ }
+ 
+@@ -506,7 +513,7 @@ fn readout(
+     let target = match entity.item_slot(host, TARGET_SLOT as u32).ok().flatten() {
+         Some(stack) => format!(
+             "{} x{} infused {}",
+-            stack.item().id(host),
++            stack.item().id(host).unwrap_or_default(),
+             stack.count(),
+             infused_level(&stack)
+         ),
+@@ -543,7 +550,7 @@ fn readout_line(
+ /// One slot as `item xN`, or `empty`.
+ fn slot_text(host: &dyn Host, stack: Option<ItemStack>) -> String {
+     match stack {
+-        Some(stack) => format!("{} x{}", stack.item().id(host), stack.count()),
++        Some(stack) => format!("{} x{}", stack.item().id(host).unwrap_or_default(), stack.count()),
+         None => "empty".to_owned(),
+     }
+ }
+@@ -574,8 +581,7 @@ fn set_held_level(host: &mut dyn ServerHost, player: PlayerRef, target: i32) ->
+     // the placement reads, so the level has to be on the real stack (an edit of a hand's copy
+     // answered success and left the item unchanged at the 0.2.1 e2e).
+     let slot = u32::try_from(player.selected_slot(&*host)?).ok()?;
+-    let mut stack = player
+-        .inventory_slots(&*host)?
++    let mut stack = player.with_inventory(host, |view| view.iter().filter_map(|(slot, stack)| stack.project().map(|stack| (slot, stack))).collect::<Vec<_>>())?
+         .into_iter()
+         .find(|(at, _)| *at == slot)
+         .map(|(_, stack)| stack)?;
+@@ -633,6 +639,7 @@ struct Mod;
+ impl Hooks for Mod {
+     /// Declare the machine's block entity type, its two slots, its FE buffer and its item Part.
+     fn register(&self, r: &mut dyn Registrar, _context: &RegistrationContext) {
++        crate::starling_screen::register(r, MENU, MachinePart);
+         let machine = r.block_key(MACHINE_INFUSER);
+         let kind = r
+             .block_entity_type(MACHINE_TYPE)
+@@ -648,22 +655,13 @@ impl Hooks for Mod {
+     /// Register `rftoolsbase:infused`, the item component the machine's level travels in. The
+     /// content is refused at load when this id is unknown, so it must be pushed here.
+     fn component_types(&self, _context: &RegistrationContext, event: &mut ComponentTypesEvent<'_>) {
+-        event.types.push(COMPONENT_INFUSED.to_owned());
++        event.register(COMPONENT_INFUSED.to_owned().into());
+     }
+ 
+     /// `/rftoolsbase info|energy|infused|level|held`: the harness controls.
+     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+         event.commands.extend(commands());
+     }
+-
+-    /// The bodies of those commands, on the already-parsed invocation.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        run_command(host, event)
+-    }
+ }
+ 
+ #[cfg(test)]
+@@ -751,3 +749,20 @@ mod tests {
+         assert!(commands[1..].iter().all(|command| command.level == 2));
+     }
+ }
++
++/// Starling's port: the old `run_mod_command` hook's body.
++pub(crate) fn starling_run_mod_command(
++    host: &mut dyn ServerHost,
++    event: &mut crate::starling_command::RunModCommandEvent<'_>,
++) -> Flow {
++        run_command(host, event)
++    }
++
++/// Starling's port: every declared usage runs the old hook's body.
++pub(crate) fn starling_executor(
++    host: &mut dyn ServerHost,
++    source: &mod_api::CommandSource,
++    command: &mod_api::CommandInvocation,
++) -> Option<i32> {
++    crate::starling_command::execute(host, source, command, starling_run_mod_command)
++}
+diff --git a/rftoolsbase/src/starling_command.rs b/src/starling_command.rs
+new file mode 100644
+index 0000000..894f55f
+--- /dev/null
++++ b/src/starling_command.rs
+@@ -0,0 +1,31 @@
++//! Starling's port to Sunrise's API: Horizon's `run_mod_command` hook, which got every command of
++//! the mod in one event, is a per-usage executor in Sunrise. The old event is rebuilt here around
++//! the executor's arguments, so the mod's command code runs as it was written.
++use mod_api::{CommandInvocation, CommandSource, Flow, ServerHost};
++
++/// Horizon's `RunModCommandEvent`: the parsed command and who ran it.
++pub(crate) struct RunModCommandEvent<'a> {
++    pub command: &'a CommandInvocation,
++    pub source: &'a CommandSource,
++    /// Whether an earlier mod took the command: in Sunrise each usage has its own executor, so never.
++    pub cancelled: bool,
++}
++
++/// The executor of every usage the mod declares: the old hook's body (`run`), whose `Cancel` was a
++/// command it ran and `Continue` one it did not.
++pub(crate) fn execute(
++    host: &mut dyn ServerHost,
++    source: &CommandSource,
++    command: &CommandInvocation,
++    run: fn(&mut dyn ServerHost, &mut RunModCommandEvent<'_>) -> Flow,
++) -> Option<i32> {
++    let mut event = RunModCommandEvent {
++        command,
++        source,
++        cancelled: false,
++    };
++    match run(host, &mut event) {
++        Flow::Continue => None,
++        _ => Some(1),
++    }
++}
+diff --git a/rftoolsbase/src/starling_screen.rs b/src/starling_screen.rs
+new file mode 100644
+index 0000000..93ae332
+--- /dev/null
++++ b/src/starling_screen.rs
+@@ -0,0 +1,155 @@
++//! Starling's port to Sunrise's API: Horizon asked a block entity's Part for its screen (`screen`,
++//! `screen_draw`, `screen_click`, `screen_tooltip`, keyed by the block); Sunrise registers one
++//! screen per menu type, with closures. The Part's old methods run here, through Horizon's events
++//! rebuilt around Sunrise's frame, so the mod's screen code stays as it was written.
++use std::sync::Arc;
++
++use mod_api::{
++    ClientHost, DrawContext, Host, MenuScreen, MenuScreenLayout, MenuScreenOpen, Registrar,
++    ScreenSlot, Text,
++};
++
++/// Horizon's screen layout.
++#[derive(Clone, Debug, Default)]
++pub(crate) struct Screen {
++    pub width: f32,
++    pub height: f32,
++    pub slots: Vec<Option<[f32; 2]>>,
++    pub inventory_y: f32,
++    pub inventory_x: f32,
++    pub own_labels: bool,
++    pub own_background: bool,
++    pub recipe_book: Option<mod_api::RecipeBookTypeKey>,
++    pub recipe_book_toggle: Option<[f32; 2]>,
++}
++
++impl Screen {
++    fn layout(self) -> MenuScreenLayout {
++        MenuScreenLayout {
++            width: self.width,
++            height: self.height,
++            slots: self
++                .slots
++                .into_iter()
++                .map(|slot| {
++                    slot.map(|position| ScreenSlot {
++                        position,
++                        no_item_icon: None,
++                    })
++                })
++                .collect(),
++            inventory_y: self.inventory_y,
++            inventory_x: self.inventory_x,
++            own_labels: self.own_labels,
++            own_background: self.own_background,
++            recipe_book: self.recipe_book,
++            recipe_book_toggle: self
++                .recipe_book_toggle
++                .map(|[x, y]| mod_api::RecipeBookToggle {
++                    x,
++                    y,
++                    from: mod_api::ToggleOrigin::Menu,
++                }),
++            ..MenuScreenLayout::default()
++        }
++    }
++}
++
++/// Horizon's `ScreenEvent`: the block whose menu opens.
++pub(crate) struct ScreenEvent<'a> {
++    pub block: &'a str,
++}
++
++/// Horizon's `ScreenDrawEvent`.
++pub(crate) struct ScreenDrawEvent<'a> {
++    pub block: &'a str,
++    pub origin: [f32; 2],
++    pub at: [f32; 2],
++    pub data: &'a [i32],
++    pub draw: &'a mut dyn DrawContext,
++}
++
++/// Horizon's `ScreenClickEvent`.
++pub(crate) struct ScreenClickEvent<'a> {
++    pub block: &'a str,
++    pub origin: [f32; 2],
++    pub at: [f32; 2],
++    pub data: &'a [i32],
++    pub right: bool,
++}
++
++/// Horizon's `ScreenTooltipEvent`.
++pub(crate) struct ScreenTooltipEvent<'a> {
++    pub block: &'a str,
++    pub origin: [f32; 2],
++    pub at: [f32; 2],
++    pub data: &'a [i32],
++    pub slot: Option<u32>,
++    pub lines: &'a mut Vec<(Text, u32)>,
++}
++
++/// A Part's old screen methods.
++pub(crate) trait StarlingScreens: Send + Sync + 'static {
++    fn screen(&self, _host: &dyn Host, _event: &mut ScreenEvent<'_>) -> Option<Screen> {
++        None
++    }
++    fn screen_draw(&self, _host: &dyn ClientHost, _event: &mut ScreenDrawEvent<'_>) {}
++    fn screen_click(&self, _host: &dyn ClientHost, _event: &mut ScreenClickEvent<'_>) -> Option<i32> {
++        None
++    }
++    fn screen_tooltip(&self, _host: &dyn ClientHost, _event: &mut ScreenTooltipEvent<'_>) {}
++}
++
++/// `part`'s screen for the menu type `menu`.
++pub(crate) fn register(r: &mut dyn Registrar, menu: &str, part: impl StarlingScreens) {
++    let part = Arc::new(part);
++    let factory = move |host: &dyn ClientHost, open: MenuScreenOpen<'_>| -> Option<MenuScreen> {
++        let block = open.block.unwrap_or_default().to_owned();
++        let screen = part.screen(host, &mut ScreenEvent { block: &block })?;
++        let (draw_part, click_part, tip_part) = (part.clone(), part.clone(), part.clone());
++        let (draw_block, click_block, tip_block) = (block.clone(), block.clone(), block);
++        Some(
++            MenuScreen::new(screen.layout())
++                .with_draw(move |host, frame, draw| {
++                    draw_part.screen_draw(
++                        host,
++                        &mut ScreenDrawEvent {
++                            block: &draw_block,
++                            origin: frame.origin,
++                            at: frame.at,
++                            data: frame.data,
++                            draw,
++                        },
++                    );
++                })
++                .with_click(move |host, frame, right| {
++                    click_part.screen_click(
++                        host,
++                        &mut ScreenClickEvent {
++                            block: &click_block,
++                            origin: frame.origin,
++                            at: frame.at,
++                            data: frame.data,
++                            right,
++                        },
++                    )
++                })
++                .with_tooltip(move |host, frame, slot, lines| {
++                    tip_part.screen_tooltip(
++                        host,
++                        &mut ScreenTooltipEvent {
++                            block: &tip_block,
++                            origin: frame.origin,
++                            at: frame.at,
++                            data: frame.data,
++                            slot,
++                            lines,
++                        },
++                    );
++                }),
++        )
++    };
++    if let Err(error) = r.register_menu_screen(menu, Arc::new(factory)) {
++        r.refuse(&error);
++    }
++}
+diff --git a/rftoolsbase/src/starling_tick.rs b/src/starling_tick.rs
+new file mode 100644
+index 0000000..4de1a43
+--- /dev/null
++++ b/src/starling_tick.rs
+@@ -0,0 +1,63 @@
++//! Starling's port to Sunrise's API: a block entity tick written for Horizon's, which handed the
++//! tick the block entity's slots, compound and data slots to change in place, runs here on a copy
++//! of them taken from the tick's view; what it changed is written back and the chunk marked
++//! unsaved, as Horizon's reply did.
++use mod_api::{BlockEntityTickEvent, Compound, ItemStack, ServerHost};
++
++/// The block entity as Horizon's tick had it.
++pub(crate) struct OldEntity {
++    pub items: Vec<Option<ItemStack>>,
++    pub nbt: Compound,
++    pub data: Vec<i32>,
++}
++
++/// Run `body` on a copy of the ticking block entity (its host, the copy, its position).
++pub(crate) fn run(
++    event: &mut BlockEntityTickEvent<'_>,
++    body: impl FnOnce(&mut dyn ServerHost, &mut OldEntity, [i32; 3]),
++) {
++    let Some((handle, pos, before)) = event.subject.with_view(|view| {
++        let items = (0..view.item_slots() as u32)
++            .map(|slot| view.item_slot(slot).and_then(|stack| stack.to_owned()))
++            .collect();
++        let entity = OldEntity {
++            items,
++            nbt: view.nbt().clone(),
++            data: view.data_slots().to_vec(),
++        };
++        (view.handle(), view.position(), entity)
++    }) else {
++        return;
++    };
++    let mut after = OldEntity {
++        items: before.items.clone(),
++        nbt: before.nbt.clone(),
++        data: before.data.clone(),
++    };
++    body(event.subject.host(), &mut after, pos);
++    let mut changed = false;
++    event.subject.with_view(|mut view| {
++        for (key, value) in after.nbt.iter() {
++            if before.nbt.get(key) != Some(value) && view.set_nbt(key.clone(), Some(value.clone())) {
++                changed = true;
++            }
++        }
++        for (key, _) in before.nbt.iter() {
++            if after.nbt.get(key).is_none() && view.set_nbt(key.clone(), None) {
++                changed = true;
++            }
++        }
++        for (slot, stack) in after.items.iter().enumerate() {
++            if before.items.get(slot) != Some(stack) {
++                let _ = view.set_item_slot(slot as u32, stack.clone());
++                changed = true;
++            }
++        }
++        if after.data != before.data && view.set_data_slots(&after.data) {
++            changed = true;
++        }
++    });
++    if changed {
++        let _ = handle.set_changed(event.subject.host());
++    }
++}

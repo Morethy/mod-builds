@@ -1,0 +1,554 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index af28217..bf21e6e 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -15,11 +15,15 @@
+ //! `register_commands`/`run_mod_command` pair. Its embedded-content helper has no
+ //! successor: one `.hmod` carries the content and the code, which is what that
+ //! helper existed to work around.
++use crate::starling_command::RunModCommandEvent;
+ use mod_api::{
+     self, Command, Flow, Hooks, RegisterCommandsEvent, Registrar, RegistrationContext,
+-    RunModCommandEvent, ServerHost, Text,
++    ServerHost, Text,
+ };
+ 
++mod starling_tick;
++mod starling_command;
++mod starling_screen;
+ mod pot;
+ 
+ pub mod runtime;
+@@ -44,6 +48,8 @@ impl Hooks for Mod {
+     /// foreign block can no longer be answered by mistake. Upstream gives every
+     /// pot one block entity type, and the block decides the mode.
+     fn register(&self, registrar: &mut dyn Registrar, context: &RegistrationContext) {
++        crate::starling_screen::register(registrar, pot::MENU, pot::PotEntity);
++        crate::starling_screen::register(registrar, pot::HOPPER_MENU, pot::PotEntity);
+         let block = registrar.block_key(pot::POT);
+         registrar.block_container(&block, pot::container());
+         registrar.block_part(block, pot::PotClick);
+@@ -52,7 +58,7 @@ impl Hooks for Mod {
+         registrar.block_part(hopper, pot::PotClick);
+         let kind = pot::declare(registrar);
+         if let Err(error) = registrar.block_entity_part(&kind, pot::PotEntity) {
+-            context.refuse(&error.to_string());
++            registrar.refuse(&error.to_string());
+         }
+     }
+ 
+@@ -63,39 +69,7 @@ impl Hooks for Mod {
+     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+         event
+             .commands
+-            .push(Command::op(INFO_USAGE, pot::INFO_LEVEL));
+-    }
+-
+-    /// The command body: the position is parsed and resolved by the server's
+-    /// dispatcher, so this only reads the pot and answers. The line is byte for
+-    /// byte the 0.1.0 one, so the existing e2e assertions still match.
+-    ///
+-    /// The usage is registered at [`pot::INFO_LEVEL`] *and* the source is checked
+-    /// again here: a command source that reaches the body by another route (a
+-    /// function, a future dispatcher change) is still refused, so a non-operator
+-    /// cannot read a pot's state at coordinates they choose.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        let literals: Vec<&str> = event.command.literals.iter().map(String::as_str).collect();
+-        if literals.first() != Some(&"botanypots") {
+-            return Flow::Continue;
+-        }
+-        if !pot::info_permitted(event.source.permission().level()) {
+-            let _ = host.commands().feedback(Text::literal(pot::INFO_DENIED));
+-            return Flow::Cancel;
+-        }
+-        let line = match (
+-            literals.get(1),
+-            pot::block_pos(event.command.argument("pos")),
+-        ) {
+-            (Some(&"info"), Some(pos)) => pot::info_line(host, pos),
+-            _ => "usage: /botanypots info <x> <y> <z>".to_owned(),
+-        };
+-        let _ = host.commands().feedback(Text::literal(line));
+-        Flow::Cancel
++            .push(Command::op(INFO_USAGE, pot::INFO_LEVEL).executes(crate::starling_executor));
+     }
+ }
+ 
+@@ -106,7 +80,7 @@ mod tests {
+     #[test]
+     fn the_info_command_is_operator_only() {
+         assert_eq!(pot::INFO_LEVEL, 2);
+-        let command = Command::op(INFO_USAGE, pot::INFO_LEVEL);
++        let command = Command::op(INFO_USAGE, pot::INFO_LEVEL).executes(crate::starling_executor);
+         assert_eq!(command.level, 2);
+         assert!(command.usage.starts_with("botanypots info "));
+         assert!(
+@@ -119,3 +93,36 @@ mod tests {
+         );
+     }
+ }
++
++/// Starling's port: the old `run_mod_command` hook's body.
++pub(crate) fn starling_run_mod_command(
++    host: &mut dyn ServerHost,
++    event: &mut crate::starling_command::RunModCommandEvent<'_>,
++) -> Flow {
++        let literals: Vec<&str> = event.command.literals.iter().map(String::as_str).collect();
++        if literals.first() != Some(&"botanypots") {
++            return Flow::Continue;
++        }
++        if !pot::info_permitted(event.source.permission().level()) {
++            let _ = host.commands().feedback(Text::literal(pot::INFO_DENIED));
++            return Flow::Cancel;
++        }
++        let line = match (
++            literals.get(1),
++            pot::block_pos(event.command.argument("pos")),
++        ) {
++            (Some(&"info"), Some(pos)) => pot::info_line(host, pos),
++            _ => "usage: /botanypots info <x> <y> <z>".to_owned(),
++        };
++        let _ = host.commands().feedback(Text::literal(line));
++        Flow::Cancel
++    }
++
++/// Starling's port: every declared usage runs the old hook's body.
++pub(crate) fn starling_executor(
++    host: &mut dyn ServerHost,
++    source: &mod_api::CommandSource,
++    command: &mod_api::CommandInvocation,
++) -> Option<i32> {
++    crate::starling_command::execute(host, source, command, starling_run_mod_command)
++}
+diff --git a/src/pot.rs b/src/pot.rs
+index c95691b..ca67587 100644
+--- a/src/pot.rs
++++ b/src/pot.rs
+@@ -7,12 +7,12 @@
+ //! back. Its tests pin what it *declares* (two slots and the menu, no hopper
+ //! face), that the saved compound reads back, and the exact readout line.
+ 
++use crate::starling_screen::{Screen, ScreenEvent, ScreenDrawEvent};
+ use mod_api::{
+     BlockClick, BlockEntityEvent, BlockEntityPart, BlockEntityRef, BlockEntityTickEvent,
+-    BlockEntityTickReply, BlockEntityTicksEvent, BlockEntityTypeKey, BlockPart, ClientHost,
++    BlockEntityTicksEvent, BlockEntityTypeKey, BlockPart, ClientHost,
+     Compound, Direction, Host, HostTransaction, Identifier, InteractionResult, ItemKey, ItemPlace,
+-    ItemResource, ItemStack, LevelRef, LevelSide, ModContainer, RandomSource, Registrar, Screen,
+-    ScreenDrawEvent, ScreenEvent, ServerHost, Tag, UseItemOnEvent, UseWithoutItemEvent,
++    ItemResource, ItemStack, LevelRef, LevelSide, ModContainer, RandomSource, Registrar, ServerHost, Tag, UseItemOnEvent, UseWithoutItemEvent,
+ };
+ 
+ use crate::runtime::{
+@@ -98,6 +98,7 @@ const HOPPER_TYPE: &str = "terracotta_hopper_botany_pot";
+ /// false), and only a hopper pot lets the bottom face reach its storage slots.
+ pub(crate) fn container() -> ModContainer {
+     ModContainer {
++        insert_rules: Vec::new(),
+         slots: BASIC_SLOT_COUNT,
+         faces: std::array::from_fn(|_| Vec::new()),
+         inputs: Vec::new(),
+@@ -115,6 +116,7 @@ pub(crate) fn hopper_container() -> ModContainer {
+     let mut faces: [Vec<usize>; 6] = std::array::from_fn(|_| Vec::new());
+     faces[Direction::Down as usize] = storage.clone();
+     ModContainer {
++        insert_rules: Vec::new(),
+         slots: SLOT_COUNT,
+         faces,
+         inputs: Vec::new(),
+@@ -251,9 +253,9 @@ struct Reading {
+ /// The crop in the seed slot and the soil's growth modifier, as the tick and the
+ /// readout both need them.
+ fn reading(host: &dyn Host, soil: Option<ItemKey>, seed: Option<ItemKey>, growth: u32) -> Reading {
+-    let seed_id = seed.map(|key| key.id(host));
++    let seed_id = seed.and_then(|key| key.id(host).map(str::to_owned));
+     let crop = seed_id.as_deref().and_then(crop_for_seed);
+-    let soil_modifier = soil.map_or(0.0, |key| soil_growth_modifier(&key.id(host)));
++    let soil_modifier = soil.map_or(0.0, |key| soil_growth_modifier(key.id(host).unwrap_or_default()));
+     let required = crop.map_or(0, |crop| {
+         required_growth_ticks(crop.grow_time, soil_modifier)
+     });
+@@ -299,7 +301,7 @@ fn item_in_tag(host: &dyn Host, item: ItemKey, tag: &str) -> bool {
+ fn block_at(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> String {
+     level
+         .block(host, pos)
+-        .map(|block| block.id(host))
++        .and_then(|block| block.id(host).map(str::to_owned))
+         .unwrap_or_default()
+ }
+ 
+@@ -338,7 +340,7 @@ impl BlockPart for PotClick {
+             return Some(InteractionResult::Success);
+         }
+         let held = click.stack?;
+-        if held.item().id(&*host) != BONE_MEAL {
++        if held.item().id(&*host).unwrap_or_default() != BONE_MEAL {
+             return None;
+         }
+         let amount = bone_meal_amount(host, level);
+@@ -399,21 +401,22 @@ impl BlockEntityPart for PotEntity {
+     /// A **hopper pot** also harvests itself the tick it becomes ready (no click),
+     /// inserts the drops into its twelve storage slots, and pushes those slots into
+     /// the container below (`BotanyPotBlockEntity.tickPot`).
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        let pos = event.pos;
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        crate::starling_tick::run(event, |host, entity, tick_pos| {
++        let pos = tick_pos;
+         let level = host.level(host.dimension());
+         let block = level.map_or_else(String::new, |level| block_at(&*host, level, pos));
+         let hopper = is_hopper_pot(&block);
+         let slot_count = if hopper { SLOT_COUNT } else { BASIC_SLOT_COUNT };
+-        let resized = event.entity.items.len() != slot_count;
++        let resized = (*entity).items.len() != slot_count;
+         if resized {
+-            event.entity.items.resize(slot_count, None);
++            (*entity).items.resize(slot_count, None);
+         }
+-        let before = read(&event.entity.nbt);
+-        let soil = slot_key(event.entity.items.first());
+-        let seed = slot_key(event.entity.items.get(SEED_SLOT));
+-        let soil_id = soil.map(|key| key.id(&*host));
+-        let seed_id = seed.map(|key| key.id(&*host));
++        let before = read(&(*entity).nbt);
++        let soil = slot_key((*entity).items.first());
++        let seed = slot_key((*entity).items.get(SEED_SLOT));
++        let soil_id = soil.and_then(|key| key.id(&*host).map(str::to_owned));
++        let seed_id = seed.and_then(|key| key.id(&*host).map(str::to_owned));
+         let mut state = before.clone();
+         // A different soil or seed starts the crop over (`onSoilChanged`/`onSeedChanged`).
+         if state.soil != soil_id || state.seed != seed_id {
+@@ -437,33 +440,37 @@ impl BlockEntityPart for PotEntity {
+             && let Some(crop) = reading.crop
+         {
+             let drops = roll_drops(host, pos, crop);
+-            items_changed |= insert_drops(host, &mut event.entity.items, drops, pos);
++            items_changed |= insert_drops(host, &mut (*entity).items, drops, pos);
+             state.growth = 0;
+             state.bone_meal = 0;
+         }
+         // A hopper pot's storage slots are pushed into the block below every tick.
+         if hopper && let Some(level) = level {
+-            items_changed |= export_below(host, level, pos, &mut event.entity.items);
++            items_changed |= export_below(host, level, pos, &mut (*entity).items);
+         }
+         let data = vec![int_of(state.growth), int_of(reading.required)];
+-        let data_changed = event.entity.data != data;
++        let data_changed = (*entity).data != data;
+         let changed = resized || data_changed || items_changed || state != before;
+         if !changed {
+-            *event.reply = BlockEntityTickReply::Unchanged;
++            // (unchanged: nothing is written back)
+             return;
+         }
+-        write(&mut event.entity.nbt, &state);
++        write(&mut (*entity).nbt, &state);
+         if data_changed {
+-            event.entity.data = data;
++            (*entity).data = data;
+         }
++    });
+     }
+ 
++
++}
++
++impl crate::starling_screen::StarlingScreens for PotEntity {
+     /// The pot menu's layout, chosen by the block: the hopper panel for a hopper
+     /// pot, the two-slot panel for the basic pot.
+     fn screen(&self, _host: &dyn Host, event: &mut ScreenEvent<'_>) -> Option<Screen> {
+         Some(menu_for(event.block))
+     }
+-
+     /// The growth readout, from the menu's data slots `[growth, required]`
+     /// (API 19's `native_screen_draw`).
+     fn screen_draw(&self, _host: &dyn ClientHost, event: &mut ScreenDrawEvent<'_>) {
+@@ -494,7 +501,7 @@ fn bone_meal_amount(host: &mut dyn ServerHost, level: LevelRef) -> u32 {
+         return BONE_MEAL_MIN;
+     };
+     level
+-        .with_random(host, |random| random.next_int_bound(span).unwrap_or(0))
++        .with_random(host, |random| random.next_int_bound(span))
+         .map_or(BONE_MEAL_MIN, |drawn| {
+             BONE_MEAL_MIN + u32::try_from(drawn).unwrap_or(0)
+         })
+@@ -768,7 +775,7 @@ pub(crate) fn info_line(host: &mut dyn ServerHost, pos: [i32; 3]) -> String {
+     let level = host.level(host.dimension());
+     let block = level
+         .and_then(|level| level.block(&*host, pos))
+-        .map(|block| block.id(&*host))
++        .and_then(|block| block.id(&*host).map(str::to_owned))
+         .unwrap_or_else(|| "minecraft:air".to_owned());
+     if !is_pot(&block) {
+         return NOT_A_POT.to_owned();
+diff --git a/botanypots/src/starling_command.rs b/src/starling_command.rs
+new file mode 100644
+index 0000000..894f55f
+--- /dev/null
++++ b/src/starling_command.rs
+@@ -0,0 +1,31 @@
++//! Starling's port to Sunrise's API: Horizon's `run_mod_command` hook, which got every command of
++//! the mod in one event, is a per-usage executor in Sunrise. The old event is rebuilt here around
++//! the executor's arguments, so the mod's command code runs as it was written.
++use mod_api::{CommandInvocation, CommandSource, Flow, ServerHost};
++
++/// Horizon's `RunModCommandEvent`: the parsed command and who ran it.
++pub(crate) struct RunModCommandEvent<'a> {
++    pub command: &'a CommandInvocation,
++    pub source: &'a CommandSource,
++    /// Whether an earlier mod took the command: in Sunrise each usage has its own executor, so never.
++    pub cancelled: bool,
++}
++
++/// The executor of every usage the mod declares: the old hook's body (`run`), whose `Cancel` was a
++/// command it ran and `Continue` one it did not.
++pub(crate) fn execute(
++    host: &mut dyn ServerHost,
++    source: &CommandSource,
++    command: &CommandInvocation,
++    run: fn(&mut dyn ServerHost, &mut RunModCommandEvent<'_>) -> Flow,
++) -> Option<i32> {
++    let mut event = RunModCommandEvent {
++        command,
++        source,
++        cancelled: false,
++    };
++    match run(host, &mut event) {
++        Flow::Continue => None,
++        _ => Some(1),
++    }
++}
+diff --git a/botanypots/src/starling_screen.rs b/src/starling_screen.rs
+new file mode 100644
+index 0000000..93ae332
+--- /dev/null
++++ b/src/starling_screen.rs
+@@ -0,0 +1,155 @@
++//! Starling's port to Sunrise's API: Horizon asked a block entity's Part for its screen (`screen`,
++//! `screen_draw`, `screen_click`, `screen_tooltip`, keyed by the block); Sunrise registers one
++//! screen per menu type, with closures. The Part's old methods run here, through Horizon's events
++//! rebuilt around Sunrise's frame, so the mod's screen code stays as it was written.
++use std::sync::Arc;
++
++use mod_api::{
++    ClientHost, DrawContext, Host, MenuScreen, MenuScreenLayout, MenuScreenOpen, Registrar,
++    ScreenSlot, Text,
++};
++
++/// Horizon's screen layout.
++#[derive(Clone, Debug, Default)]
++pub(crate) struct Screen {
++    pub width: f32,
++    pub height: f32,
++    pub slots: Vec<Option<[f32; 2]>>,
++    pub inventory_y: f32,
++    pub inventory_x: f32,
++    pub own_labels: bool,
++    pub own_background: bool,
++    pub recipe_book: Option<mod_api::RecipeBookTypeKey>,
++    pub recipe_book_toggle: Option<[f32; 2]>,
++}
++
++impl Screen {
++    fn layout(self) -> MenuScreenLayout {
++        MenuScreenLayout {
++            width: self.width,
++            height: self.height,
++            slots: self
++                .slots
++                .into_iter()
++                .map(|slot| {
++                    slot.map(|position| ScreenSlot {
++                        position,
++                        no_item_icon: None,
++                    })
++                })
++                .collect(),
++            inventory_y: self.inventory_y,
++            inventory_x: self.inventory_x,
++            own_labels: self.own_labels,
++            own_background: self.own_background,
++            recipe_book: self.recipe_book,
++            recipe_book_toggle: self
++                .recipe_book_toggle
++                .map(|[x, y]| mod_api::RecipeBookToggle {
++                    x,
++                    y,
++                    from: mod_api::ToggleOrigin::Menu,
++                }),
++            ..MenuScreenLayout::default()
++        }
++    }
++}
++
++/// Horizon's `ScreenEvent`: the block whose menu opens.
++pub(crate) struct ScreenEvent<'a> {
++    pub block: &'a str,
++}
++
++/// Horizon's `ScreenDrawEvent`.
++pub(crate) struct ScreenDrawEvent<'a> {
++    pub block: &'a str,
++    pub origin: [f32; 2],
++    pub at: [f32; 2],
++    pub data: &'a [i32],
++    pub draw: &'a mut dyn DrawContext,
++}
++
++/// Horizon's `ScreenClickEvent`.
++pub(crate) struct ScreenClickEvent<'a> {
++    pub block: &'a str,
++    pub origin: [f32; 2],
++    pub at: [f32; 2],
++    pub data: &'a [i32],
++    pub right: bool,
++}
++
++/// Horizon's `ScreenTooltipEvent`.
++pub(crate) struct ScreenTooltipEvent<'a> {
++    pub block: &'a str,
++    pub origin: [f32; 2],
++    pub at: [f32; 2],
++    pub data: &'a [i32],
++    pub slot: Option<u32>,
++    pub lines: &'a mut Vec<(Text, u32)>,
++}
++
++/// A Part's old screen methods.
++pub(crate) trait StarlingScreens: Send + Sync + 'static {
++    fn screen(&self, _host: &dyn Host, _event: &mut ScreenEvent<'_>) -> Option<Screen> {
++        None
++    }
++    fn screen_draw(&self, _host: &dyn ClientHost, _event: &mut ScreenDrawEvent<'_>) {}
++    fn screen_click(&self, _host: &dyn ClientHost, _event: &mut ScreenClickEvent<'_>) -> Option<i32> {
++        None
++    }
++    fn screen_tooltip(&self, _host: &dyn ClientHost, _event: &mut ScreenTooltipEvent<'_>) {}
++}
++
++/// `part`'s screen for the menu type `menu`.
++pub(crate) fn register(r: &mut dyn Registrar, menu: &str, part: impl StarlingScreens) {
++    let part = Arc::new(part);
++    let factory = move |host: &dyn ClientHost, open: MenuScreenOpen<'_>| -> Option<MenuScreen> {
++        let block = open.block.unwrap_or_default().to_owned();
++        let screen = part.screen(host, &mut ScreenEvent { block: &block })?;
++        let (draw_part, click_part, tip_part) = (part.clone(), part.clone(), part.clone());
++        let (draw_block, click_block, tip_block) = (block.clone(), block.clone(), block);
++        Some(
++            MenuScreen::new(screen.layout())
++                .with_draw(move |host, frame, draw| {
++                    draw_part.screen_draw(
++                        host,
++                        &mut ScreenDrawEvent {
++                            block: &draw_block,
++                            origin: frame.origin,
++                            at: frame.at,
++                            data: frame.data,
++                            draw,
++                        },
++                    );
++                })
++                .with_click(move |host, frame, right| {
++                    click_part.screen_click(
++                        host,
++                        &mut ScreenClickEvent {
++                            block: &click_block,
++                            origin: frame.origin,
++                            at: frame.at,
++                            data: frame.data,
++                            right,
++                        },
++                    )
++                })
++                .with_tooltip(move |host, frame, slot, lines| {
++                    tip_part.screen_tooltip(
++                        host,
++                        &mut ScreenTooltipEvent {
++                            block: &tip_block,
++                            origin: frame.origin,
++                            at: frame.at,
++                            data: frame.data,
++                            slot,
++                            lines,
++                        },
++                    );
++                }),
++        )
++    };
++    if let Err(error) = r.register_menu_screen(menu, Arc::new(factory)) {
++        r.refuse(&error);
++    }
++}
+diff --git a/botanypots/src/starling_tick.rs b/src/starling_tick.rs
+new file mode 100644
+index 0000000..4de1a43
+--- /dev/null
++++ b/src/starling_tick.rs
+@@ -0,0 +1,63 @@
++//! Starling's port to Sunrise's API: a block entity tick written for Horizon's, which handed the
++//! tick the block entity's slots, compound and data slots to change in place, runs here on a copy
++//! of them taken from the tick's view; what it changed is written back and the chunk marked
++//! unsaved, as Horizon's reply did.
++use mod_api::{BlockEntityTickEvent, Compound, ItemStack, ServerHost};
++
++/// The block entity as Horizon's tick had it.
++pub(crate) struct OldEntity {
++    pub items: Vec<Option<ItemStack>>,
++    pub nbt: Compound,
++    pub data: Vec<i32>,
++}
++
++/// Run `body` on a copy of the ticking block entity (its host, the copy, its position).
++pub(crate) fn run(
++    event: &mut BlockEntityTickEvent<'_>,
++    body: impl FnOnce(&mut dyn ServerHost, &mut OldEntity, [i32; 3]),
++) {
++    let Some((handle, pos, before)) = event.subject.with_view(|view| {
++        let items = (0..view.item_slots() as u32)
++            .map(|slot| view.item_slot(slot).and_then(|stack| stack.to_owned()))
++            .collect();
++        let entity = OldEntity {
++            items,
++            nbt: view.nbt().clone(),
++            data: view.data_slots().to_vec(),
++        };
++        (view.handle(), view.position(), entity)
++    }) else {
++        return;
++    };
++    let mut after = OldEntity {
++        items: before.items.clone(),
++        nbt: before.nbt.clone(),
++        data: before.data.clone(),
++    };
++    body(event.subject.host(), &mut after, pos);
++    let mut changed = false;
++    event.subject.with_view(|mut view| {
++        for (key, value) in after.nbt.iter() {
++            if before.nbt.get(key) != Some(value) && view.set_nbt(key.clone(), Some(value.clone())) {
++                changed = true;
++            }
++        }
++        for (key, _) in before.nbt.iter() {
++            if after.nbt.get(key).is_none() && view.set_nbt(key.clone(), None) {
++                changed = true;
++            }
++        }
++        for (slot, stack) in after.items.iter().enumerate() {
++            if before.items.get(slot) != Some(stack) {
++                let _ = view.set_item_slot(slot as u32, stack.clone());
++                changed = true;
++            }
++        }
++        if after.data != before.data && view.set_data_slots(&after.data) {
++            changed = true;
++        }
++    });
++    if changed {
++        let _ = handle.set_changed(event.subject.host());
++    }
++}

@@ -1,0 +1,516 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 5460f27..e273ead 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -14,13 +14,17 @@
+ //! command is the typed `register_commands`/`run_mod_command` pair. Its
+ //! embedded-content helper has no successor: one `.hmod` carries the content
+ //! and the code, which is what that helper existed to work around.
++use crate::starling_command::RunModCommandEvent;
+ use mod_api::{
+     self, Command, CommandArgumentValue, CommandSource, Flow, Hooks, RegisterCommandsEvent,
+-    Registrar, RegistrationContext, RunModCommandEvent, ServerHost, Text,
++    Registrar, RegistrationContext, ServerHost, Text,
+ };
+ 
+ use crate::runtime::{CAPACITY, INFO_DENIED};
+ 
++mod starling_tick;
++mod starling_command;
++mod starling_screen;
+ mod station;
+ 
+ pub mod runtime;
+@@ -41,8 +45,9 @@ impl Hooks for Mod {
+         registrar.block_container(&block, station::container());
+         registrar.block_energy(&block, station::battery());
+         let kind = station::declare(registrar);
++        crate::starling_screen::register(registrar, station::MENU, station::StationPart);
+         if let Err(error) = registrar.block_entity_part(&kind, station::StationPart) {
+-            context.refuse(&error.to_string());
++            registrar.refuse(&error.to_string());
+         }
+         let item = registrar.item_key(station::STATION);
+         station::remember_item(item);
+@@ -58,27 +63,26 @@ impl Hooks for Mod {
+     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+         event
+             .commands
+-            .push(Command::new("charginggadgets info <pos:block_pos>"));
++            .push(Command::new("charginggadgets info <pos:block_pos>").executes(crate::starling_executor));
+         event.commands.push(Command::op(
+             "charginggadgets energy <pos:block_pos> <amount:integer>",
+             2,
+-        ));
++        ).executes(crate::starling_executor));
+         event.commands.push(Command::op(
+             "charginggadgets item <pos:block_pos> <amount:integer>",
+             2,
+-        ));
++        ).executes(crate::starling_executor));
+         event
+             .commands
+-            .push(Command::op("charginggadgets held <amount:integer>", 2));
++            .push(Command::op("charginggadgets held <amount:integer>", 2).executes(crate::starling_executor));
+     }
++}
+ 
+-    /// The command bodies: the arguments are parsed and resolved by the
+-    /// server's dispatcher, so this only reads the station and answers.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
++/// Starling's port: the old `run_mod_command` hook's body.
++pub(crate) fn starling_run_mod_command(
++    host: &mut dyn ServerHost,
++    event: &mut crate::starling_command::RunModCommandEvent<'_>,
++) -> Flow {
+         let literals: Vec<&str> = event.command.literals.iter().map(String::as_str).collect();
+         let pos = station::block_pos(event.command.argument("pos"));
+         let amount = match event.command.argument("amount") {
+@@ -148,4 +152,12 @@ impl Hooks for Mod {
+         let _ = host.commands().feedback(Text::literal(line));
+         Flow::Cancel
+     }
++
++/// Starling's port: every declared usage runs the old hook's body.
++pub(crate) fn starling_executor(
++    host: &mut dyn ServerHost,
++    source: &mod_api::CommandSource,
++    command: &mod_api::CommandInvocation,
++) -> Option<i32> {
++    crate::starling_command::execute(host, source, command, starling_run_mod_command)
+ }
+diff --git a/charginggadgets/src/starling_command.rs b/src/starling_command.rs
+new file mode 100644
+index 0000000..894f55f
+--- /dev/null
++++ b/src/starling_command.rs
+@@ -0,0 +1,31 @@
++//! Starling's port to Sunrise's API: Horizon's `run_mod_command` hook, which got every command of
++//! the mod in one event, is a per-usage executor in Sunrise. The old event is rebuilt here around
++//! the executor's arguments, so the mod's command code runs as it was written.
++use mod_api::{CommandInvocation, CommandSource, Flow, ServerHost};
++
++/// Horizon's `RunModCommandEvent`: the parsed command and who ran it.
++pub(crate) struct RunModCommandEvent<'a> {
++    pub command: &'a CommandInvocation,
++    pub source: &'a CommandSource,
++    /// Whether an earlier mod took the command: in Sunrise each usage has its own executor, so never.
++    pub cancelled: bool,
++}
++
++/// The executor of every usage the mod declares: the old hook's body (`run`), whose `Cancel` was a
++/// command it ran and `Continue` one it did not.
++pub(crate) fn execute(
++    host: &mut dyn ServerHost,
++    source: &CommandSource,
++    command: &CommandInvocation,
++    run: fn(&mut dyn ServerHost, &mut RunModCommandEvent<'_>) -> Flow,
++) -> Option<i32> {
++    let mut event = RunModCommandEvent {
++        command,
++        source,
++        cancelled: false,
++    };
++    match run(host, &mut event) {
++        Flow::Continue => None,
++        _ => Some(1),
++    }
++}
+diff --git a/charginggadgets/src/starling_screen.rs b/src/starling_screen.rs
+new file mode 100644
+index 0000000..93ae332
+--- /dev/null
++++ b/src/starling_screen.rs
+@@ -0,0 +1,155 @@
++//! Starling's port to Sunrise's API: Horizon asked a block entity's Part for its screen (`screen`,
++//! `screen_draw`, `screen_click`, `screen_tooltip`, keyed by the block); Sunrise registers one
++//! screen per menu type, with closures. The Part's old methods run here, through Horizon's events
++//! rebuilt around Sunrise's frame, so the mod's screen code stays as it was written.
++use std::sync::Arc;
++
++use mod_api::{
++    ClientHost, DrawContext, Host, MenuScreen, MenuScreenLayout, MenuScreenOpen, Registrar,
++    ScreenSlot, Text,
++};
++
++/// Horizon's screen layout.
++#[derive(Clone, Debug, Default)]
++pub(crate) struct Screen {
++    pub width: f32,
++    pub height: f32,
++    pub slots: Vec<Option<[f32; 2]>>,
++    pub inventory_y: f32,
++    pub inventory_x: f32,
++    pub own_labels: bool,
++    pub own_background: bool,
++    pub recipe_book: Option<mod_api::RecipeBookTypeKey>,
++    pub recipe_book_toggle: Option<[f32; 2]>,
++}
++
++impl Screen {
++    fn layout(self) -> MenuScreenLayout {
++        MenuScreenLayout {
++            width: self.width,
++            height: self.height,
++            slots: self
++                .slots
++                .into_iter()
++                .map(|slot| {
++                    slot.map(|position| ScreenSlot {
++                        position,
++                        no_item_icon: None,
++                    })
++                })
++                .collect(),
++            inventory_y: self.inventory_y,
++            inventory_x: self.inventory_x,
++            own_labels: self.own_labels,
++            own_background: self.own_background,
++            recipe_book: self.recipe_book,
++            recipe_book_toggle: self
++                .recipe_book_toggle
++                .map(|[x, y]| mod_api::RecipeBookToggle {
++                    x,
++                    y,
++                    from: mod_api::ToggleOrigin::Menu,
++                }),
++            ..MenuScreenLayout::default()
++        }
++    }
++}
++
++/// Horizon's `ScreenEvent`: the block whose menu opens.
++pub(crate) struct ScreenEvent<'a> {
++    pub block: &'a str,
++}
++
++/// Horizon's `ScreenDrawEvent`.
++pub(crate) struct ScreenDrawEvent<'a> {
++    pub block: &'a str,
++    pub origin: [f32; 2],
++    pub at: [f32; 2],
++    pub data: &'a [i32],
++    pub draw: &'a mut dyn DrawContext,
++}
++
++/// Horizon's `ScreenClickEvent`.
++pub(crate) struct ScreenClickEvent<'a> {
++    pub block: &'a str,
++    pub origin: [f32; 2],
++    pub at: [f32; 2],
++    pub data: &'a [i32],
++    pub right: bool,
++}
++
++/// Horizon's `ScreenTooltipEvent`.
++pub(crate) struct ScreenTooltipEvent<'a> {
++    pub block: &'a str,
++    pub origin: [f32; 2],
++    pub at: [f32; 2],
++    pub data: &'a [i32],
++    pub slot: Option<u32>,
++    pub lines: &'a mut Vec<(Text, u32)>,
++}
++
++/// A Part's old screen methods.
++pub(crate) trait StarlingScreens: Send + Sync + 'static {
++    fn screen(&self, _host: &dyn Host, _event: &mut ScreenEvent<'_>) -> Option<Screen> {
++        None
++    }
++    fn screen_draw(&self, _host: &dyn ClientHost, _event: &mut ScreenDrawEvent<'_>) {}
++    fn screen_click(&self, _host: &dyn ClientHost, _event: &mut ScreenClickEvent<'_>) -> Option<i32> {
++        None
++    }
++    fn screen_tooltip(&self, _host: &dyn ClientHost, _event: &mut ScreenTooltipEvent<'_>) {}
++}
++
++/// `part`'s screen for the menu type `menu`.
++pub(crate) fn register(r: &mut dyn Registrar, menu: &str, part: impl StarlingScreens) {
++    let part = Arc::new(part);
++    let factory = move |host: &dyn ClientHost, open: MenuScreenOpen<'_>| -> Option<MenuScreen> {
++        let block = open.block.unwrap_or_default().to_owned();
++        let screen = part.screen(host, &mut ScreenEvent { block: &block })?;
++        let (draw_part, click_part, tip_part) = (part.clone(), part.clone(), part.clone());
++        let (draw_block, click_block, tip_block) = (block.clone(), block.clone(), block);
++        Some(
++            MenuScreen::new(screen.layout())
++                .with_draw(move |host, frame, draw| {
++                    draw_part.screen_draw(
++                        host,
++                        &mut ScreenDrawEvent {
++                            block: &draw_block,
++                            origin: frame.origin,
++                            at: frame.at,
++                            data: frame.data,
++                            draw,
++                        },
++                    );
++                })
++                .with_click(move |host, frame, right| {
++                    click_part.screen_click(
++                        host,
++                        &mut ScreenClickEvent {
++                            block: &click_block,
++                            origin: frame.origin,
++                            at: frame.at,
++                            data: frame.data,
++                            right,
++                        },
++                    )
++                })
++                .with_tooltip(move |host, frame, slot, lines| {
++                    tip_part.screen_tooltip(
++                        host,
++                        &mut ScreenTooltipEvent {
++                            block: &tip_block,
++                            origin: frame.origin,
++                            at: frame.at,
++                            data: frame.data,
++                            slot,
++                            lines,
++                        },
++                    );
++                }),
++        )
++    };
++    if let Err(error) = r.register_menu_screen(menu, Arc::new(factory)) {
++        r.refuse(&error);
++    }
++}
+diff --git a/charginggadgets/src/starling_tick.rs b/src/starling_tick.rs
+new file mode 100644
+index 0000000..4de1a43
+--- /dev/null
++++ b/src/starling_tick.rs
+@@ -0,0 +1,63 @@
++//! Starling's port to Sunrise's API: a block entity tick written for Horizon's, which handed the
++//! tick the block entity's slots, compound and data slots to change in place, runs here on a copy
++//! of them taken from the tick's view; what it changed is written back and the chunk marked
++//! unsaved, as Horizon's reply did.
++use mod_api::{BlockEntityTickEvent, Compound, ItemStack, ServerHost};
++
++/// The block entity as Horizon's tick had it.
++pub(crate) struct OldEntity {
++    pub items: Vec<Option<ItemStack>>,
++    pub nbt: Compound,
++    pub data: Vec<i32>,
++}
++
++/// Run `body` on a copy of the ticking block entity (its host, the copy, its position).
++pub(crate) fn run(
++    event: &mut BlockEntityTickEvent<'_>,
++    body: impl FnOnce(&mut dyn ServerHost, &mut OldEntity, [i32; 3]),
++) {
++    let Some((handle, pos, before)) = event.subject.with_view(|view| {
++        let items = (0..view.item_slots() as u32)
++            .map(|slot| view.item_slot(slot).and_then(|stack| stack.to_owned()))
++            .collect();
++        let entity = OldEntity {
++            items,
++            nbt: view.nbt().clone(),
++            data: view.data_slots().to_vec(),
++        };
++        (view.handle(), view.position(), entity)
++    }) else {
++        return;
++    };
++    let mut after = OldEntity {
++        items: before.items.clone(),
++        nbt: before.nbt.clone(),
++        data: before.data.clone(),
++    };
++    body(event.subject.host(), &mut after, pos);
++    let mut changed = false;
++    event.subject.with_view(|mut view| {
++        for (key, value) in after.nbt.iter() {
++            if before.nbt.get(key) != Some(value) && view.set_nbt(key.clone(), Some(value.clone())) {
++                changed = true;
++            }
++        }
++        for (key, _) in before.nbt.iter() {
++            if after.nbt.get(key).is_none() && view.set_nbt(key.clone(), None) {
++                changed = true;
++            }
++        }
++        for (slot, stack) in after.items.iter().enumerate() {
++            if before.items.get(slot) != Some(stack) {
++                let _ = view.set_item_slot(slot as u32, stack.clone());
++                changed = true;
++            }
++        }
++        if after.data != before.data && view.set_data_slots(&after.data) {
++            changed = true;
++        }
++    });
++    if changed {
++        let _ = handle.set_changed(event.subject.host());
++    }
++}
+diff --git a/src/station.rs b/src/station.rs
+index 7309148..5f22d2f 100644
+--- a/src/station.rs
++++ b/src/station.rs
+@@ -10,12 +10,12 @@
+ //! prints.
+ use std::sync::OnceLock;
+ 
++use crate::starling_screen::{Screen, ScreenEvent, ScreenDrawEvent};
+ use mod_api::{
+-    self, BlockEntityEvent, BlockEntityPart, BlockEntityTickEvent, BlockEntityTickReply,
+-    BlockEntityTicksEvent, BlockEntityTypeKey, BlockPart, ClientHost, Component, ComponentId,
++    self, BlockEntityEvent, BlockEntityPart, BlockEntityTickEvent, BlockEntityTicksEvent, BlockEntityTypeKey, BlockPart, ClientHost, Component, ComponentId,
+     Compound, EnergyHandler, Host, HostTransaction, ITEM_ENERGY, ItemComponentHandler, ItemKey,
+     ItemPart, ItemPlace, ItemResource, ItemStack, LevelSide, ModContainer, ModEnergyBuffer,
+-    OnBlockPlacedByEvent, Registrar, Screen, ScreenDrawEvent, ScreenEvent, ServerHost, Tag, Text,
++    OnBlockPlacedByEvent, Registrar, ServerHost, Tag, Text,
+     TooltipEvent, Transaction,
+ };
+ 
+@@ -82,6 +82,7 @@ pub(crate) fn declare(registrar: &mut dyn Registrar) -> BlockEntityTypeKey {
+ /// tick refuses anything it cannot burn or charge).
+ pub(crate) fn container() -> ModContainer {
+     ModContainer {
++        insert_rules: Vec::new(),
+         slots: SLOT_COUNT,
+         faces: std::array::from_fn(|_| vec![FUEL_SLOT, CHARGE_SLOT]),
+         inputs: vec![FUEL_SLOT, CHARGE_SLOT],
+@@ -223,7 +224,7 @@ impl Sight {
+ /// is "not a charging station", not a station at 0 FE.
+ pub(crate) fn info_line(host: &mut dyn ServerHost, pos: [i32; 3]) -> Option<String> {
+     let level = host.level(host.dimension())?;
+-    if level.block(&*host, pos)?.id(&*host) != STATION {
++    if level.block(&*host, pos)?.id(&*host) != Some(STATION) {
+         return None;
+     }
+     let entity = host.block_entity(level, pos)?;
+@@ -232,13 +233,13 @@ pub(crate) fn info_line(host: &mut dyn ServerHost, pos: [i32; 3]) -> Option<Stri
+         .item_slot(&*host, FUEL_SLOT as u32)
+         .ok()
+         .flatten()
+-        .map(|stack| (stack.item().id(&*host), stack.count()));
++        .map(|stack| (stack.item().id(&*host).unwrap_or_default().to_owned(), stack.count()));
+     let charge = entity
+         .item_slot(&*host, CHARGE_SLOT as u32)
+         .ok()
+         .flatten()
+         .map(|stack| Charge {
+-            item: stack.item().id(&*host),
++            item: stack.item().id(&*host).unwrap_or_default().to_owned(),
+             count: stack.count(),
+             buffer: item_buffer_of(host, level, pos),
+         });
+@@ -281,7 +282,7 @@ fn item_buffer_of(
+ /// in someone else's compound).
+ pub(crate) fn set_energy(host: &mut dyn ServerHost, pos: [i32; 3], amount: i32) -> Option<i32> {
+     let level = host.level(host.dimension())?;
+-    if level.block(&*host, pos)?.id(&*host) != STATION {
++    if level.block(&*host, pos)?.id(&*host) != Some(STATION) {
+         return None;
+     }
+     let entity = host.block_entity(level, pos)?;
+@@ -304,7 +305,7 @@ pub(crate) fn set_item_energy(
+     target: i32,
+ ) -> Option<i32> {
+     let level = host.level(host.dimension())?;
+-    if level.block(&*host, pos)?.id(&*host) != STATION {
++    if level.block(&*host, pos)?.id(&*host) != Some(STATION) {
+         return None;
+     }
+     let place = ItemPlace::BlockEntity {
+@@ -325,8 +326,7 @@ pub(crate) fn set_held_energy(host: &mut dyn ServerHost, player: u128, target: i
+     // component edit of a carried item takes, and the one the in-game check can observe.
+     let held = host.player(player)?;
+     let slot = u32::try_from(held.selected_slot(host)?).ok()?;
+-    let mut stack = held
+-        .inventory_slots(host)?
++    let mut stack = held.with_inventory(host, |view| view.iter().filter_map(|(slot, stack)| stack.project().map(|stack| (slot, stack))).collect::<Vec<_>>())?
+         .into_iter()
+         .find(|(at, _)| *at == slot)
+         .map(|(_, stack)| stack)?;
+@@ -490,41 +490,46 @@ impl BlockEntityPart for StationPart {
+     /// item in the charge slot, then the menu's data slots. The payload is left
+     /// `Changed` only when something moved, so an idle station does not dirty
+     /// its chunk every tick (the retired bundle marked it every tick).
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        let resized = event.entity.items.len() != SLOT_COUNT;
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        crate::starling_tick::run(event, |host, entity, tick_pos| {
++        let resized = (*entity).items.len() != SLOT_COUNT;
+         if resized {
+-            event.entity.items.resize(SLOT_COUNT, None);
++            (*entity).items.resize(SLOT_COUNT, None);
+         }
+-        let mut saved = Tag::Compound(std::mem::take(&mut event.entity.nbt));
++        let mut saved = Tag::Compound(std::mem::take(&mut (*entity).nbt));
+         let before = read(&saved);
+         let mut station = before;
+         {
+             let mut fuel = SlotFuel {
+                 host: &*host,
+-                entity: &mut event.entity,
++                entity: &mut (*entity),
+             };
+             station.burn_tick(&mut fuel);
+         }
+-        charge_slot(&mut station, &mut event.entity.items[CHARGE_SLOT]);
++        charge_slot(&mut station, &mut (*entity).items[CHARGE_SLOT]);
+         write(&mut saved, &station);
+         if let Tag::Compound(nbt) = saved {
+-            event.entity.nbt = nbt;
++            (*entity).nbt = nbt;
+         }
+         let data = station.data_slots().to_vec();
+-        let data_changed = event.entity.data != data;
++        let data_changed = (*entity).data != data;
+         if data_changed {
+-            event.entity.data = data;
++            (*entity).data = data;
+         }
+         if !resized && !data_changed && station == before {
+-            *event.reply = BlockEntityTickReply::Unchanged;
++            // (unchanged: nothing is written back)
+         }
++    });
+     }
+ 
++
++}
++
++impl crate::starling_screen::StarlingScreens for StationPart {
+     /// The station menu's layout.
+     fn screen(&self, _host: &dyn Host, _event: &mut ScreenEvent<'_>) -> Option<Screen> {
+         Some(menu())
+     }
+-
+     /// The readouts (`native_screen_draw`, API 19): the buffer and the burning
+     /// steps, from the menu's data slots `[energy/32, capacity/32, counter,
+     /// maxburn]`.
+@@ -635,12 +640,12 @@ fn charged(stack: &ItemStack, amount: i32) -> Option<(i32, ItemStack)> {
+ 
+ /// The fuel slot, as `ChargingStationTile.initBurn` reads it: the item's
+ /// smelting burn time and the shrink (or the crafting remainder) that takes it.
+-struct SlotFuel<'a, 'g> {
++struct SlotFuel<'a> {
+     host: &'a dyn ServerHost,
+-    entity: &'a mut mod_api::ModBlockEntityView<'g>,
++    entity: &'a mut crate::starling_tick::OldEntity,
+ }
+ 
+-impl FuelSlot for SlotFuel<'_, '_> {
++impl FuelSlot for SlotFuel<'_> {
+     fn peek(&self) -> Option<u32> {
+         let stack = self.entity.items.first()?.as_ref()?;
+         (stack.count() > 0).then(|| burn_time(self.host, stack))
+@@ -701,7 +706,7 @@ impl ItemPart for StationItemPart {
+         let Some(level) = host.level(host.dimension()) else {
+             return;
+         };
+-        if level.block(&*host, event.pos).map(|block| block.id(&*host)) != Some(STATION.to_owned())
++        if level.block(&*host, event.pos).and_then(|block| block.id(&*host)) != Some(STATION)
+         {
+             return;
+         }
