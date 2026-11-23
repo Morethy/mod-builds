@@ -1,0 +1,266 @@
+diff --git a/src/gadget.rs b/src/gadget.rs
+index aa36ba4..70925d2 100644
+--- a/src/gadget.rs
++++ b/src/gadget.rs
+@@ -270,7 +270,7 @@ impl GadgetEnergy {
+     /// What the gadget at the place holds now.
+     fn held(&self, host: &mut dyn ServerHost) -> i32 {
+         self.place
+-            .stack(host)
++            .with_stack(host, |s| s.project()).flatten()
+             .map_or(0, |stack| energy_of(&custom_data_of(&stack)))
+     }
+ 
+@@ -287,7 +287,7 @@ impl GadgetEnergy {
+             let Some(owner) = host.player(player) else {
+                 return 0;
+             };
+-            let Some(mut stack) = self.place.stack(host) else {
++            let Some(mut stack) = self.place.with_stack(host, |s| s.project()).flatten() else {
+                 return 0;
+             };
+             let moved = moved_toward(&mut stack, target);
+@@ -302,10 +302,12 @@ impl GadgetEnergy {
+             return moved;
+         }
+         let mut moved = 0;
+-        let went = self.place.edit(host, tx, |stack| {
+-            moved = moved_toward(stack, target);
++        // The place lends an editor of its stack: the change is made on a copy and its custom data
++        // and damage staged back, as the old `&mut ItemStack` edit wrote them.
++        let went = self.place.edit(host, tx, |editor| {
++            edit_copy(editor, |stack| moved = moved_toward(stack, target));
+         });
+-        if went { moved } else { 0 }
++        if went.is_ok() { moved } else { 0 }
+     }
+ }
+ 
+@@ -381,7 +383,7 @@ fn refund(host: &mut dyn ServerHost, place: &ItemPlace, cost: i32) {
+ /// engine makes before an item's use. The block-click route runs before it, so this is where the
+ /// shot's cooldown is enforced.
+ fn on_cooldown(host: &mut dyn ServerHost, player: PlayerRef, place: &ItemPlace) -> bool {
+-    let Some(stack) = place.stack(host) else {
++    let Some(stack) = place.with_stack(host, |s| s.project()).flatten() else {
+         return false;
+     };
+     let group = host.item_cooldown_group(&stack);
+@@ -393,13 +395,40 @@ fn on_cooldown(host: &mut dyn ServerHost, player: PlayerRef, place: &ItemPlace)
+ /// show as a drained battery.
+ fn refresh_bar(host: &mut dyn ServerHost, place: &ItemPlace) {
+     let _ = host.transaction(|host, tx| {
+-        Ok::<bool, Infallible>(place.edit(host, tx, |stack| {
+-            let energy = energy_of(&custom_data_of(stack));
+-            stack.set_damage(bar_damage(energy));
+-        }))
++        Ok::<bool, Infallible>(
++            place
++                .edit(host, tx, |editor| {
++                    edit_copy(editor, |stack| {
++                        let energy = energy_of(&custom_data_of(stack));
++                        stack.set_damage(bar_damage(energy));
++                    })
++                })
++                .is_ok(),
++        )
+     });
+ }
+ 
++/// `change` made on a copy of the stack the editor lends, its custom data and damage staged back:
++/// what the old `&mut ItemStack` edit wrote.
++fn edit_copy(editor: &mut mod_api::ItemComponentEditor<'_>, change: impl FnOnce(&mut ItemStack)) {
++    let Some(mut stack) = editor.original().project() else {
++        return;
++    };
++    change(&mut stack);
++    let mut patch = Compound::new();
++    match data_value(&stack) {
++        Some(tag) => {
++            patch.insert(CUSTOM_DATA.into(), tag);
++        }
++        None => {
++            let removal = format!("!{CUSTOM_DATA}");
++            patch.insert(removal.as_str().into(), Tag::Compound(Compound::new()));
++        }
++    }
++    let _ = editor.apply_components(&patch);
++    editor.set_damage(stack.damage());
++}
++
+ // ---------------------------------------------------------------------------
+ // Who may break what
+ // ---------------------------------------------------------------------------
+@@ -427,7 +456,7 @@ fn may_break(host: &mut dyn ServerHost, player: PlayerRef, level: LevelRef, pos:
+     // jigsaw block, and the actor-free destroy path had no such check.
+     let game_master = level
+         .block(&*host, pos)
+-        .is_some_and(|block| is_game_master_block(&block.id(&*host)));
++        .is_some_and(|block| is_game_master_block(block.id(&*host).unwrap_or_default()));
+     if game_master && !player.can_use_game_master_blocks(&*host).unwrap_or(false) {
+         return false;
+     }
+@@ -471,7 +500,7 @@ fn candidate(host: &mut dyn ServerHost, level: LevelRef, pos: Pos) -> Candidate
+             ..Candidate::default()
+         };
+     };
+-    let id = level.block(&*host, pos).map(|block| block.id(&*host));
++    let id = level.block(&*host, pos).and_then(|block| block.id(&*host));
+     let states = host.block_states();
+     Candidate {
+         air: id.as_deref().is_some_and(|id| {
+@@ -521,7 +550,7 @@ fn effect_level(host: &dyn Host, player: PlayerRef, effect: &str) -> Option<i32>
+     let effects = living.effects(host)?;
+     effects
+         .iter()
+-        .find(|active| active.id.id(host) == effect)
++        .find(|active| active.id.id(host) == Some(effect))
+         .map(|active| active.amplifier + 1)
+ }
+ 
+@@ -541,10 +570,10 @@ fn fire(host: &mut dyn ServerHost, player: PlayerRef, hand: Hand, start: Pos, fa
+         player: player.uuid(),
+         hand,
+     };
+-    let Some(stack) = place.stack(host) else {
++    let Some(stack) = place.with_stack(host, |s| s.project()).flatten() else {
+         return;
+     };
+-    if !is_gadget(&stack.item().id(&*host)) {
++    if !is_gadget(stack.item().id(&*host).unwrap_or_default()) {
+         return;
+     }
+     // Horizon's own item cooldown: the shot sets it for the dig time, and this route ran before the
+@@ -636,7 +665,7 @@ pub(crate) fn right_click(host: HostSide<'_>, event: &mut RightClickBlockEvent<'
+             let held = event
+                 .click
+                 .stack
+-                .is_some_and(|stack| is_gadget(&stack.item().id(&*host)));
++                .is_some_and(|stack| is_gadget(stack.item().id(&*host).unwrap_or_default()));
+             if held && let Some(player) = host.player(uuid) {
+                 fire(host, player, hand, pos, face);
+             }
+@@ -645,7 +674,7 @@ pub(crate) fn right_click(host: HostSide<'_>, event: &mut RightClickBlockEvent<'
+         HostSide::Client(host) => event
+             .click
+             .stack
+-            .is_some_and(|stack| is_gadget(&stack.item().id(host))),
++            .is_some_and(|stack| is_gadget(stack.item().id(host).unwrap_or_default())),
+     };
+     if !held {
+         return Flow::Continue;
+@@ -714,8 +743,8 @@ fn held_gadget(host: &mut dyn ServerHost, player: PlayerRef) -> Option<ItemStack
+         player: player.uuid(),
+         hand: Hand::Main,
+     };
+-    let stack = place.stack(host)?;
+-    is_gadget(&stack.item().id(&*host)).then_some(stack)
++    let stack = place.with_stack(host, |s| s.project()).flatten()?;
++    is_gadget(stack.item().id(&*host).unwrap_or_default()).then_some(stack)
+ }
+ 
+ /// `/mininggadgets info`: the report line, or `None` when the player holds no
+@@ -810,7 +839,11 @@ fn edit_held(
+         hand: Hand::Main,
+     };
+     host.transaction(|host, tx| {
+-        Ok::<bool, Infallible>(place.edit(host, tx, |stack| edit_data(stack, change)))
++        Ok::<bool, Infallible>(
++            place
++                .edit(host, tx, |editor| edit_copy(editor, |stack| edit_data(stack, change)))
++                .is_ok(),
++        )
+     })
+     .unwrap_or(false)
+ }
+diff --git a/src/lib.rs b/src/lib.rs
+index 12c290a..b3976f5 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -20,7 +20,7 @@ pub mod runtime;
+ use mod_api::{
+     self, ClientHost, Command, CommandArgumentValue, CommandSource, ComponentTypesEvent, Flow,
+     Hooks, HostSide, InteractionResult, ItemPart, RegisterCommandsEvent, Registrar,
+-    RegistrationContext, RightClickBlockEvent, RunModCommandEvent, ServerHost, Text, TooltipEvent,
++    RegistrationContext, RightClickBlockEvent, ServerHost, Text, TooltipEvent,
+     UseItemEvent,
+ };
+ 
+@@ -54,8 +54,8 @@ impl Hooks for Mod {
+     /// The component ids the gadget's own data model names, registered before
+     /// content loads, as the retired `component_types` hook did.
+     fn component_types(&self, _context: &RegistrationContext, event: &mut ComponentTypesEvent<'_>) {
+-        event.types.push(gadget::UPGRADES.to_owned());
+-        event.types.push(gadget::RANGE.to_owned());
++        event.register(gadget::UPGRADES.into());
++        event.register(gadget::RANGE.into());
+     }
+ 
+     /// A right click with a held gadget: the laser fires at the aimed face and the
+@@ -67,37 +67,40 @@ impl Hooks for Mod {
+     /// `/mininggadgets info|energy|range|upgrade`: the harness controls the in-game
+     /// check uses (there is no modification table or settings screen in slice 1).
+     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+-        event.commands.push(Command::new("mininggadgets info"));
+         event
+             .commands
+-            .push(Command::op("mininggadgets energy <amount:integer>", 2));
++            .push(Command::new("mininggadgets info").executes(run_command));
+         event
+             .commands
+-            .push(Command::op("mininggadgets range <size:integer>", 2));
++            .push(Command::op("mininggadgets energy <amount:integer>", 2).executes(run_command));
+         event
+             .commands
+-            .push(Command::op("mininggadgets upgrade <name:word>", 2));
++            .push(Command::op("mininggadgets range <size:integer>", 2).executes(run_command));
++        event
++            .commands
++            .push(Command::op("mininggadgets upgrade <name:word>", 2).executes(run_command));
+     }
++}
+ 
+     /// The command bodies, in the acting player's own state. The arguments are
+     /// parsed and resolved by the server's dispatcher, so this only reads the held
+     /// gadget and answers — with the retired bundle's wording, which the in-game
+     /// check matches.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        let literals: Vec<&str> = event.command.literals.iter().map(String::as_str).collect();
+-        let player = match event.source {
++fn run_command(
++    host: &mut dyn ServerHost,
++    source: &CommandSource,
++    command: &mod_api::CommandInvocation,
++) -> Option<i32> {
++        let literals: Vec<&str> = command.literals.iter().map(String::as_str).collect();
++        let player = match source {
+             CommandSource::Player { player, .. } => Some(*player),
+             _ => None,
+         };
+-        let integer = |name: &str| match event.command.argument(name) {
++        let integer = |name: &str| match command.argument(name) {
+             Some(CommandArgumentValue::Integer(amount)) => Some(*amount),
+             _ => None,
+         };
+-        let word = |name: &str| match event.command.argument(name) {
++        let word = |name: &str| match command.argument(name) {
+             Some(CommandArgumentValue::String(word)) => Some(word.clone()),
+             _ => None,
+         };
+@@ -129,11 +132,10 @@ impl Hooks for Mod {
+                 None => "Usage: /mininggadgets upgrade <name>".to_owned(),
+             },
+             (["mininggadgets", _], None) => "Hold a Mining Gadget first.".to_owned(),
+-            _ => return Flow::Continue,
++            _ => return None,
+         };
+         let _ = host.commands().feedback(Text::literal(line));
+-        Flow::Cancel
+-    }
++        Some(1)
+ }
+ 
+ /// The three gadget tiers' Part: the air use and the tooltip. A right click on a

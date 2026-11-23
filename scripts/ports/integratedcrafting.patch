@@ -1,0 +1,316 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 60db588..7ca469b 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -23,7 +23,7 @@ use std::sync::Arc;
+ use mod_api::{
+     BlockEntityEvent, BlockEntityPart, BlockEntityTickEvent, BlockEntityTicksEvent, BlockPart,
+     Compound, Flow, Hooks, Host, LevelSide, RegisterCommandsEvent, Registrar, RegistrationContext,
+-    RunModCommandEvent, ServerHost,
++    ServerHost,
+ };
+ 
+ /// The Crafting Interface block (and its item).
+@@ -57,8 +57,8 @@ impl BlockEntityPart for Interface {
+         event.ticks = true;
+     }
+ 
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        support::on_block_entity_tick(host, event);
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        support::on_block_entity_tick(event);
+     }
+ }
+ 
+@@ -90,12 +90,4 @@ impl Hooks for Mod {
+     fn register_commands(&self, host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+         support::on_register_commands(host, event);
+     }
+-
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        support::on_run_mod_command(host, event)
+-    }
+ }
+diff --git a/src/support.rs b/src/support.rs
+index 0d10058..2dd5bc5 100644
+--- a/src/support.rs
++++ b/src/support.rs
+@@ -15,10 +15,10 @@
+ // (no cross-mod API exists at this pin): they come from this block's own input slots,
+ // and the results stay in its output slots. `notes.md` records that gap by name.
+ use mod_api::{
+-    BlockEntityEvent, BlockEntityTickEvent, BlockEntityTickReply, Command, CommandArgumentValue,
++    BlockEntityEvent, BlockEntityTickEvent, Command, CommandArgumentValue,
+     CommandInvocation, CommandSource, Compound, ENTITY_ITEMS, Flow, Host, HostTransaction,
+     Identifier, ItemResource, ItemStack, LevelRef, ModContainer, PlayerRef, RegisterCommandsEvent,
+-    RunModCommandEvent, ServerHost, Tag, Text,
++    ServerHost, Tag, Text,
+ };
+ 
+ use crate::INTERFACE;
+@@ -63,6 +63,7 @@ pub(crate) fn interface_container() -> ModContainer {
+     let inputs: Vec<usize> = (0..INPUT_SLOTS).collect();
+     let outputs: Vec<usize> = (INPUT_SLOTS..SLOTS).collect();
+     ModContainer {
++        insert_rules: Vec::new(),
+         slots: SLOTS,
+         // `Direction` order: down, up, north, south, west, east.
+         faces: [
+@@ -96,24 +97,30 @@ pub(crate) fn warn_refused(error: impl std::fmt::Display) {
+ /// hopper's change back with [`merge_container`] — for the ingredient **and** the result slots,
+ /// and against the state the interface itself last wrote (the mirror), so a hopper that drains a
+ /// result is not handed the same stack again every tick.
+-pub(crate) fn on_block_entity_tick(
+-    host: &mut dyn ServerHost,
+-    event: &mut BlockEntityTickEvent<'_>,
+-) {
+-    let saved = read_storage(&event.entity.nbt);
+-    let mirror = read_mirror(&event.entity.nbt);
+-    let container = storage_of(host, &event.entity.items);
++pub(crate) fn on_block_entity_tick(event: &mut BlockEntityTickEvent<'_>) {
++    let Some((handle, nbt, entity_items)) = event.subject.with_view(|view| {
++        let items: Vec<Option<ItemStack>> = (0..view.item_slots() as u32)
++            .map(|slot| view.item_slot(slot).and_then(|stack| stack.to_owned()))
++            .collect();
++        (view.handle(), view.nbt().clone(), items)
++    }) else {
++        return;
++    };
++    let host = event.subject.host();
++    let saved = read_storage(&nbt);
++    let mirror = read_mirror(&nbt);
++    let container = storage_of(host, &entity_items);
+     let merged_inputs = merge_container(&saved.inputs, &mirror.inputs, &container.inputs);
+     let merged_outputs = merge_container(&saved.outputs, &mirror.outputs, &container.outputs);
+     let mut storage = Storage::new(merged_inputs, merged_outputs);
+-    let mut engine = read_engine(&Tag::Compound(event.entity.nbt.clone()));
++    let mut engine = read_engine(&Tag::Compound(nbt.clone()));
+     let events = engine.tick(&mut storage);
+     // The container's copy is refreshed from the saved slots whether or not a craft ran, so a
+     // hopper never reads a copy the interface no longer believes.
+-    let container_before = event.entity.items.clone();
++    let container_before = entity_items.clone();
+     let items = items_of(host, &storage, &container_before);
+     let items_changed = items != container_before;
+-    let mut data = event.entity.nbt.clone();
++    let mut data = nbt.clone();
+     save_engine(&mut data, &engine);
+     let written: Vec<Option<Stack>> = storage
+         .inputs
+@@ -122,18 +129,31 @@ pub(crate) fn on_block_entity_tick(
+         .cloned()
+         .collect();
+     write_items(&mut data, &storage.inputs, &storage.outputs, &written);
+-    let data_changed = data != event.entity.nbt;
++    let data_changed = data != nbt;
+     if events.is_empty() && !items_changed && !data_changed {
+         // A waiting job whose ingredients and slots have not changed yet.
+-        *event.reply = BlockEntityTickReply::Unchanged;
+         return;
+     }
+-    if items_changed {
+-        event.entity.items = items;
+-    }
+-    if data_changed {
+-        event.entity.nbt = data;
+-    }
++    event.subject.with_view(|mut view| {
++        if data_changed {
++            for (key, value) in data.iter() {
++                if nbt.get(key) != Some(value) {
++                    view.set_nbt(key.clone(), Some(value.clone()));
++                }
++            }
++            for (key, _) in nbt.iter() {
++                if data.get(key).is_none() {
++                    view.set_nbt(key.clone(), None);
++                }
++            }
++        }
++        if items_changed {
++            for (slot, stack) in items.into_iter().enumerate() {
++                let _ = view.set_item_slot(slot as u32, stack);
++            }
++        }
++    });
++    let _ = handle.set_changed(event.subject.host());
+ }
+ 
+ /// Read the queue out of a block entity's saved compound; an interface nobody has
+@@ -382,7 +402,7 @@ fn int(tag: &Tag, key: &str) -> Option<i64> {
+ fn storage_of(host: &dyn Host, items: &[Option<ItemStack>]) -> Storage {
+     let model = |slot: &Option<ItemStack>| {
+         slot.as_ref()
+-            .map(|stack| Stack::new(stack.item().id(host), stack.count()))
++            .map(|stack| Stack::new(stack.item().id(host).unwrap_or_default(), stack.count()))
+     };
+     let split = INPUT_SLOTS.min(items.len());
+     let inputs = items[..split].iter().map(model).collect();
+@@ -413,7 +433,7 @@ fn rebuild(
+ ) -> Option<ItemStack> {
+     let wanted = wanted.as_ref()?;
+     if let Some(Some(original)) = original
+-        && original.item().id(host) == wanted.item
++        && original.item().id(host) == Some(wanted.item.as_str())
+     {
+         let mut stack = original.clone();
+         let _ = stack.set_count(wanted.count);
+@@ -430,16 +450,16 @@ pub(crate) fn on_register_commands(
+ ) {
+     event
+         .commands
+-        .push(Command::new("integratedcrafting status <pos:block_pos>"));
++        .push(Command::new("integratedcrafting status <pos:block_pos>").executes(on_run_mod_command));
+     event.commands.push(Command::new(
+         "integratedcrafting request <pos:block_pos> <item:item> <count:integer>",
+-    ));
++    ).executes(on_run_mod_command));
+     event
+         .commands
+-        .push(Command::new("integratedcrafting cancel <pos:block_pos>"));
++        .push(Command::new("integratedcrafting cancel <pos:block_pos>").executes(on_run_mod_command));
+     event.commands.push(Command::new(
+         "integratedcrafting feed <pos:block_pos> <item:item> <count:integer>",
+-    ));
++    ).executes(on_run_mod_command));
+ }
+ 
+ /// Run `/integratedcrafting status <x> <y> <z>` (the readout), `request <x> <y> <z>
+@@ -449,33 +469,33 @@ pub(crate) fn on_register_commands(
+ /// this slice).
+ pub(crate) fn on_run_mod_command(
+     host: &mut dyn ServerHost,
+-    event: &mut RunModCommandEvent<'_>,
+-) -> Flow {
+-    let invocation = event.command;
++    source: &CommandSource,
++    invocation: &CommandInvocation,
++) -> Option<i32> {
+     let mut literals = invocation.literals.iter().map(String::as_str);
+     if literals.next() != Some("integratedcrafting") {
+-        return Flow::Continue;
++        return None;
+     }
+     let Some(subcommand) = literals.next() else {
+-        return Flow::Continue;
++        return None;
+     };
+-    let Some(dimension) = invocation.dimension.id(host) else {
++    let Some(dimension) = invocation.dimension.id(host).map(str::to_owned) else {
+         reply(host, "Integrated Crafting: that dimension is not known.");
+-        return Flow::Cancel;
++        return Some(1);
+     };
+     let Some(level) = host.level(&dimension) else {
+         reply(host, "Integrated Crafting: that dimension is not loaded.");
+-        return Flow::Cancel;
++        return Some(1);
+     };
+     let Some(pos) = block_pos(invocation, "pos") else {
+         reply(host, "Usage: /integratedcrafting <subcommand> <x> <y> <z>");
+-        return Flow::Cancel;
++        return Some(1);
+     };
+     // `status` is a readout of this mod's own block; the three that change an interface act on it
+     // as an ordinary interaction does, so a player must be within reach of it. The console, a
+     // command block and a function are the server's own hand and act anywhere (and `feed` from
+     // one of those has no inventory to take from, so it is refused there for that reason).
+-    let player = match event.source {
++    let player = match source {
+         CommandSource::Player { player, .. } => Some(*player),
+         _ => None,
+     };
+@@ -490,7 +510,7 @@ pub(crate) fn on_run_mod_command(
+             host,
+             &format!("Integrated Crafting: stand within {REACH_BLOCKS} blocks of the interface."),
+         );
+-        return Flow::Cancel;
++        return Some(1);
+     }
+     match subcommand {
+         "status" => status(host, level, pos),
+@@ -502,7 +522,7 @@ pub(crate) fn on_run_mod_command(
+             "Usage: /integratedcrafting status|request|cancel|feed <x> <y> <z> ...",
+         ),
+     }
+-    Flow::Cancel
++    Some(1)
+ }
+ 
+ /// `/integratedcrafting status`: the queue's readout, byte for byte the engine's.
+@@ -542,7 +562,7 @@ fn request(
+         );
+         return;
+     };
+-    let output = item.item().id(&*host);
++    let output = item.item().id(&*host).unwrap_or_default().to_owned();
+     let table = crafting_table(&*host);
+     if Engine::recipe_for(&table, &output).is_none() {
+         reply(
+@@ -655,7 +675,7 @@ fn feed(
+     let (id, limit) = {
+         let read: &dyn Host = &*host;
+         (
+-            key.id(read),
++            key.id(read).unwrap_or_default().to_owned(),
+             read.max_stack_size(key).unwrap_or(DEFAULT_OUTPUT_LIMIT),
+         )
+     };
+@@ -713,7 +733,7 @@ fn feed(
+                 if held.item() != key {
+                     continue;
+                 }
+-                taken += source.extract(host, tx, index, &resource, inserted - taken);
++                taken += source.extract_at(host, tx, index, &resource, inserted - taken);
+             }
+             // Not enough in the inventory: nothing moves and nothing is created.
+             Ok::<u32, ()>(taken)
+@@ -730,7 +750,7 @@ fn feed(
+                     .resource(host, index)
+                     .is_some_and(|held| held.item() == key)
+                 {
+-                    left -= source.insert(host, tx, index, &resource, left);
++                    left -= source.insert_at(host, tx, index, &resource, left);
+                 }
+             }
+             Ok::<(), ()>(())
+@@ -754,7 +774,7 @@ fn feed(
+                     .resource(host, index)
+                     .is_some_and(|held| held.item() == key)
+                 {
+-                    left -= source.insert(host, tx, index, &resource, left);
++                    left -= source.insert_at(host, tx, index, &resource, left);
+                 }
+             }
+             Ok::<(), ()>(())
+@@ -908,7 +928,7 @@ fn crafting_table(host: &dyn Host) -> Vec<Recipe> {
+         let mut cells = Vec::with_capacity(recipe.ingredients.len());
+         for ingredient in &recipe.ingredients {
+             let mut ids: Vec<String> = match ingredient.item_keys(host) {
+-                Ok(keys) => keys.iter().map(|key| key.id(host)).collect(),
++                Ok(keys) => keys.iter().filter_map(|key| key.id(host).map(str::to_owned)).collect(),
+                 Err(_) => ingredient.order.clone(),
+             };
+             ids.sort_unstable();
+@@ -925,7 +945,7 @@ fn crafting_table(host: &dyn Host) -> Vec<Recipe> {
+         table.push(Recipe::new(
+             recipe.id.clone(),
+             cells,
+-            result.item().id(host),
++            result.item().id(host).unwrap_or_default().to_owned(),
+             result.count(),
+         ));
+     }
+@@ -986,7 +1006,7 @@ fn interface_at(
+     pos: [i32; 3],
+ ) -> Option<mod_api::BlockEntityRef> {
+     let block = level.block(host, pos)?;
+-    if block.id(host) != INTERFACE {
++    if block.id(host) != Some(INTERFACE) {
+         return None;
+     }
+     host.block_entity(level, pos)

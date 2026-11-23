@@ -1,0 +1,319 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 79dacdf..e33ac54 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -21,13 +21,14 @@
+ //! | `block_entity_tick` (17) | `BlockEntityPart::block_entity_tick` on both Parts |
+ //! | `register_commands` (8) | [`Mod::register_commands`] |
+ //! | `perform_command` (8) | [`Mod::run_mod_command`] |
++mod starling_tick;
+ pub mod runtime;
+ pub mod support;
+ pub mod tubes;
+ 
+ use mod_api::{
+     self, Flow, Hooks, HostSide, LevelTickPostEvent, RegisterCommandsEvent, Registrar,
+-    RegistrationContext, RunModCommandEvent, ServerHost,
++    RegistrationContext, ServerHost,
+ };
+ 
+ /// The mod keeps no state of its own: everything a machine knows is in its block entity's saved
+@@ -50,15 +51,6 @@ impl Hooks for Mod {
+         support::declare_commands(event.commands);
+     }
+ 
+-    /// The command bodies: the dispatcher has already parsed the position and the amount.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        support::run_command(host, event)
+-    }
+-
+     /// After a level's block entities have ticked: hand each handler what was queued for it — the
+     /// air its neighbours sent, and the harness's own sets (`level_tick_post`, API 1). A write
+     /// made inside a block entity's tick is overwritten by that tick's write-back, so everything
+diff --git a/pneumaticcraft/src/starling_tick.rs b/src/starling_tick.rs
+new file mode 100644
+index 0000000..4de1a43
+--- /dev/null
++++ b/src/starling_tick.rs
+@@ -0,0 +1,63 @@
++//! Starling's port to Sunrise's API: a block entity tick written for Horizon's, which handed the
++//! tick the block entity's slots, compound and data slots to change in place, runs here on a copy
++//! of them taken from the tick's view; what it changed is written back and the chunk marked
++//! unsaved, as Horizon's reply did.
++use mod_api::{BlockEntityTickEvent, Compound, ItemStack, ServerHost};
++
++/// The block entity as Horizon's tick had it.
++pub(crate) struct OldEntity {
++    pub items: Vec<Option<ItemStack>>,
++    pub nbt: Compound,
++    pub data: Vec<i32>,
++}
++
++/// Run `body` on a copy of the ticking block entity (its host, the copy, its position).
++pub(crate) fn run(
++    event: &mut BlockEntityTickEvent<'_>,
++    body: impl FnOnce(&mut dyn ServerHost, &mut OldEntity, [i32; 3]),
++) {
++    let Some((handle, pos, before)) = event.subject.with_view(|view| {
++        let items = (0..view.item_slots() as u32)
++            .map(|slot| view.item_slot(slot).and_then(|stack| stack.to_owned()))
++            .collect();
++        let entity = OldEntity {
++            items,
++            nbt: view.nbt().clone(),
++            data: view.data_slots().to_vec(),
++        };
++        (view.handle(), view.position(), entity)
++    }) else {
++        return;
++    };
++    let mut after = OldEntity {
++        items: before.items.clone(),
++        nbt: before.nbt.clone(),
++        data: before.data.clone(),
++    };
++    body(event.subject.host(), &mut after, pos);
++    let mut changed = false;
++    event.subject.with_view(|mut view| {
++        for (key, value) in after.nbt.iter() {
++            if before.nbt.get(key) != Some(value) && view.set_nbt(key.clone(), Some(value.clone())) {
++                changed = true;
++            }
++        }
++        for (key, _) in before.nbt.iter() {
++            if after.nbt.get(key).is_none() && view.set_nbt(key.clone(), None) {
++                changed = true;
++            }
++        }
++        for (slot, stack) in after.items.iter().enumerate() {
++            if before.items.get(slot) != Some(stack) {
++                let _ = view.set_item_slot(slot as u32, stack.clone());
++                changed = true;
++            }
++        }
++        if after.data != before.data && view.set_data_slots(&after.data) {
++            changed = true;
++        }
++    });
++    if changed {
++        let _ = handle.set_changed(event.subject.host());
++    }
++}
+diff --git a/src/support.rs b/src/support.rs
+index 58ed4bc..676e5d4 100644
+--- a/src/support.rs
++++ b/src/support.rs
+@@ -21,10 +21,10 @@ use crate::tubes::{
+     Handler, Side, Sides, Tube, disperse_to_lower, tube_leak, tube_leaks, visual_sides,
+ };
+ use mod_api::{
+-    self, BlockEntityEvent, BlockEntityPart, BlockEntityTickEvent, BlockEntityTickReply,
++    self, BlockEntityEvent, BlockEntityPart, BlockEntityTickEvent,
+     BlockEntityTicksEvent, BlockPart, Command, CommandArgumentValue, Compound, Direction, ENERGY,
+     Flow, Host, HostBlockStates, HostTransaction, LevelRef, LevelSide, ModEnergyBuffer, Registrar,
+-    RegistrationContext, RunModCommandEvent, ServerHost, Tag, Text,
++    RegistrationContext, ServerHost, Tag, Text,
+ };
+ 
+ /// The flux compressor block and its item (`ModBlocks.FLUX_COMPRESSOR`).
+@@ -250,13 +250,13 @@ pub(crate) fn declare(registrar: &mut dyn Registrar, context: &RegistrationConte
+         .blocks(&TUBE_BLOCKS)
+         .build();
+     if let Err(error) = registrar.block_entity_part(&flux_type, FluxPart) {
+-        context.refuse(&error.to_string());
++        registrar.refuse(&error.to_string());
+     }
+     if let Err(error) = registrar.block_entity_part(&dynamo_type, DynamoPart) {
+-        context.refuse(&error.to_string());
++        registrar.refuse(&error.to_string());
+     }
+     if let Err(error) = registrar.block_entity_part(&tube_type, TubePart) {
+-        context.refuse(&error.to_string());
++        registrar.refuse(&error.to_string());
+     }
+ }
+ 
+@@ -305,8 +305,8 @@ impl BlockEntityPart for FluxPart {
+     }
+ 
+     /// One server tick of a flux compressor.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        tick(host, event, Kind::Flux);
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        crate::starling_tick::run(event, |host, entity, pos| tick(host, entity, pos, Kind::Flux));
+     }
+ }
+ 
+@@ -333,8 +333,8 @@ impl BlockEntityPart for DynamoPart {
+     }
+ 
+     /// One server tick of a pneumatic dynamo.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        tick(host, event, Kind::Dynamo);
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        crate::starling_tick::run(event, |host, entity, pos| tick(host, entity, pos, Kind::Dynamo));
+     }
+ }
+ 
+@@ -361,8 +361,8 @@ impl BlockEntityPart for TubePart {
+     }
+ 
+     /// One server tick of a pressure tube of whichever tier stands here.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        tube_tick(host, event);
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        crate::starling_tick::run(event, tube_tick);
+     }
+ }
+ 
+@@ -375,14 +375,19 @@ impl BlockEntityPart for TubePart {
+ /// The order is upstream's: the air handler's tick (disperse to a lower-pressure connected
+ /// machine, then vent what a lone handler cannot keep), the machine itself, the dynamo's push
+ /// into the block its coil faces, then the block state.
+-pub(crate) fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>, kind: Kind) {
+-    let mut saved = std::mem::take(&mut event.entity.nbt);
++pub(crate) fn tick(
++    host: &mut dyn ServerHost,
++    entity: &mut crate::starling_tick::OldEntity,
++    tick_pos: [i32; 3],
++    kind: Kind,
++) {
++    let mut saved = std::mem::take(&mut entity.nbt);
+     let before = saved.clone();
+     let Some(level) = level_in_place(host) else {
+-        event.entity.nbt = saved;
++        entity.nbt = saved;
+         return;
+     };
+-    let pos = event.pos;
++    let pos = tick_pos;
+     let now = level.game_time(&*host).unwrap_or(0).max(0) as u64;
+     let state = level.block_state(&*host, pos);
+     let facing = state
+@@ -480,10 +485,10 @@ pub(crate) fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'
+         host.set_block_property(pos, PROP_ACTIVE, wanted);
+         touched = true;
+     }
+-    event.entity.nbt = saved;
++    entity.nbt = saved;
+     // An idle machine leaves the chunk alone: the retired bundle marked it changed every tick.
+     if !touched {
+-        *event.reply = BlockEntityTickReply::Unchanged;
++        // Unchanged: nothing is written back.
+     }
+ }
+ 
+@@ -528,7 +533,7 @@ struct Neighbour {
+ /// Which handler stands at `pos`, if one does.
+ fn handler_kind_at(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> Option<HandlerKind> {
+     let block = level.block(host, pos)?;
+-    HandlerKind::of(&block.id(host))
++    HandlerKind::of(block.id(host)?)
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -540,19 +545,19 @@ fn handler_kind_at(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> Option<Ha
+ ///
+ /// The order is upstream's: find what is connected, disperse to the lower-pressure neighbours,
+ /// vent if the tube is a dead end, then show the connections on the block state.
+-fn tube_tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-    let mut saved = std::mem::take(&mut event.entity.nbt);
++fn tube_tick(host: &mut dyn ServerHost, entity: &mut crate::starling_tick::OldEntity, tick_pos: [i32; 3]) {
++    let mut saved = std::mem::take(&mut entity.nbt);
+     let before = saved.clone();
+     let Some(level) = level_in_place(host) else {
+-        event.entity.nbt = saved;
++        entity.nbt = saved;
+         return;
+     };
+-    let pos = event.pos;
++    let pos = tick_pos;
+     let Some(tube) = level
+         .block(&*host, pos)
+-        .and_then(|block| Tube::of(&block.id(&*host)))
++        .and_then(|block| block.id(&*host).and_then(Tube::of))
+     else {
+-        event.entity.nbt = saved;
++        entity.nbt = saved;
+         return;
+     };
+     let volume = tube.volume();
+@@ -597,9 +602,9 @@ fn tube_tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+             }
+         }
+     }
+-    event.entity.nbt = saved;
++    entity.nbt = saved;
+     if !touched {
+-        *event.reply = BlockEntityTickReply::Unchanged;
++        // Unchanged: nothing is written back.
+     }
+ }
+ 
+@@ -690,23 +695,26 @@ fn offset(pos: [i32; 3], dir: Direction) -> [i32; 3] {
+ /// The commands (`native_register_commands`, API 8). Upstream has none: they exist so the
+ /// harness can read and set a machine without a GUI or a pressure network (precedent
+ /// `/powah info|set`, `/charginggadgets energy`).
+-pub(crate) fn declare_commands(commands: &mut Vec<Command>) {
+-    commands.push(Command::new("pneumaticcraft info <pos:block_pos>"));
+-    commands.push(Command::op(
+-        "pneumaticcraft air <pos:block_pos> <amount:integer>",
+-        2,
+-    ));
+-    commands.push(Command::op(
+-        "pneumaticcraft energy <pos:block_pos> <amount:integer>",
+-        2,
+-    ));
++pub(crate) fn declare_commands(commands: &mut Vec<mod_api::CommandRegistration>) {
++    commands.push(Command::new("pneumaticcraft info <pos:block_pos>").executes(run_command));
++    commands.push(
++        Command::op("pneumaticcraft air <pos:block_pos> <amount:integer>", 2).executes(run_command),
++    );
++    commands.push(
++        Command::op("pneumaticcraft energy <pos:block_pos> <amount:integer>", 2)
++            .executes(run_command),
++    );
+ }
+ 
+ /// `/pneumaticcraft info|air|energy` (`native_perform_command`, API 8).
+-pub(crate) fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>) -> Flow {
+-    let literals: Vec<&str> = event.command.literals.iter().map(String::as_str).collect();
+-    let pos = block_pos(event.command.argument("pos"));
+-    let amount = match event.command.argument("amount") {
++pub(crate) fn run_command(
++    host: &mut dyn ServerHost,
++    _source: &mod_api::CommandSource,
++    command: &mod_api::CommandInvocation,
++) -> Option<i32> {
++    let literals: Vec<&str> = command.literals.iter().map(String::as_str).collect();
++    let pos = block_pos(command.argument("pos"));
++    let amount = match command.argument("amount") {
+         Some(CommandArgumentValue::Integer(amount)) => Some(*amount),
+         _ => None,
+     };
+@@ -724,10 +732,10 @@ pub(crate) fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEv
+                 None => format!("{pos:?} is not a PneumaticCraft machine."),
+             }
+         }
+-        _ => return Flow::Continue,
++        _ => return None,
+     };
+     let _ = host.commands().feedback(Text::literal(line));
+-    Flow::Cancel
++    Some(1)
+ }
+ 
+ /// The command's `<pos:block_pos>` argument.
+@@ -786,7 +794,7 @@ fn readout(host: &mut dyn ServerHost, pos: [i32; 3]) -> String {
+     let Some(block) = level.block(&*host, pos) else {
+         return format!("{pos:?} is not a mod block entity.");
+     };
+-    let id = block.id(&*host);
++    let id = block.id(&*host).unwrap_or_default().to_owned();
+     let Some(kind) = HandlerKind::of(&id) else {
+         return format!("{pos:?} is a {id} not a PneumaticCraft machine.");
+     };

@@ -1,0 +1,794 @@
+diff --git a/src/blood.rs b/src/blood.rs
+index 2304673..2c7cf86 100644
+--- a/src/blood.rs
++++ b/src/blood.rs
+@@ -18,8 +18,7 @@ use mod_api::{
+     BlockEntityTicksEvent, BlockPart, ClientHost, Command, CommandArgumentValue, CommandInvocation,
+     CommandSource, Component, Compound, EntityRef, Flow, Host, HostTransaction, Identifier,
+     ItemPart, ItemPlace, ItemStack, LevelRef, LevelSide, LivingDeathEvent, ModContainer,
+-    ModFluidTanks, PlayerRef, RandomSource, RegisterCommandsEvent, RunModCommandEvent, Screen,
+-    ScreenDrawEvent, ScreenEvent, ServerHost, Tag, Text, TooltipEvent,
++    ModFluidTanks, PlayerRef, RandomSource, RegisterCommandsEvent, ServerHost, MenuScreenLayout, ScreenSlot, Tag, Text, TooltipEvent,
+ };
+ 
+ use crate::runtime::{
+@@ -36,7 +35,7 @@ pub const CHEST_BLOCK: &str = "blood_chest";
+ const CHEST_ID: &str = "evilcraft:blood_chest";
+ 
+ /// The menu type the content declares (`data/evilcraft/horizon/menu/blood_chest_menu.json`).
+-const MENU: &str = "evilcraft:blood_chest_menu";
++pub(crate) const MENU: &str = "evilcraft:blood_chest_menu";
+ /// Where the extractor keeps its blood: an int under the stack's
+ /// `minecraft:custom_data`. The pin's item fluid helpers carry vanilla's fluids only,
+ /// so a mod fluid lives in the stack's own data.
+@@ -80,92 +79,65 @@ impl BlockEntityPart for Chest {
+ 
+     /// One server tick: empty the container slot into the tank, then repair the stacks
+     /// the tick's pace says are due.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        let entity = &mut *event.entity;
+-        if entity.items.len() < SLOT_COUNT {
+-            return;
+-        }
+-        let mut tank = read_tank(&entity.nbt);
+-        // The container slot empties a blood container into the tank, as upstream's
+-        // `EmptyFluidContainerInTankTickAction` does.
+-        if let Some(container) = entity.items[CONTAINER_SLOT].take() {
+-            // The container stays in its slot once emptied, as upstream's
+-            // `EmptyFluidContainerInTankTickAction` leaves it; the old code dropped the
+-            // extractor item when its last blood went into the tank. Any other item is
+-            // left exactly as it was: only an extractor carries blood.
+-            let extractor = container.item().id(host) == EXTRACTOR;
+-            let (filled, keeps) = drain_container(tank, extractor_blood(&container));
+-            tank = filled;
+-            entity.items[CONTAINER_SLOT] = Some(if extractor {
+-                with_extractor_blood(&container, keeps)
+-            } else {
+-                container
+-            });
+-        }
+-        let ticks = read_int(&entity.nbt, TICKS).unwrap_or(0).max(0) as u32;
+-        if repair_due(ticks) {
+-            for slot in 0..CHEST_SLOTS {
+-                let Some(mut stack) = entity.items[slot].take() else {
+-                    continue;
+-                };
+-                let damage = i32::try_from(stack.damage()).unwrap_or(i32::MAX);
+-                let item = stack.item().id(host);
+-                if can_hold(&item, damage) {
+-                    // Upstream's `RepairItemTickAction`: the action's multiplier scales
+-                    // `mBPerDamage`, and the tank then pays `mBPerDamage x multiplier`.
+-                    if damage > 0 {
+-                        if let Some((left, tank_left)) = repair(damage, tank) {
+-                            write_damage(&mut stack, u32::try_from(left).unwrap_or(0));
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        crate::starling_tick::run(event, |host, entity, _pos| {
++            if entity.items.len() < SLOT_COUNT {
++                return;
++            }
++            let mut tank = read_tank(&entity.nbt);
++            // The container slot empties a blood container into the tank, as upstream's
++            // `EmptyFluidContainerInTankTickAction` does.
++            if let Some(container) = entity.items[CONTAINER_SLOT].take() {
++                // The container stays in its slot once emptied, as upstream's
++                // `EmptyFluidContainerInTankTickAction` leaves it; the old code dropped the
++                // extractor item when its last blood went into the tank. Any other item is
++                // left exactly as it was: only an extractor carries blood.
++                let extractor = container.item().id(host).unwrap_or_default() == EXTRACTOR;
++                let (filled, keeps) = drain_container(tank, extractor_blood(&container));
++                tank = filled;
++                entity.items[CONTAINER_SLOT] = Some(if extractor {
++                    with_extractor_blood(&container, keeps)
++                } else {
++                    container
++                });
++            }
++            let ticks = read_int(&entity.nbt, TICKS).unwrap_or(0).max(0) as u32;
++            if repair_due(ticks) {
++                for slot in 0..CHEST_SLOTS {
++                    let Some(mut stack) = entity.items[slot].take() else {
++                        continue;
++                    };
++                    let damage = i32::try_from(stack.damage()).unwrap_or(i32::MAX);
++                    let item = stack.item().id(host).unwrap_or_default();
++                    if can_hold(&item, damage) {
++                        // Upstream's `RepairItemTickAction`: the action's multiplier scales
++                        // `mBPerDamage`, and the tank then pays `mBPerDamage x multiplier`.
++                        if damage > 0 {
++                            if let Some((left, tank_left)) = repair(damage, tank) {
++                                write_damage(&mut stack, u32::try_from(left).unwrap_or(0));
++                                tank = tank_left;
++                            }
++                        } else if let Some((next, tank_left)) = anvil_step(&item, tank)
++                            && let Some(whole) = item_stack(host, next)
++                        {
++                            stack = whole;
+                             tank = tank_left;
+                         }
+-                    } else if let Some((next, tank_left)) = anvil_step(&item, tank)
+-                        && let Some(whole) = item_stack(host, next)
+-                    {
+-                        stack = whole;
+-                        tank = tank_left;
+                     }
++                    entity.items[slot] = Some(stack);
+                 }
+-                entity.items[slot] = Some(stack);
+             }
+-        }
+-        write_tank(&mut entity.nbt, tank);
+-        write_int(&mut entity.nbt, TICKS, ticks.wrapping_add(1) as i32);
+-        // The menu's two data slots: the tank and its capacity. Set only where the
+-        // value moved, because the vector is what the window syncs.
+-        if entity.data.len() != 2 || entity.data[0] != tank {
+-            entity.data = vec![tank, TANK_CAPACITY];
+-        }
+-    }
+-
+-    /// The chest's eleven-slot layout: ten repair slots in two rows of five, the
+-    /// container slot beside them, the player's inventory under.
+-    fn screen(&self, _host: &dyn Host, _event: &mut ScreenEvent<'_>) -> Option<Screen> {
+-        let mut slots = Vec::with_capacity(SLOT_COUNT);
+-        for row in 0..2 {
+-            for column in 0..5 {
+-                slots.push(Some([8.0 + 18.0 * column as f32, 18.0 + 18.0 * row as f32]));
++            write_tank(&mut entity.nbt, tank);
++            write_int(&mut entity.nbt, TICKS, ticks.wrapping_add(1) as i32);
++            // The menu's two data slots: the tank and its capacity. Set only where the
++            // value moved, because the vector is what the window syncs.
++            if entity.data.len() != 2 || entity.data[0] != tank {
++                entity.data = vec![tank, TANK_CAPACITY];
+             }
+-        }
+-        slots.push(Some([116.0, 27.0]));
+-        Some(Screen {
+-            width: 176.0,
+-            height: 166.0,
+-            slots,
+-            inventory_y: 84.0,
+-            inventory_x: 8.0,
+-            own_labels: false,
+-            own_background: false,
+-            ..Screen::default()
+-        })
++        });
+     }
+ 
+-    /// The chest's tank readout: the menu's data slots are `[tank, capacity]`.
+-    fn screen_draw(&self, _host: &dyn ClientHost, event: &mut ScreenDrawEvent<'_>) {
+-        let tank = event.data.first().copied().unwrap_or(0).max(0);
+-        let text = format!("{tank} / {TANK_CAPACITY} mB");
+-        let at = [event.origin[0] + 8.0, event.origin[1] + 58.0];
+-        event.draw.text(&text, at, 0xFF40_4040, false);
+-    }
++
+ }
+ 
+ #[mod_api::sunrise_part]
+@@ -277,13 +249,18 @@ fn fill_for(host: &mut dyn ServerHost, player: PlayerRef, health: f32) {
+     // random, so the draw moves vanilla's later ones as a Java mod's does.
+     let span = i32::try_from(kill_span(health)).unwrap_or(1).max(1);
+     let roll = level
+-        .with_random(host, |random| random.next_int_bound(span).unwrap_or(0))
++        .with_random(host, |random| random.next_int_bound(span))
+         .unwrap_or(0);
+     let blood = blood_from_kill(health, u32::try_from(roll.max(0)).unwrap_or(0));
+     if blood <= 0 {
+         return;
+     }
+-    let Some(slots) = player.inventory_slots(host) else {
++    // Starling: the inventory is lent; the occupied slots' stacks are copied out, as the old read gave them.
++    let Some(slots) = player.with_inventory(host, |view| {
++        view.iter()
++            .filter_map(|(slot, stack)| stack.project().map(|stack| (slot, stack)))
++            .collect::<Vec<_>>()
++    }) else {
+         return;
+     };
+     let mut pool = blood;
+@@ -291,7 +268,7 @@ fn fill_for(host: &mut dyn ServerHost, player: PlayerRef, health: f32) {
+         if pool <= 0 {
+             break;
+         }
+-        if stack.item().id(host) != EXTRACTOR {
++        if stack.item().id(host).unwrap_or_default() != EXTRACTOR {
+             continue;
+         }
+         let held = extractor_blood(&stack);
+@@ -330,39 +307,41 @@ pub fn register_commands(_host: &mut dyn ServerHost, event: &mut RegisterCommand
+     event.commands.push(Command::op(
+         "evilcraft info <pos:block_pos>",
+         OPERATOR_LEVEL,
+-    ));
++    ).executes(run_command));
+     event.commands.push(Command::op(
+         "evilcraft blood <pos:block_pos> <amount:integer>",
+         2,
+-    ));
++    ).executes(run_command));
+     event.commands.push(Command::op(
+         "evilcraft damage <pos:block_pos> <slot:integer> <amount:integer>",
+         2,
+-    ));
++    ).executes(run_command));
+     // The infuser's readout and its slot loader: the machine's own menu is the player's
+     // route, these let a scenario read and feed it without a GUI.
+     event.commands.push(Command::op(
+         "evilcraft infuser <pos:block_pos>",
+         OPERATOR_LEVEL,
+-    ));
++    ).executes(run_command));
+     // `<id:id>` is a free `namespace:path` identifier: a `word` argument stops at the
+     // colon (the campaign's `item`-argument trap, so no `item` kind here).
+     event.commands.push(Command::op(
+         "evilcraft load <pos:block_pos> <slot:integer> <id:id>",
+         2,
+-    ));
+-    event.commands.push(Command::new("evilcraft held"));
++    ).executes(run_command));
++    event.commands.push(Command::new("evilcraft held").executes(run_command));
+     event
+         .commands
+-        .push(Command::op("evilcraft held <amount:integer>", 2));
++        .push(Command::op("evilcraft held <amount:integer>", 2).executes(run_command));
+ }
+ 
+ /// `/evilcraft info|blood|damage|infuser|load|held` (`run_mod_command`).
+-pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>) -> Flow {
+-    let source = event.source;
+-    let invocation = event.command;
++pub fn run_command(
++    host: &mut dyn ServerHost,
++    source: &CommandSource,
++    invocation: &CommandInvocation,
++) -> Option<i32> {
+     if invocation.literals.first().map(String::as_str) != Some("evilcraft") {
+-        return Flow::Continue;
++        return None;
+     }
+     match invocation.literals.get(1).map_or("", String::as_str) {
+         "info" => info(host, source, invocation),
+@@ -376,7 +355,7 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
+             "usage: /evilcraft info|blood|damage|infuser|load|held ...".to_owned(),
+         ),
+     }
+-    Flow::Cancel
++    Some(1)
+ }
+ 
+ /// `/evilcraft info <pos>`: the tank, the container slot and every chest slot's damage.
+@@ -401,7 +380,7 @@ fn info(host: &mut dyn ServerHost, source: &CommandSource, invocation: &CommandI
+     };
+     let tank = read_tank(&data);
+     let container = match entity.item_slot(host, CONTAINER_SLOT as u32) {
+-        Ok(Some(stack)) => format!("{}@{}", stack.item().id(host), extractor_blood(&stack)),
++        Ok(Some(stack)) => format!("{}@{}", stack.item().id(host).unwrap_or_default(), extractor_blood(&stack)),
+         Ok(None) => "empty@0".to_owned(),
+         Err(_) => "unknown@0".to_owned(),
+     };
+@@ -412,7 +391,7 @@ fn info(host: &mut dyn ServerHost, source: &CommandSource, invocation: &CommandI
+         };
+         slots.push_str(&format!(
+             "{slot}:{}@{} ",
+-            stack.item().id(host),
++            stack.item().id(host).unwrap_or_default(),
+             stack.damage()
+         ));
+     }
+@@ -486,7 +465,7 @@ fn set_damage(host: &mut dyn ServerHost, source: &CommandSource, invocation: &Co
+         return;
+     };
+     write_damage(&mut stack, u32::try_from(amount.max(0)).unwrap_or(0));
+-    let item = stack.item().id(host);
++    let item = stack.item().id(host).unwrap_or_default().to_owned();
+     let slot = u32::try_from(slot.max(0)).unwrap_or(0);
+     let written = host
+         .transaction(|host, tx| -> Result<bool, ()> {
+@@ -526,11 +505,11 @@ fn held(host: &mut dyn ServerHost, source: &CommandSource, invocation: &CommandI
+                 player: player.uuid(),
+                 slot: i32::try_from(slot).unwrap_or(0),
+             };
+-            let Some(stack) = place.stack(host) else {
++            let Some(stack) = place.with_stack(host, |s| s.project()).flatten() else {
+                 say(host, "Hold a Blood Extractor first.".to_owned());
+                 return;
+             };
+-            if stack.item().id(host) != EXTRACTOR {
++            if stack.item().id(host).unwrap_or_default() != EXTRACTOR {
+                 say(host, "Hold a Blood Extractor first.".to_owned());
+                 return;
+             }
+@@ -553,11 +532,11 @@ fn held(host: &mut dyn ServerHost, source: &CommandSource, invocation: &CommandI
+                 player: player.uuid(),
+                 slot: i32::try_from(slot).unwrap_or(0),
+             };
+-            let Some(stack) = place.stack(host) else {
++            let Some(stack) = place.with_stack(host, |s| s.project()).flatten() else {
+                 say(host, "Hold a Blood Extractor first.".to_owned());
+                 return;
+             };
+-            if stack.item().id(host) != EXTRACTOR {
++            if stack.item().id(host).unwrap_or_default() != EXTRACTOR {
+                 say(host, "Hold a Blood Extractor first.".to_owned());
+                 return;
+             }
+@@ -610,7 +589,7 @@ pub(crate) fn our_entity(
+     };
+     let ours = level
+         .block(host, pos)
+-        .is_some_and(|key| key.id(host) == block);
++        .is_some_and(|key| key.id(host) == Some(block));
+     match host.block_entity(level, pos) {
+         Some(entity) if ours && entity.data(host).is_some() => Some(entity),
+         _ => {
+@@ -631,7 +610,7 @@ fn either_machine(
+         return None;
+     };
+     let ours = level.block(host, pos).is_some_and(|key| {
+-        let id = key.id(host);
++        let id = key.id(host).unwrap_or_default();
+         id == CHEST_ID || id == crate::infuser::INFUSER_ID
+     });
+     match host.block_entity(level, pos) {
+@@ -837,3 +816,30 @@ mod tests {
+         assert_eq!(CHEST_ID, format!("evilcraft:{CHEST_BLOCK}"));
+     }
+ }
++
++/// The chest's screen: its eleven slots and the tank readout.
++pub(crate) fn chest_screen(_host: &dyn ClientHost, _open: mod_api::MenuScreenOpen<'_>) -> Option<mod_api::MenuScreen> {
++        let mut slots = Vec::with_capacity(SLOT_COUNT);
++        for row in 0..2 {
++            for column in 0..5 {
++                slots.push(Some(ScreenSlot { position: [8.0 + 18.0 * column as f32, 18.0 + 18.0 * row as f32], no_item_icon: None }));
++            }
++        }
++        slots.push(Some(ScreenSlot { position: [116.0, 27.0], no_item_icon: None }));
++        let layout = MenuScreenLayout {
++            width: 176.0,
++            height: 166.0,
++            slots,
++            inventory_y: 84.0,
++            inventory_x: 8.0,
++            own_labels: false,
++            own_background: false,
++            ..MenuScreenLayout::default()
++        };
++    Some(mod_api::MenuScreen::new(layout).with_draw(|_host, frame, draw| {
++        let tank = frame.data.first().copied().unwrap_or(0).max(0);
++        let text = format!("{tank} / {TANK_CAPACITY} mB");
++        let at = [frame.origin[0] + 8.0, frame.origin[1] + 58.0];
++        draw.text(&text, at, 0xFF40_4040, false);
++    }))
++}
+diff --git a/src/infuser.rs b/src/infuser.rs
+index 057afc1..82ba2de 100644
+--- a/src/infuser.rs
++++ b/src/infuser.rs
+@@ -15,7 +15,7 @@ use mod_api::{
+     self, BlockEntityEvent, BlockEntityPart, BlockEntityRef, BlockEntityTickEvent,
+     BlockEntityTicksEvent, BlockPart, ClientHost, CommandArgumentValue, CommandInvocation,
+     CommandSource, Compound, Host, HostTransaction, Identifier, ItemStack, LevelSide, ModContainer,
+-    ModFluidTanks, Screen, ScreenDrawEvent, ScreenEvent, ServerHost,
++    ModFluidTanks, ServerHost, MenuScreenLayout, ScreenSlot,
+ };
+ 
+ use crate::runtime::{
+@@ -30,7 +30,7 @@ pub const INFUSER_BLOCK: &str = "blood_infuser";
+ /// The block's full id, as `Level::block` names it.
+ pub const INFUSER_ID: &str = "evilcraft:blood_infuser";
+ /// The menu type the content declares (`data/evilcraft/horizon/menu/blood_infuser_menu.json`).
+-const MENU: &str = "evilcraft:blood_infuser_menu";
++pub(crate) const MENU: &str = "evilcraft:blood_infuser_menu";
+ /// The block entity's saved infusion progress, in ticks.
+ const PROGRESS: &str = "progress";
+ 
+@@ -248,117 +248,77 @@ impl BlockEntityPart for Infuser {
+ 
+     /// One server tick: empty the container slot into the tank, then advance the
+     /// infusion the input slot names, at the tier the upgrade slots set.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        let entity = &mut *event.entity;
+-        if entity.items.len() < INFUSER_SLOTS {
+-            return;
+-        }
+-        let mut tank = crate::blood::read_tank(&entity.nbt);
+-        // The container slot empties a blood container into the tank, upstream's
+-        // `EmptyFluidContainerInTankTickAction` (the same action the chest runs).
+-        if let Some(container) = entity.items[crate::runtime::INFUSER_CONTAINER_SLOT].take() {
+-            let extractor = container.item().id(host) == crate::runtime::EXTRACTOR;
+-            let (filled, keeps) =
+-                crate::runtime::drain_container(tank, crate::blood::extractor_blood(&container));
+-            tank = filled;
+-            entity.items[crate::runtime::INFUSER_CONTAINER_SLOT] = Some(if extractor {
+-                crate::blood::with_extractor_blood(&container, keeps)
+-            } else {
+-                container
+-            });
+-        }
+-        // The machine's tier is the promise in its upgrade slots (`ItemPromise`).
+-        let mut tier = 0;
+-        for slot in 3..INFUSER_SLOTS {
+-            if let Some(stack) = &entity.items[slot] {
+-                tier = tier.max(crate::runtime::machine_tier([stack
+-                    .item()
+-                    .id(host)
+-                    .as_str()]));
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        crate::starling_tick::run(event, |host, entity, _pos| {
++            if entity.items.len() < INFUSER_SLOTS {
++                return;
+             }
+-        }
+-        let progress = crate::blood::read_int(&entity.nbt, PROGRESS)
+-            .unwrap_or(0)
+-            .max(0) as u32;
+-        let input = entity.items[INFUSER_INPUT_SLOT]
+-            .as_ref()
+-            .map(|stack| stack.item().id(host).to_owned());
+-        let recipe = input.as_deref().and_then(|item| {
+-            let recipes = recipes(&*host);
+-            infusion_for(&recipes, item, tier).cloned()
+-        });
+-        let mut next = 0;
+-        let mut required = 0;
+-        if let Some(recipe) = &recipe {
+-            required = recipe.ticks;
+-            // Upstream's `canTick`: the result slot must take the product, then the
+-            // tank must pay the recipe's blood. A refusal resets the progress.
+-            if output_fits(host, entity.items[INFUSER_OUTPUT_SLOT].as_ref(), recipe)
+-                && let Some((advanced, done)) = infuse_tick(progress, recipe, tank)
+-            {
+-                if done {
+-                    if produce(host, &mut entity.items, recipe) {
+-                        tank = (tank - recipe.blood).max(0);
++            let mut tank = crate::blood::read_tank(&entity.nbt);
++            // The container slot empties a blood container into the tank, upstream's
++            // `EmptyFluidContainerInTankTickAction` (the same action the chest runs).
++            if let Some(container) = entity.items[crate::runtime::INFUSER_CONTAINER_SLOT].take() {
++                let extractor = container.item().id(host).unwrap_or_default() == crate::runtime::EXTRACTOR;
++                let (filled, keeps) =
++                    crate::runtime::drain_container(tank, crate::blood::extractor_blood(&container));
++                tank = filled;
++                entity.items[crate::runtime::INFUSER_CONTAINER_SLOT] = Some(if extractor {
++                    crate::blood::with_extractor_blood(&container, keeps)
++                } else {
++                    container
++                });
++            }
++            // The machine's tier is the promise in its upgrade slots (`ItemPromise`).
++            let mut tier = 0;
++            for slot in 3..INFUSER_SLOTS {
++                if let Some(stack) = &entity.items[slot] {
++                    tier = tier.max(crate::runtime::machine_tier([stack
++                        .item()
++                        .id(host)
++                        .unwrap_or_default()]));
++                }
++            }
++            let progress = crate::blood::read_int(&entity.nbt, PROGRESS)
++                .unwrap_or(0)
++                .max(0) as u32;
++            let input = entity.items[INFUSER_INPUT_SLOT]
++                .as_ref()
++                .map(|stack| stack.item().id(host).unwrap_or_default().to_owned());
++            let recipe = input.as_deref().and_then(|item| {
++                let recipes = recipes(&*host);
++                infusion_for(&recipes, item, tier).cloned()
++            });
++            let mut next = 0;
++            let mut required = 0;
++            if let Some(recipe) = &recipe {
++                required = recipe.ticks;
++                // Upstream's `canTick`: the result slot must take the product, then the
++                // tank must pay the recipe's blood. A refusal resets the progress.
++                if output_fits(host, entity.items[INFUSER_OUTPUT_SLOT].as_ref(), recipe)
++                    && let Some((advanced, done)) = infuse_tick(progress, recipe, tank)
++                {
++                    if done {
++                        if produce(host, &mut entity.items, recipe) {
++                            tank = (tank - recipe.blood).max(0);
++                        } else {
++                            next = progress;
++                        }
+                     } else {
+-                        next = progress;
++                        next = advanced;
+                     }
+-                } else {
+-                    next = advanced;
+                 }
+             }
+-        }
+-        crate::blood::write_int(&mut entity.nbt, PROGRESS, next as i32);
+-        crate::blood::write_tank(&mut entity.nbt, tank);
+-        // The menu's three data slots: the tank, the progress and its duration.
+-        let required = i32::try_from(required).unwrap_or(i32::MAX);
+-        let data = vec![tank, next as i32, required];
+-        if entity.data != data {
+-            entity.data = data;
+-        }
++            crate::blood::write_int(&mut entity.nbt, PROGRESS, next as i32);
++            crate::blood::write_tank(&mut entity.nbt, tank);
++            // The menu's three data slots: the tank, the progress and its duration.
++            let required = i32::try_from(required).unwrap_or(i32::MAX);
++            let data = vec![tank, next as i32, required];
++            if entity.data != data {
++                entity.data = data;
++            }
++        });
+     }
+ 
+-    /// The infuser's layout: the container, infusion and result slots in a row, the four
+-    /// upgrade slots above them, the player's inventory under.
+-    fn screen(&self, _host: &dyn Host, _event: &mut ScreenEvent<'_>) -> Option<Screen> {
+-        let mut slots = Vec::with_capacity(INFUSER_SLOTS);
+-        slots.push(Some([8.0, 36.0]));
+-        slots.push(Some([79.0, 36.0]));
+-        slots.push(Some([133.0, 36.0]));
+-        for column in 0..crate::runtime::UPGRADE_SLOTS {
+-            slots.push(Some([8.0 + 18.0 * column as f32, 18.0]));
+-        }
+-        Some(Screen {
+-            width: 176.0,
+-            height: 166.0,
+-            slots,
+-            inventory_y: 84.0,
+-            inventory_x: 8.0,
+-            own_labels: false,
+-            own_background: false,
+-            ..Screen::default()
+-        })
+-    }
+ 
+-    /// The infuser's readouts: its tank and the infusion's progress.
+-    fn screen_draw(&self, _host: &dyn ClientHost, event: &mut ScreenDrawEvent<'_>) {
+-        let tank = event.data.first().copied().unwrap_or(0).max(0);
+-        let progress = event.data.get(1).copied().unwrap_or(0).max(0);
+-        let required = event.data.get(2).copied().unwrap_or(0).max(0);
+-        let salt = format!("{tank} / {INFUSER_TANK} mB");
+-        let work = format!("{progress} / {required} t");
+-        event.draw.text(
+-            &salt,
+-            [event.origin[0] + 8.0, event.origin[1] + 58.0],
+-            0xFF40_4040,
+-            false,
+-        );
+-        event.draw.text(
+-            &work,
+-            [event.origin[0] + 8.0, event.origin[1] + 68.0],
+-            0xFF40_4040,
+-            false,
+-        );
+-    }
+ }
+ 
+ /// Whether the result slot takes the recipe's product: empty, or the same item with
+@@ -367,7 +327,7 @@ fn output_fits(host: &dyn Host, slot: Option<&ItemStack>, recipe: &Infusion) ->
+     let Some(stack) = slot else {
+         return true;
+     };
+-    if stack.item().id(host) != recipe.output {
++    if stack.item().id(host).unwrap_or_default() != recipe.output {
+         return false;
+     }
+     let max = host.max_stack_size(stack.item()).unwrap_or(64);
+@@ -444,7 +404,7 @@ pub fn readout(host: &mut dyn ServerHost, source: &CommandSource, invocation: &C
+             tier = tier.max(crate::runtime::machine_tier([stack
+                 .item()
+                 .id(host)
+-                .as_str()]));
++                .unwrap_or_default()]));
+         }
+     }
+     let container = container_line(host, &entity);
+@@ -467,7 +427,7 @@ pub fn readout(host: &mut dyn ServerHost, source: &CommandSource, invocation: &C
+ /// `item@count`, or `empty@0`.
+ fn stack_line(host: &mut dyn ServerHost, entity: &BlockEntityRef, slot: usize) -> String {
+     match entity.item_slot(host, slot as u32) {
+-        Ok(Some(stack)) => format!("{}@{}", stack.item().id(host), stack.count()),
++        Ok(Some(stack)) => format!("{}@{}", stack.item().id(host).unwrap_or_default(), stack.count()),
+         Ok(None) => "empty@0".to_owned(),
+         Err(_) => "unknown@0".to_owned(),
+     }
+@@ -478,7 +438,7 @@ fn container_line(host: &mut dyn ServerHost, entity: &BlockEntityRef) -> String
+     match entity.item_slot(host, crate::runtime::INFUSER_CONTAINER_SLOT as u32) {
+         Ok(Some(stack)) => format!(
+             "{}@{}",
+-            stack.item().id(host),
++            stack.item().id(host).unwrap_or_default(),
+             crate::blood::extractor_blood(&stack)
+         ),
+         Ok(None) => "empty@0".to_owned(),
+@@ -556,3 +516,43 @@ fn entity_at(
+ ) -> Option<BlockEntityRef> {
+     crate::blood::our_entity(host, source, pos, INFUSER_ID, "Blood Infuser")
+ }
++
++/// The infuser's screen: its seven slots, the tank and the infusion's progress.
++pub(crate) fn infuser_screen(_host: &dyn ClientHost, _open: mod_api::MenuScreenOpen<'_>) -> Option<mod_api::MenuScreen> {
++        let mut slots = Vec::with_capacity(INFUSER_SLOTS);
++        slots.push(Some(ScreenSlot { position: [8.0, 36.0], no_item_icon: None }));
++        slots.push(Some(ScreenSlot { position: [79.0, 36.0], no_item_icon: None }));
++        slots.push(Some(ScreenSlot { position: [133.0, 36.0], no_item_icon: None }));
++        for column in 0..crate::runtime::UPGRADE_SLOTS {
++            slots.push(Some(ScreenSlot { position: [8.0 + 18.0 * column as f32, 18.0], no_item_icon: None }));
++        }
++        let layout = MenuScreenLayout {
++            width: 176.0,
++            height: 166.0,
++            slots,
++            inventory_y: 84.0,
++            inventory_x: 8.0,
++            own_labels: false,
++            own_background: false,
++            ..MenuScreenLayout::default()
++        };
++    Some(mod_api::MenuScreen::new(layout).with_draw(|_host, frame, draw| {
++        let tank = frame.data.first().copied().unwrap_or(0).max(0);
++        let progress = frame.data.get(1).copied().unwrap_or(0).max(0);
++        let required = frame.data.get(2).copied().unwrap_or(0).max(0);
++        let salt = format!("{tank} / {INFUSER_TANK} mB");
++        let work = format!("{progress} / {required} t");
++        draw.text(
++            &salt,
++            [frame.origin[0] + 8.0, frame.origin[1] + 58.0],
++            0xFF40_4040,
++            false,
++        );
++        draw.text(
++            &work,
++            [frame.origin[0] + 8.0, frame.origin[1] + 68.0],
++            0xFF40_4040,
++            false,
++        );
++    }))
++}
+diff --git a/src/lib.rs b/src/lib.rs
+index 23505b8..cda28c5 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -13,6 +13,7 @@
+ //! player. The mod keeps no state of its own: the tank lives in the block entity's saved
+ //! compound, the extractor's blood in the stack's components, and a broken machine's tank
+ //! travels on its own item as `minecraft:block_entity_data` ([`tank`]).
++mod starling_tick;
+ pub mod blood;
+ pub mod infuser;
+ pub mod runtime;
+@@ -20,7 +21,7 @@ pub mod tank;
+ 
+ use mod_api::{
+     self, BlockDropsEvent, Flow, Hooks, LevelHost, LivingDeathEvent, RegisterCommandsEvent,
+-    Registrar, RegistrationContext, RunModCommandEvent, ServerHost,
++    Registrar, RegistrationContext, ServerHost,
+ };
+ 
+ /// The mod has no settings and no state of its own.
+@@ -69,6 +70,11 @@ impl Hooks for Mod {
+         r.register_raw_recipe_serializer(runtime::INFUSION_TYPE, runtime::INFUSION_TYPE);
+         // The infuser's own item, the second machine whose drop carries its tank.
+         tank::Machine::Infuser.register(r);
++        // The two machines' screens, on their own menu types.
++        r.register_menu_screen(blood::MENU, std::sync::Arc::new(blood::chest_screen))
++            .expect("evilcraft declares the blood chest's menu");
++        r.register_menu_screen(infuser::MENU, std::sync::Arc::new(infuser::infuser_screen))
++            .expect("evilcraft declares the blood infuser's menu");
+     }
+ 
+     /// A broken Blood Chest or Blood Infuser drops its own item carrying the blood in its
+@@ -89,13 +95,4 @@ impl Hooks for Mod {
+     fn register_commands(&self, host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+         blood::register_commands(host, event);
+     }
+-
+-    /// Run a parsed `/evilcraft ...` command.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        blood::run_command(host, event)
+-    }
+ }
+diff --git a/evilcraft/src/starling_tick.rs b/src/starling_tick.rs
+new file mode 100644
+index 0000000..4de1a43
+--- /dev/null
++++ b/src/starling_tick.rs
+@@ -0,0 +1,63 @@
++//! Starling's port to Sunrise's API: a block entity tick written for Horizon's, which handed the
++//! tick the block entity's slots, compound and data slots to change in place, runs here on a copy
++//! of them taken from the tick's view; what it changed is written back and the chunk marked
++//! unsaved, as Horizon's reply did.
++use mod_api::{BlockEntityTickEvent, Compound, ItemStack, ServerHost};
++
++/// The block entity as Horizon's tick had it.
++pub(crate) struct OldEntity {
++    pub items: Vec<Option<ItemStack>>,
++    pub nbt: Compound,
++    pub data: Vec<i32>,
++}
++
++/// Run `body` on a copy of the ticking block entity (its host, the copy, its position).
++pub(crate) fn run(
++    event: &mut BlockEntityTickEvent<'_>,
++    body: impl FnOnce(&mut dyn ServerHost, &mut OldEntity, [i32; 3]),
++) {
++    let Some((handle, pos, before)) = event.subject.with_view(|view| {
++        let items = (0..view.item_slots() as u32)
++            .map(|slot| view.item_slot(slot).and_then(|stack| stack.to_owned()))
++            .collect();
++        let entity = OldEntity {
++            items,
++            nbt: view.nbt().clone(),
++            data: view.data_slots().to_vec(),
++        };
++        (view.handle(), view.position(), entity)
++    }) else {
++        return;
++    };
++    let mut after = OldEntity {
++        items: before.items.clone(),
++        nbt: before.nbt.clone(),
++        data: before.data.clone(),
++    };
++    body(event.subject.host(), &mut after, pos);
++    let mut changed = false;
++    event.subject.with_view(|mut view| {
++        for (key, value) in after.nbt.iter() {
++            if before.nbt.get(key) != Some(value) && view.set_nbt(key.clone(), Some(value.clone())) {
++                changed = true;
++            }
++        }
++        for (key, _) in before.nbt.iter() {
++            if after.nbt.get(key).is_none() && view.set_nbt(key.clone(), None) {
++                changed = true;
++            }
++        }
++        for (slot, stack) in after.items.iter().enumerate() {
++            if before.items.get(slot) != Some(stack) {
++                let _ = view.set_item_slot(slot as u32, stack.clone());
++                changed = true;
++            }
++        }
++        if after.data != before.data && view.set_data_slots(&after.data) {
++            changed = true;
++        }
++    });
++    if changed {
++        let _ = handle.set_changed(event.subject.host());
++    }
++}
+diff --git a/src/tank.rs b/src/tank.rs
+index ae660e2..2dec538 100644
+--- a/src/tank.rs
++++ b/src/tank.rs
+@@ -167,9 +167,15 @@ pub fn on_drops(level: &dyn LevelHost, event: &mut BlockDropsEvent<'_>) -> Flow
+     let Some(item) = machine.item() else {
+         return Flow::Continue;
+     };
+-    for drop in event.drops.iter_mut() {
+-        if drop.stack.item() == item {
+-            let _ = drop.stack.apply_components(&patch);
++    // Starling: the prepared drops are read and written by index.
++    for i in 0..event.drops.len() {
++        let Some(mut stack) = event.drops.get(i).and_then(|d| d.stack()).and_then(|s| s.project()) else {
++            continue;
++        };
++        if stack.item() == item && stack.apply_components(&patch).is_ok()
++            && let Some(mut drop) = event.drops.get_mut(i)
++        {
++            let _ = drop.set_stack(stack);
+         }
+     }
+     Flow::Continue
+@@ -203,7 +209,7 @@ impl ItemPart for MachineItem {
+         };
+         let ours = level
+             .block(&*host, event.pos)
+-            .is_some_and(|block| Machine::of_block(&block.id(&*host)).is_some());
++            .is_some_and(|block| Machine::of_block(block.id(&*host).unwrap_or_default()).is_some());
+         if !ours {
+             return;
+         }
