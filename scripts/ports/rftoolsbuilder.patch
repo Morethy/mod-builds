@@ -1,0 +1,449 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 783a756..93e6c19 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -17,12 +17,15 @@
+ //! and hollow cells, the clamps and the walk) and [`support`] is the game glue.
+ //! See `notes.md` for the slice boundary, the deliberate deviations and the
+ //! gaps.
++mod starling_tick;
++mod starling_command;
+ pub mod runtime;
+ mod support;
+ 
++use crate::starling_command::RunModCommandEvent;
+ use mod_api::{
+     self, ComponentTypesEvent, Flow, Hooks, HostSide, RegisterCommandsEvent, Registrar,
+-    RegistrationContext, RightClickBlockEvent, RunModCommandEvent, ServerHost,
++    RegistrationContext, RightClickBlockEvent, ServerHost,
+ };
+ 
+ /// The mod holds no state of its own: a Builder's progress is its block
+@@ -41,7 +44,7 @@ impl Hooks for Mod {
+     /// The `rftoolsbuilder:shape_card` component, registered before content (and
+     /// so every card stack's codec) loads.
+     fn component_types(&self, _cx: &RegistrationContext, event: &mut ComponentTypesEvent<'_>) {
+-        event.types.push(support::COMPONENT.to_owned());
++        event.register(support::COMPONENT.to_owned().into());
+     }
+ 
+     /// A right click on a Builder with a card in hand puts the card in its slot.
+@@ -53,13 +56,21 @@ impl Hooks for Mod {
+     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+         support::on_register_commands(event);
+     }
++}
+ 
+-    /// The bodies of `/rftoolsbuilder shape|status`.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
++/// Starling's port: the old `run_mod_command` hook's body.
++pub(crate) fn starling_run_mod_command(
++    host: &mut dyn ServerHost,
++    event: &mut crate::starling_command::RunModCommandEvent<'_>,
++) -> Flow {
+         support::on_run_mod_command(host, event)
+     }
++
++/// Starling's port: every declared usage runs the old hook's body.
++pub(crate) fn starling_executor(
++    host: &mut dyn ServerHost,
++    source: &mod_api::CommandSource,
++    command: &mod_api::CommandInvocation,
++) -> Option<i32> {
++    crate::starling_command::execute(host, source, command, starling_run_mod_command)
+ }
+diff --git a/rftoolsbuilder/src/starling_command.rs b/src/starling_command.rs
+new file mode 100644
+index 0000000..894f55f
+--- /dev/null
++++ b/src/starling_command.rs
+@@ -0,0 +1,31 @@
++//! Starling's port to Sunrise's API: Horizon's `run_mod_command` hook, which got every command of
++//! the mod in one event, is a per-usage executor in Sunrise. The old event is rebuilt here around
++//! the executor's arguments, so the mod's command code runs as it was written.
++use mod_api::{CommandInvocation, CommandSource, Flow, ServerHost};
++
++/// Horizon's `RunModCommandEvent`: the parsed command and who ran it.
++pub(crate) struct RunModCommandEvent<'a> {
++    pub command: &'a CommandInvocation,
++    pub source: &'a CommandSource,
++    /// Whether an earlier mod took the command: in Sunrise each usage has its own executor, so never.
++    pub cancelled: bool,
++}
++
++/// The executor of every usage the mod declares: the old hook's body (`run`), whose `Cancel` was a
++/// command it ran and `Continue` one it did not.
++pub(crate) fn execute(
++    host: &mut dyn ServerHost,
++    source: &CommandSource,
++    command: &CommandInvocation,
++    run: fn(&mut dyn ServerHost, &mut RunModCommandEvent<'_>) -> Flow,
++) -> Option<i32> {
++    let mut event = RunModCommandEvent {
++        command,
++        source,
++        cancelled: false,
++    };
++    match run(host, &mut event) {
++        Flow::Continue => None,
++        _ => Some(1),
++    }
++}
+diff --git a/rftoolsbuilder/src/starling_tick.rs b/src/starling_tick.rs
+new file mode 100644
+index 0000000..16e2c71
+--- /dev/null
++++ b/src/starling_tick.rs
+@@ -0,0 +1,63 @@
++//! Starling's port to Sunrise's API: code written for Horizon's, which handed a block entity's
++//! slots, compound and data slots (`ModBlockEntityFields`) to a tick or a menu button to change in
++//! place, runs here on a copy of them taken from Sunrise's view; what it changed is written back and
++//! the chunk marked unsaved, as Horizon's reply did.
++use mod_api::{BlockEntityScope, BlockEntityTickEvent, ServerHost};
++
++/// The block entity as Horizon's tick had it.
++pub(crate) type OldEntity = mod_api::item::containers::ModBlockEntityFields;
++
++/// Run `body` on a copy of the ticking block entity (its host, the copy, its position).
++pub(crate) fn run(
++    event: &mut BlockEntityTickEvent<'_>,
++    body: impl FnOnce(&mut dyn ServerHost, &mut OldEntity, [i32; 3]),
++) {
++    run_scope(&mut event.subject, body);
++}
++
++/// Run `body` on a copy of the block entity `subject` lends (a tick's, a menu button's).
++pub(crate) fn run_scope(
++    subject: &mut BlockEntityScope<'_>,
++    body: impl FnOnce(&mut dyn ServerHost, &mut OldEntity, [i32; 3]),
++) {
++    let Some((handle, pos, before)) = subject.with_view(|view| {
++        let items = (0..view.item_slots() as u32)
++            .map(|slot| view.item_slot(slot).and_then(|stack| stack.to_owned()))
++            .collect();
++        let entity = OldEntity {
++            items,
++            nbt: view.nbt().clone(),
++            data: view.data_slots().to_vec(),
++        };
++        (view.handle(), view.position(), entity)
++    }) else {
++        return;
++    };
++    let mut after = before.clone();
++    body(subject.host(), &mut after, pos);
++    let mut changed = false;
++    subject.with_view(|mut view| {
++        for (key, value) in after.nbt.iter() {
++            if before.nbt.get(key) != Some(value) && view.set_nbt(key.clone(), Some(value.clone())) {
++                changed = true;
++            }
++        }
++        for (key, _) in before.nbt.iter() {
++            if after.nbt.get(key).is_none() && view.set_nbt(key.clone(), None) {
++                changed = true;
++            }
++        }
++        for (slot, stack) in after.items.iter().enumerate() {
++            if before.items.get(slot) != Some(stack) {
++                let _ = view.set_item_slot(slot as u32, stack.clone());
++                changed = true;
++            }
++        }
++        if after.data != before.data && view.set_data_slots(&after.data) {
++            changed = true;
++        }
++    });
++    if changed {
++        let _ = handle.set_changed(subject.host());
++    }
++}
+diff --git a/src/support.rs b/src/support.rs
+index cc91b4c..e6d3d81 100644
+--- a/src/support.rs
++++ b/src/support.rs
+@@ -12,13 +12,14 @@
+ 
+ use std::sync::OnceLock;
+ 
++use crate::starling_command::RunModCommandEvent;
+ use mod_api::{
+     self, BlockEntityEvent, BlockEntityPart, BlockEntityRef, BlockEntityTickEvent,
+     BlockEntityTicksEvent, BlockKey, BlockPart, BlockUpdateFlags, Capability, Command,
+     CommandArgumentValue, Component, Compound, Flow, Hand, Host, HostBlockStates, HostSide,
+     HostTransaction, ITEMS, Identifier, InteractionResult, ItemPart, ItemResource, ItemStack,
+     LevelRef, LevelSide, ModContainer, PlayerRef, RegisterCommandsEvent, Registrar,
+-    RegistrationContext, ResourceHandler, RightClickBlockEvent, RunModCommandEvent, ServerHost,
++    RegistrationContext, ResourceHandler, RightClickBlockEvent, ServerHost,
+     SoundSource, Tag, Text, UseOnEvent,
+ };
+ 
+@@ -150,6 +151,7 @@ pub(crate) fn register(registrar: &mut dyn Registrar, _cx: &RegistrationContext)
+         reason = "the update is for a field a later game build may add"
+     )]
+     let container = ModContainer {
++        insert_rules: Vec::new(),
+         slots: CARD_SLOTS,
+         faces: std::array::from_fn(|_| slots.clone()),
+         inputs: slots.clone(),
+@@ -186,8 +188,8 @@ impl BlockEntityPart for Builder {
+     }
+ 
+     /// One server tick: walk the card's shape and place what fits.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        tick(host, event);
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        crate::starling_tick::run(event, |host, entity, pos| tick(host, entity, pos));
+     }
+ }
+ 
+@@ -560,16 +562,15 @@ impl State {
+ /// here for the menu, a hopper or `ctl container`.
+ fn sync_card(
+     host: &mut dyn ServerHost,
+-    event: &mut BlockEntityTickEvent<'_>,
++    entity: &mut crate::starling_tick::OldEntity, tick_pos: [i32; 3],
+ ) -> Option<(String, CardData)> {
+-    let shown = string(&event.entity.nbt, K_CARD_SHOWN);
+-    let held = event
+-        .entity
++    let shown = string(&(*entity).nbt, K_CARD_SHOWN);
++    let held = (*entity)
+         .items
+         .first()
+         .and_then(Option::as_ref)
+-        .map(|stack| (stack.item().id(&*host), CardData::read(stack)));
+-    let mut saved = saved_card(&event.entity.nbt);
++        .map(|stack| (stack.item().id(&*host).unwrap_or_default().to_owned(), CardData::read(stack)));
++    let mut saved = saved_card(&(*entity).nbt);
+     let mut changed = false;
+     // An outside change: the container holds a card other than the one mirrored last tick.
+     if held.as_ref().map(|(item, _)| item) != shown.as_ref() {
+@@ -577,7 +578,7 @@ fn sync_card(
+         changed = true;
+     }
+     let want = saved.as_ref().and_then(|card| card_stack(&*host, card));
+-    let current = event.entity.items.first().and_then(Option::as_ref).cloned();
++    let current = (*entity).items.first().and_then(Option::as_ref).cloned();
+     let same = match (&current, &want) {
+         (None, None) => true,
+         (Some(have), Some(want)) => have == want,
+@@ -585,29 +586,28 @@ fn sync_card(
+     };
+     if !same {
+         match want.clone() {
+-            Some(stack) => event.entity.items = vec![Some(stack)],
+-            None => event.entity.items = vec![None],
++            Some(stack) => (*entity).items = vec![Some(stack)],
++            None => (*entity).items = vec![None],
+         }
+-        event.entity.items.resize(SLOT_CARD + 1, None);
++        (*entity).items.resize(SLOT_CARD + 1, None);
+         changed = true;
+     }
+     let shown_now = saved.as_ref().map(|(item, _)| item.clone());
+-    if string(&event.entity.nbt, K_CARD_SHOWN) != shown_now {
++    if string(&(*entity).nbt, K_CARD_SHOWN) != shown_now {
+         match shown_now {
+             Some(item) => {
+-                event
+-                    .entity
++                (*entity)
+                     .nbt
+                     .insert(key!(K_CARD_SHOWN), Tag::String(item.as_str().into()));
+             }
+             None => {
+-                event.entity.nbt.remove(&key!(K_CARD_SHOWN));
++                (*entity).nbt.remove(&key!(K_CARD_SHOWN));
+             }
+         }
+         changed = true;
+     }
+     if changed {
+-        *event.reply = mod_api::BlockEntityTickReply::Changed;
++        // (unchanged: nothing is written back)
+     }
+     saved
+ }
+@@ -619,22 +619,22 @@ fn sync_card(
+ /// default), reports `Unchanged` when there was nothing to do, and completes
+ /// one pass per card (upstream restarts the pass while the machine is enabled;
+ /// the port does one pass and says so — notes.md).
+-fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-    let pos = event.pos;
++fn tick(host: &mut dyn ServerHost, entity: &mut crate::starling_tick::OldEntity, tick_pos: [i32; 3]) {
++    let pos = tick_pos;
+     // The card slot lives in the saved data and is mirrored into the container every tick; a
+     // container slot holding something other than what the Builder last mirrored was changed from
+     // outside (a click that has not been read back yet) and wins.
+-    let mirrored = sync_card(host, event);
++    let mirrored = sync_card(host, entity, tick_pos);
+     let card = mirrored.as_ref().map(|(_, payload)| payload.card);
+-    let before = State::read(&event.entity.nbt);
++    let before = State::read(&(*entity).nbt);
+     let mut state = before.clone();
+ 
+     let Some(card) = card else {
+         // No card: no scan. `Unchanged` when there was nothing to forget.
+         if before != State::default() {
+             state = State::default();
+-            state.write(&mut event.entity.nbt);
+-            *event.reply = mod_api::BlockEntityTickReply::Changed;
++            state.write(&mut (*entity).nbt);
++            // (unchanged: nothing is written back)
+         }
+         return;
+     };
+@@ -643,8 +643,8 @@ fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+         // GUI); the readout names it.
+         if before != State::default() {
+             state = State::default();
+-            state.write(&mut event.entity.nbt);
+-            *event.reply = mod_api::BlockEntityTickReply::Changed;
++            state.write(&mut (*entity).nbt);
++            // (unchanged: nothing is written back)
+         }
+         return;
+     };
+@@ -669,8 +669,8 @@ fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+             cells: Some(runtime::CellCount { cells, more }),
+             ..State::default()
+         };
+-        state.write(&mut event.entity.nbt);
+-        *event.reply = mod_api::BlockEntityTickReply::Changed;
++        state.write(&mut (*entity).nbt);
++        // (unchanged: nothing is written back)
+     } else if state.done {
+         return;
+     }
+@@ -685,8 +685,8 @@ fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+             at: scan.min,
+             reason: RefusalReason::OutOfWorld,
+         });
+-        state.write(&mut event.entity.nbt);
+-        *event.reply = mod_api::BlockEntityTickReply::Changed;
++        state.write(&mut (*entity).nbt);
++        // (unchanged: nothing is written back)
+         return;
+     }
+ 
+@@ -724,8 +724,8 @@ fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+                         });
+                         // Stay on this cell: upstream's wait mode.
+                         state.cursor = Some(cursor);
+-                        state.write(&mut event.entity.nbt);
+-                        *event.reply = mod_api::BlockEntityTickReply::Changed;
++                        state.write(&mut (*entity).nbt);
++                        // (unchanged: nothing is written back)
+                         return;
+                     }
+                     Placed::Rejected => state.progress.skipped += 1,
+@@ -744,8 +744,8 @@ fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+         state.cursor = scan.cursor;
+     }
+     if state != before {
+-        state.write(&mut event.entity.nbt);
+-        *event.reply = mod_api::BlockEntityTickReply::Changed;
++        state.write(&mut (*entity).nbt);
++        // (unchanged: nothing is written back)
+     }
+ }
+ 
+@@ -797,7 +797,7 @@ fn place(host: &mut dyn ServerHost, level: LevelRef, builder: [i32; 3], at: [i32
+         return Placed::Rejected;
+     };
+     let taken = host
+-        .transaction(|host, tx| Ok::<u32, ()>(handler.extract(host, tx, index, &resource, 1)))
++        .transaction(|host, tx| Ok::<u32, ()>(handler.extract_at(host, tx, index, &resource, 1)))
+         .unwrap_or(0);
+     if taken != 1 {
+         return Placed::NoMaterial;
+@@ -807,7 +807,7 @@ fn place(host: &mut dyn ServerHost, level: LevelRef, builder: [i32; 3], at: [i32
+         // Put the block back rather than lose it, as upstream's
+         // `takeAndReplace` does.
+         let _ = host
+-            .transaction(|host, tx| Ok::<u32, ()>(handler.insert(host, tx, index, &resource, 1)));
++            .transaction(|host, tx| Ok::<u32, ()>(handler.insert_at(host, tx, index, &resource, 1)));
+         return Placed::Rejected;
+     }
+     // Upstream places through a fake player and plays the block's place sound
+@@ -824,8 +824,7 @@ fn place(host: &mut dyn ServerHost, level: LevelRef, builder: [i32; 3], at: [i32
+             ],
+             SoundSource::Blocks,
+             sound.volume,
+-            sound.pitch,
+-        );
++            sound.pitch, None);
+     }
+     Placed::Yes
+ }
+@@ -896,7 +895,7 @@ pub(crate) fn on_right_click_block(
+     let stack = click.stack.cloned();
+     let card_held = stack
+         .as_ref()
+-        .is_some_and(|stack| stack.item().id(&*server) == CARD_ITEM);
++        .is_some_and(|stack| stack.item().id(&*server).unwrap_or_default() == CARD_ITEM);
+     if !card_held && stack.is_some() {
+         return Flow::Continue;
+     }
+@@ -953,7 +952,7 @@ fn install(host: &mut dyn ServerHost, pos: [i32; 3], uuid: u128, stack: Option<I
+             return;
+         }
+     }
+-    let Some(item) = stack.item().id(&*host).into() else {
++    let Some(item) = stack.item().id(&*host).map(str::to_owned) else {
+         return;
+     };
+     let payload = CardData::read(&stack);
+@@ -1179,12 +1178,11 @@ fn from_corners(corner1: [i32; 3], corner2: [i32; 3], builder: [i32; 3]) -> Card
+ /// The card the acting player holds, if the held stack is a card.
+ fn held_card(host: &dyn ServerHost, player: &PlayerRef) -> Option<CardData> {
+     let slot = player.selected_slot(host)?;
+-    let held = player
+-        .inventory_slots(host)?
++    let held = player.with_inventory(host, |view| view.iter().filter_map(|(slot, stack)| stack.project().map(|stack| (slot, stack))).collect::<Vec<_>>())?
+         .into_iter()
+         .find(|(at, _)| *at == u32::try_from(slot).unwrap_or(u32::MAX))?
+         .1;
+-    if held.item().id(host) != CARD_ITEM {
++    if held.item().id(host).unwrap_or_default() != CARD_ITEM {
+         return None;
+     }
+     Some(CardData::read(&held))
+@@ -1196,8 +1194,7 @@ fn write_held_card(host: &mut dyn ServerHost, player: &PlayerRef, data: &CardDat
+         return false;
+     };
+     let slot = u32::try_from(slot).unwrap_or(u32::MAX);
+-    let Some(held) = player
+-        .inventory_slots(host)
++    let Some(held) = player.with_inventory(host, |view| view.iter().filter_map(|(slot, stack)| stack.project().map(|stack| (slot, stack))).collect::<Vec<_>>())
+         .and_then(|slots| slots.into_iter().find(|(at, _)| *at == slot))
+         .map(|(_, stack)| stack)
+     else {
+@@ -1218,17 +1215,17 @@ fn write_held_card(host: &mut dyn ServerHost, player: &PlayerRef, data: &CardDat
+ pub(crate) fn on_register_commands(event: &mut RegisterCommandsEvent<'_>) {
+     event
+         .commands
+-        .push(Command::new("rftoolsbuilder status <pos:block_pos>"));
++        .push(Command::new("rftoolsbuilder status <pos:block_pos>").executes(crate::starling_executor));
+     event.commands.push(Command::new(
+         "rftoolsbuilder shape <shape:word> <dx:integer> <dy:integer> <dz:integer>",
+-    ));
++    ).executes(crate::starling_executor));
+     event.commands.push(Command::new(
+         "rftoolsbuilder shape <shape:word> <dx:integer> <dy:integer> <dz:integer> <solid:word>",
+-    ));
++    ).executes(crate::starling_executor));
+     event.commands.push(Command::new(
+         "rftoolsbuilder offset <x:integer> <y:integer> <z:integer>",
+-    ));
+-    event.commands.push(Command::new("rftoolsbuilder reset"));
++    ).executes(crate::starling_executor));
++    event.commands.push(Command::new("rftoolsbuilder reset").executes(crate::starling_executor));
+ }
+ 
+ /// Their bodies (`run_mod_command`).

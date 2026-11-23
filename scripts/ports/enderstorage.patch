@@ -1,0 +1,457 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 78ca653..aa7afe4 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -31,12 +31,15 @@
+ //! | `server_stopping` (v1) | [`Mod::server_stopping`] |
+ //! | `register_commands` (8) | [`Mod::register_commands`] |
+ //! | `perform_command` (8) | [`Mod::run_mod_command`] |
++mod starling_tick;
++mod starling_command;
+ pub mod runtime;
+ pub mod support;
+ 
++use crate::starling_command::RunModCommandEvent;
+ use mod_api::{
+     self, ComponentTypesEvent, Flow, Hooks, RegisterCommandsEvent, Registrar, RegistrationContext,
+-    RunModCommandEvent, ServerHost, ServerStoppingEvent, ServerTickEvent, WorldLifecycleEvent,
++    ServerHost, ServerStoppingEvent, ServerTickEvent, WorldLifecycleEvent,
+ };
+ 
+ /// The mod keeps its state in the shared store, not in this struct: one store serves every chest in
+@@ -56,7 +59,7 @@ impl Hooks for Mod {
+     /// The item component that carries a frequency, registered before content (and so the item's
+     /// stack codec) loads.
+     fn component_types(&self, _context: &RegistrationContext, event: &mut ComponentTypesEvent<'_>) {
+-        support::declare_component(event.types);
++        { let mut types = Vec::new(); support::declare_component(&mut types); for id in types { event.register(id.into()); } };
+     }
+ 
+     /// `/enderstorage freq|info` (upstream's own command file is commented out in 1.21.1).
+@@ -64,15 +67,6 @@ impl Hooks for Mod {
+         support::declare_commands(event.commands);
+     }
+ 
+-    /// Run one of the commands above and take it.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        support::run_command(host, event)
+-    }
+-
+     /// A right click: a dye sets the chest's next colour band, a bucket fills or drains the tank.
+     fn right_click_block(
+         &self,
+@@ -130,3 +124,20 @@ impl Hooks for Mod {
+         support::server_stopping(host, _event);
+     }
+ }
++
++/// Starling's port: the old `run_mod_command` hook's body.
++pub(crate) fn starling_run_mod_command(
++    host: &mut dyn ServerHost,
++    event: &mut crate::starling_command::RunModCommandEvent<'_>,
++) -> Flow {
++        support::run_command(host, event)
++    }
++
++/// Starling's port: every declared usage runs the old hook's body.
++pub(crate) fn starling_executor(
++    host: &mut dyn ServerHost,
++    source: &mod_api::CommandSource,
++    command: &mod_api::CommandInvocation,
++) -> Option<i32> {
++    crate::starling_command::execute(host, source, command, starling_run_mod_command)
++}
+diff --git a/enderstorage/src/starling_command.rs b/src/starling_command.rs
+new file mode 100644
+index 0000000..894f55f
+--- /dev/null
++++ b/src/starling_command.rs
+@@ -0,0 +1,31 @@
++//! Starling's port to Sunrise's API: Horizon's `run_mod_command` hook, which got every command of
++//! the mod in one event, is a per-usage executor in Sunrise. The old event is rebuilt here around
++//! the executor's arguments, so the mod's command code runs as it was written.
++use mod_api::{CommandInvocation, CommandSource, Flow, ServerHost};
++
++/// Horizon's `RunModCommandEvent`: the parsed command and who ran it.
++pub(crate) struct RunModCommandEvent<'a> {
++    pub command: &'a CommandInvocation,
++    pub source: &'a CommandSource,
++    /// Whether an earlier mod took the command: in Sunrise each usage has its own executor, so never.
++    pub cancelled: bool,
++}
++
++/// The executor of every usage the mod declares: the old hook's body (`run`), whose `Cancel` was a
++/// command it ran and `Continue` one it did not.
++pub(crate) fn execute(
++    host: &mut dyn ServerHost,
++    source: &CommandSource,
++    command: &CommandInvocation,
++    run: fn(&mut dyn ServerHost, &mut RunModCommandEvent<'_>) -> Flow,
++) -> Option<i32> {
++    let mut event = RunModCommandEvent {
++        command,
++        source,
++        cancelled: false,
++    };
++    match run(host, &mut event) {
++        Flow::Continue => None,
++        _ => Some(1),
++    }
++}
+diff --git a/enderstorage/src/starling_tick.rs b/src/starling_tick.rs
+new file mode 100644
+index 0000000..16e2c71
+--- /dev/null
++++ b/src/starling_tick.rs
+@@ -0,0 +1,63 @@
++//! Starling's port to Sunrise's API: code written for Horizon's, which handed a block entity's
++//! slots, compound and data slots (`ModBlockEntityFields`) to a tick or a menu button to change in
++//! place, runs here on a copy of them taken from Sunrise's view; what it changed is written back and
++//! the chunk marked unsaved, as Horizon's reply did.
++use mod_api::{BlockEntityScope, BlockEntityTickEvent, ServerHost};
++
++/// The block entity as Horizon's tick had it.
++pub(crate) type OldEntity = mod_api::item::containers::ModBlockEntityFields;
++
++/// Run `body` on a copy of the ticking block entity (its host, the copy, its position).
++pub(crate) fn run(
++    event: &mut BlockEntityTickEvent<'_>,
++    body: impl FnOnce(&mut dyn ServerHost, &mut OldEntity, [i32; 3]),
++) {
++    run_scope(&mut event.subject, body);
++}
++
++/// Run `body` on a copy of the block entity `subject` lends (a tick's, a menu button's).
++pub(crate) fn run_scope(
++    subject: &mut BlockEntityScope<'_>,
++    body: impl FnOnce(&mut dyn ServerHost, &mut OldEntity, [i32; 3]),
++) {
++    let Some((handle, pos, before)) = subject.with_view(|view| {
++        let items = (0..view.item_slots() as u32)
++            .map(|slot| view.item_slot(slot).and_then(|stack| stack.to_owned()))
++            .collect();
++        let entity = OldEntity {
++            items,
++            nbt: view.nbt().clone(),
++            data: view.data_slots().to_vec(),
++        };
++        (view.handle(), view.position(), entity)
++    }) else {
++        return;
++    };
++    let mut after = before.clone();
++    body(subject.host(), &mut after, pos);
++    let mut changed = false;
++    subject.with_view(|mut view| {
++        for (key, value) in after.nbt.iter() {
++            if before.nbt.get(key) != Some(value) && view.set_nbt(key.clone(), Some(value.clone())) {
++                changed = true;
++            }
++        }
++        for (key, _) in before.nbt.iter() {
++            if after.nbt.get(key).is_none() && view.set_nbt(key.clone(), None) {
++                changed = true;
++            }
++        }
++        for (slot, stack) in after.items.iter().enumerate() {
++            if before.items.get(slot) != Some(stack) {
++                let _ = view.set_item_slot(slot as u32, stack.clone());
++                changed = true;
++            }
++        }
++        if after.data != before.data && view.set_data_slots(&after.data) {
++            changed = true;
++        }
++    });
++    if changed {
++        let _ = handle.set_changed(subject.host());
++    }
++}
+diff --git a/src/support.rs b/src/support.rs
+index 6d09296..36b6638 100644
+--- a/src/support.rs
++++ b/src/support.rs
+@@ -21,12 +21,13 @@ use std::sync::Mutex;
+ use std::sync::atomic::{AtomicU64, Ordering};
+ use std::time::{SystemTime, UNIX_EPOCH};
+ 
++use crate::starling_command::RunModCommandEvent;
+ use mod_api::{
+     BlockEntityPart, BlockEntityRef, BlockEntityTickEvent, BlockEntityTicksEvent, BlockPart,
+     BlockState, Command, CommandArgumentValue, CommandInvocation, CommandSource, Component,
+     Compound, FLUIDS, Flow, FluidIdentity, FluidResource, FluidStack, GameMode, Hand, Host,
+     HostSide, HostTransaction, Identifier, InteractionResult, ItemKey, ItemStack, LevelRef,
+-    ModContainer, ModFluidTanks, PlayerRef, Registrar, RunModCommandEvent, ServerHost,
++    ModContainer, ModFluidTanks, PlayerRef, Registrar, ServerHost,
+     ServerTickEvent, ServerTickPhase, Tag, Text, Transaction, WorldLifecycleEvent, WorldPhase,
+ };
+ 
+@@ -80,7 +81,7 @@ impl StoredItem {
+     fn of(host: &dyn Host, stack: &ItemStack) -> Option<Self> {
+         let nbt = stack.to_nbt(host)?;
+         Some(Self {
+-            id: stack.item().id(host),
++            id: stack.item().id(host).unwrap_or_default().to_owned(),
+             count: stack.count(),
+             nbt,
+         })
+@@ -706,6 +707,7 @@ pub fn declare(r: &mut dyn Registrar) {
+ fn container() -> ModContainer {
+     let all: Vec<usize> = (0..SLOTS).collect();
+     ModContainer {
++        insert_rules: Vec::new(),
+         slots: SLOTS,
+         faces: [
+             all.clone(),
+@@ -738,15 +740,15 @@ pub fn declare_component(types: &mut Vec<String>) {
+ }
+ 
+ /// `/enderstorage freq|info`.
+-pub fn declare_commands(commands: &mut Vec<Command>) {
++pub fn declare_commands(commands: &mut Vec<mod_api::CommandRegistration>) {
+     commands.push(Command::new(
+         "enderstorage freq held <left:word> <middle:word> <right:word>",
+-    ));
++    ).executes(crate::starling_executor));
+     commands.push(Command::op(
+         "enderstorage freq <pos:block_pos> <left:word> <middle:word> <right:word>",
+         2,
+-    ));
+-    commands.push(Command::new("enderstorage info <pos:block_pos>"));
++    ).executes(crate::starling_executor));
++    commands.push(Command::new("enderstorage info <pos:block_pos>").executes(crate::starling_executor));
+ }
+ 
+ /// The chest's Part: it ticks, and each server tick merges its slots with the shared store.
+@@ -781,8 +783,8 @@ impl BlockEntityPart for ChestEntity {
+         event.ticks = true;
+     }
+ 
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        tick_chest(host, event);
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        crate::starling_tick::run(event, |host, entity, pos| tick_chest(host, entity, pos));
+     }
+ }
+ 
+@@ -804,8 +806,8 @@ impl BlockEntityPart for TankEntity {
+         event.ticks = true;
+     }
+ 
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        tick_tank(host, event);
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        crate::starling_tick::run(event, |host, entity, pos| tick_tank(host, entity, pos));
+     }
+ }
+ 
+@@ -828,13 +830,13 @@ impl mod_api::ItemPart for Placed {
+ // ---------------------------------------------------------------------------
+ 
+ /// One server tick of a chest: apply a queued frequency, then merge its slots with the store.
+-fn tick_chest(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
++fn tick_chest(host: &mut dyn ServerHost, entity: &mut crate::starling_tick::OldEntity, tick_pos: [i32; 3]) {
+     ensure_world(host);
+-    let pos = event.pos;
++    let pos = tick_pos;
+     let dimension = host.dimension().to_owned();
+-    let mut frequency = be_frequency(&mut event.entity.nbt);
+-    let uid = be_uid(&mut event.entity.nbt);
+-    let current = stored_slots(&*host, &event.entity.items);
++    let mut frequency = be_frequency(&mut (*entity).nbt);
++    let uid = be_uid(&mut (*entity).nbt);
++    let current = stored_slots(&*host, &(*entity).items);
+     let mut out = current.clone();
+     {
+         let mut guard = core();
+@@ -859,7 +861,7 @@ fn tick_chest(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+                 }
+                 state.snapshots.insert(uid, items.clone());
+                 out = items;
+-                set_be_frequency(&mut event.entity.nbt, wanted);
++                set_be_frequency(&mut (*entity).nbt, wanted);
+                 frequency = wanted;
+             }
+         }
+@@ -873,21 +875,21 @@ fn tick_chest(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+         out = synced.items;
+     }
+     if out != current {
+-        event.entity.items = stacks(&*host, &out);
++        (*entity).items = stacks(&*host, &out);
+     }
+ }
+ 
+ /// One tick of a tank: a queued frequency first, then the fluid merge with the shared tank store
+ /// (the declaration keeps the tank in the entity's `fluids`).
+-fn tick_tank(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
++fn tick_tank(host: &mut dyn ServerHost, entity: &mut crate::starling_tick::OldEntity, tick_pos: [i32; 3]) {
+     ensure_world(host);
+-    let pos = event.pos;
++    let pos = tick_pos;
+     let dimension = host.dimension().to_owned();
+-    let mut frequency = be_frequency(&mut event.entity.nbt);
+-    let uid = be_uid(&mut event.entity.nbt);
++    let mut frequency = be_frequency(&mut (*entity).nbt);
++    let uid = be_uid(&mut (*entity).nbt);
+     // What the entity holds before this tick. It is the value the next tick reads, so the
+     // snapshot kept below is only honest once the entity takes the merged tank.
+-    let held = read_be_tank(&event.entity.nbt);
++    let held = read_be_tank(&(*entity).nbt);
+     let mut current = held.clone();
+     let mut switched: Option<Tank> = None;
+     {
+@@ -913,7 +915,7 @@ fn tick_tank(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+                 }
+                 current = tank.clone();
+                 switched = Some(tank);
+-                set_be_frequency(&mut event.entity.nbt, wanted);
++                set_be_frequency(&mut (*entity).nbt, wanted);
+                 frequency = wanted;
+             }
+         }
+@@ -926,7 +928,7 @@ fn tick_tank(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+         }
+         let written = tank_write(&held, synced.tank);
+         if written.write {
+-            write_be_tank(&mut event.entity.nbt, &written.tank);
++            write_be_tank(&mut (*entity).nbt, &written.tank);
+         }
+         state.tank_snapshots.insert(uid, written.tank);
+     }
+@@ -1166,8 +1168,8 @@ pub fn loot_drops(host: &mut dyn ServerHost, event: &mut mod_api::LootDropsEvent
+     }
+     // The content's loot table drops the bare item on a build where it loads; replacing that drop
+     // rather than adding to it keeps one chest per broken block.
+-    let name = stack.item().id(&*host);
+-    event.drops.retain(|drop| drop.item().id(&*host) != name);
++    let name = stack.item().id(&*host).unwrap_or_default().to_owned();
++    event.drops.retain(|drop| drop.item().id(&*host).unwrap_or_default() != name);
+     event.drops.push(stack);
+ }
+ 
+@@ -1259,14 +1261,14 @@ pub fn fill_bucket(host: &mut dyn ServerHost, event: &mut mod_api::FillBucketEve
+         return Flow::Continue;
+     }
+     let fluid = bucket_fluid(&*host, event.stack);
+-    let empty = event.stack.item().id(&*host) == BUCKET_ITEM;
++    let empty = event.stack.item().id(&*host).unwrap_or_default() == BUCKET_ITEM;
+     let player = host.players().acting_player();
+     if let Some(player) = player {
+         // The fluid and the hand exchange are one change: a failed bucket swap aborts the
+         // transaction, so a tank is never mutated without the player's bucket changing with it.
+         let _ = host.transaction(|host, tx| {
+             let done = if let Some(fluid) = fluid {
+-                event.stack.item().id(&*host) == fluid_bucket(fluid).unwrap_or_default()
++                event.stack.item().id(&*host).unwrap_or_default() == fluid_bucket(fluid).unwrap_or_default()
+                     && fill_tank(host, tx, level, pos, fluid, player)
+             } else if empty {
+                 drain_tank(host, tx, level, pos, None, player)
+@@ -1282,7 +1284,7 @@ pub fn fill_bucket(host: &mut dyn ServerHost, event: &mut mod_api::FillBucketEve
+ 
+ /// The fluid a filled bucket holds.
+ fn bucket_fluid(host: &dyn Host, stack: &ItemStack) -> Option<&'static str> {
+-    match stack.item().id(host).as_str() {
++    match stack.item().id(host).unwrap_or_default() {
+         "minecraft:water_bucket" => Some("minecraft:water"),
+         "minecraft:lava_bucket" => Some("minecraft:lava"),
+         _ => None,
+@@ -1300,7 +1302,7 @@ fn fluid_bucket(fluid: &str) -> Option<&'static str> {
+ 
+ /// Whether a right click on a tank with `held` is the tank's: a bucket of either kind is.
+ fn bucket_click(host: &dyn Host, held: &ItemStack) -> bool {
+-    held.item().id(host) == BUCKET_ITEM || bucket_fluid(host, held).is_some()
++    held.item().id(host).unwrap_or_default() == BUCKET_ITEM || bucket_fluid(host, held).is_some()
+ }
+ 
+ /// Put one bucket of `fluid` into the tank at `pos` and turn one held bucket into an empty one;
+@@ -1330,13 +1332,13 @@ fn fill_tank(
+         return false;
+     }
+     let held = tanks.amount(host, 0);
+-    if tanks.capacity(host, 0, &resource).saturating_sub(held) < want {
++    if tanks.capacity(host, 0, Some(&resource)).saturating_sub(held) < want {
+         return false;
+     }
+-    let inserted = tanks.insert(host, tx, 0, &resource, want);
++    let inserted = tanks.insert_at(host, tx, 0, &resource, want);
+     if inserted < want {
+         if inserted > 0 {
+-            let _ = tanks.extract(host, tx, 0, &resource, inserted);
++            let _ = tanks.extract_at(host, tx, 0, &resource, inserted);
+         }
+         return false;
+     }
+@@ -1369,15 +1371,15 @@ fn drain_tank(
+     if tanks.amount(host, 0) < want {
+         return false;
+     }
+-    let taken = tanks.extract(host, tx, 0, &resource, want);
++    let taken = tanks.extract_at(host, tx, 0, &resource, want);
+     if taken < want {
+         if taken > 0 {
+-            let _ = tanks.insert(host, tx, 0, &resource, taken);
++            let _ = tanks.insert_at(host, tx, 0, &resource, taken);
+         }
+         return false;
+     }
+     let name = match resource.fluid() {
+-        FluidIdentity::Resolved(key) => key.id(&*host),
++        FluidIdentity::Resolved(key) => key.id(&*host).unwrap_or_default().to_owned(),
+         FluidIdentity::Unresolved(fluid) => fluid.id(&*host),
+         // `FluidIdentity` is non-exhaustive: a fluid this build cannot name is not a bucket.
+         _ => String::new(),
+@@ -1448,11 +1450,11 @@ fn swap_held(host: &mut dyn ServerHost, player: PlayerRef, from: &str, to: &str)
+ /// slot.
+ fn holding_stack(host: &dyn ServerHost, player: PlayerRef, item: &str) -> Option<(u32, ItemStack)> {
+     let selected = u32::try_from(player.selected_slot(host)?).ok();
+-    let slots = player.inventory_slots(host)?;
++    let slots = player.with_inventory(host, |view| view.iter().filter_map(|(slot, stack)| stack.project().map(|stack| (slot, stack))).collect::<Vec<_>>())?;
+     let holds = |slot: u32| {
+         slots
+             .iter()
+-            .find(|(at, stack)| *at == slot && stack.item().id(host) == item)
++            .find(|(at, stack)| *at == slot && stack.item().id(host).unwrap_or_default() == item)
+             .map(|(_, stack)| stack.clone())
+     };
+     if let Some(slot) = selected
+@@ -1465,15 +1467,14 @@ fn holding_stack(host: &dyn ServerHost, player: PlayerRef, item: &str) -> Option
+     }
+     slots
+         .iter()
+-        .find(|(_, stack)| stack.item().id(host) == item)
++        .find(|(_, stack)| stack.item().id(host).unwrap_or_default() == item)
+         .map(|(slot, stack)| (*slot, stack.clone()))
+ }
+ 
+ /// The player's main-hand stack and the slot it is in.
+ fn held(host: &dyn ServerHost, player: PlayerRef) -> Option<(u32, ItemStack)> {
+     let slot = u32::try_from(player.selected_slot(host)?).ok()?;
+-    player
+-        .inventory_slots(host)?
++    player.with_inventory(host, |view| view.iter().filter_map(|(slot, stack)| stack.project().map(|stack| (slot, stack))).collect::<Vec<_>>())?
+         .into_iter()
+         .find(|(at, _)| *at == slot)
+         .map(|(_, stack)| (slot, stack))
+@@ -1488,7 +1489,7 @@ fn dye_click(
+     pos: [i32; 3],
+     held_stack: &ItemStack,
+ ) -> bool {
+-    let Some(colour) = Colour::from_dye(&held_stack.item().id(&*host)) else {
++    let Some(colour) = Colour::from_dye(&held_stack.item().id(&*host).unwrap_or_default()) else {
+         return false;
+     };
+     let Some(entity) = our_entity(&*host, level, pos, BLOCK) else {
+@@ -1628,7 +1629,7 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
+                 );
+                 return Flow::Cancel;
+             };
+-            let id = stack.item().id(&*host);
++            let id = stack.item().id(&*host).unwrap_or_default().to_owned();
+             if id != ITEM && id != TANK_ITEM {
+                 say(
+                     host,
