@@ -6,6 +6,8 @@ for the same mods again builds them again."""
 import calendar
 import json
 import os
+import sys
+import pathlib
 import subprocess
 import time
 
@@ -40,8 +42,58 @@ def stale(listed, days, kept, now):
     ]
 
 
+# A build's mods release (mods-<build>) past this many assets is pruned (a release holds 1000 at most: a full one
+# took no new library, so Compile failed for every mod not built yet, 2026-11-23).
+MODS_PRUNE_AT = 800
+
+
+def mods_prunable(listed, index):
+    """The assets of a mods-<build> release that can go, oldest kind first: an answer that may pass another time
+    (a failure not settled, built again when asked), a failure a library has replaced, and a library of a mod
+    whose newer version (by when it was built) is there for the same ABI. A phone with the older version asks
+    for it again and it is built again."""
+    by_name = {a["name"]: a for a in listed}
+    gone = []
+    for row in index.get("failed", []):
+        job = row.get("job", "")
+        if not row.get("settled") or f"{job}.json" in by_name:
+            gone.append(f"{job}.failed.json")
+    newest = {}
+    for row in index.get("mods", []):
+        key = (row.get("id"), row.get("job", "").partition(".")[2])
+        made = by_name.get(f"{row.get('job')}.json", {}).get("created_at", "")
+        newest.setdefault(key, []).append((made, row["job"]))
+    for rows in newest.values():
+        for _, job in sorted(rows, reverse=True)[1:]:
+            gone += [f"{job}.so", f"{job}.json"]
+    return [by_name[name] for name in gone if name in by_name]
+
+
+def prune_mods(now):
+    """Each mods-<build> release near the limit, pruned (mods_prunable), its index written again."""
+    sys.path.insert(0, str(pathlib.Path(__file__).parent))
+    import store
+    repo = os.environ["GH_REPO"]
+    tags = subprocess.run(["gh", "api", "--paginate", f"repos/{repo}/releases?per_page=100", "-q",
+                           '.[] | select(.tag_name | startswith("mods-")) | .tag_name'],
+                          check=True, capture_output=True, text=True).stdout.split()
+    for tag in tags:
+        listed = assets(tag)
+        if len(listed) < MODS_PRUNE_AT:
+            continue
+        build = tag.removeprefix("mods-")
+        index = store.fetch_json(store.download_url(tag, store.INDEX)) or {}
+        gone = mods_prunable(listed, index)
+        for asset in gone:
+            subprocess.run(["gh", "api", "-X", "DELETE", f"repos/{repo}/releases/assets/{asset['id']}"], check=True)
+        print(f"{tag}: {len(listed)} assets, {len(gone)} deleted")
+        if gone:
+            store.write_index(build, store.run_gh, pathlib.Path("answer"))
+
+
 def main():
     now = time.time()
+    prune_mods(now)
     shards = [(f"results-{c}", RESULT_DAYS, RESULTS_KEPT) for c in "0123456789abcdef"]
     # "results" is the release before the shards: a release holds 1000 assets at most, and one
     # filled in the first evening, so builds go to results-<first hex digit of the job> now.
