@@ -286,6 +286,9 @@ def build_one(row, mods, source, result, build, profile):
             raise Refused("is not a .hmod")
         mod, version, manifest = mod_of(folder)
         status.update(id=mod, version=version)
+        # The port it is built with (scripts/ports), so a new port asks for the build again (store.py).
+        if (port := store.port_digest(mod)):
+            status["port"] = port
         cargo = native_of(folder, manifest)
         check(manifest, cargo, folder)
         if not sunrise_game(source) and not (folder / "horizon-mod.toml").is_file():

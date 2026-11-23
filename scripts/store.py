@@ -329,6 +329,12 @@ def build_row(build):
 NOW_TAKEN = re.compile(r"uses the crate (serde_json|sha2|log):|makes the game's crates build again|The game's crates built again")
 
 
+def port_digest(mod):
+    """The SHA-256 of Starling's port of `mod` (scripts/ports/<mod>.patch), or None."""
+    path = pathlib.Path(__file__).resolve().parent / "ports" / f"{mod}.patch"
+    return hashlib.sha256(path.read_bytes()).hexdigest() if ID.fullmatch(str(mod)) and path.is_file() else None
+
+
 def plan(catalog, build, abis, have, game=None):
     """The catalog's native mods to build for `build`: every version of each (not revoked, for the
     build's vanilla `game` when it says one) and each ABI, and the newest version of each other mod, for
@@ -339,7 +345,9 @@ def plan(catalog, build, abis, have, game=None):
     revoked = {(r.get("id"), r.get("sha256")) for r in catalog.get("revoked", []) if isinstance(r, dict)}
     held = {row["job"] for row in (have or {}).get("mods", [])}
     held |= {row["job"] for row in (have or {}).get("failed", [])
-             if row.get("settled") and not NOW_TAKEN.search(str(row.get("error", "")))}
+             if row.get("settled") and not NOW_TAKEN.search(str(row.get("error", "")))
+             # A port made or changed since the failure: built again with it.
+             and port_digest(row.get("id")) == row.get("port")}
     planned, seen = [], set()
     for project in catalog.get("projects", []):
         if project.get("kind") not in ("native-mod", "mod") or not ID.fullmatch(str(project.get("id", ""))):
