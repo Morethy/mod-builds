@@ -1,0 +1,482 @@
+diff --git a/src/dissolution.rs b/src/dissolution.rs
+index 3a43f8d..9664777 100644
+--- a/src/dissolution.rs
++++ b/src/dissolution.rs
+@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex, OnceLock};
+ 
+ use mod_api::{
+     self, BlockEntityPart, BlockEntityTickEvent, BlockEntityTicksEvent, BlockPart, BlockState,
+-    Compound, Direction, FLUIDS, FluidIdentity, Host, ItemKey, ItemPart, ItemStack, LevelHost,
++    Compound, Direction, FLUIDS, FluidIdentity, Host, ItemKey, ItemPart, ItemStack,
+     ModContainer, ModEnergyBuffer, ModFluidTanks, OnBlockPlacedByEvent, Registrar, ServerHost,
+     StateForPlacementEvent, Tag, UseItemOnEvent,
+ };
+@@ -233,7 +233,10 @@ fn one(
+         let text = mod_api::serde_json::to_string(cell).ok()?;
+         let ingredient = host.recipe_ingredient(&text).ok().flatten()?;
+         let keys = ingredient.item_keys(host).ok()?;
+-        let items: Vec<String> = keys.iter().map(|key| key.id(host)).collect();
++        let items: Vec<String> = keys
++            .iter()
++            .map(|key| key.id(host).unwrap_or_default().to_owned())
++            .collect();
+         if items.is_empty() {
+             // A tag nobody fills: the recipe could never match, so it is left out of the
+             // table (the same outcome as the game dropping a recipe it cannot read).
+@@ -252,7 +255,7 @@ fn one(
+         fluid,
+         ticks,
+         output: product.as_ref().map(|stack| crate::chamber::Product {
+-            id: stack.item().id(host),
++            id: stack.item().id(host).unwrap_or_default().to_owned(),
+             count: stack.count(),
+         }),
+         output_fluid: value.get("outputFluid").and_then(fluid_of),
+@@ -287,9 +290,10 @@ impl BlockPart for Chamber {
+     /// `RotationType.FOUR_WAY`: a placed chamber faces its placer.
+     fn state_for_placement(
+         &self,
+-        level: &dyn LevelHost,
++        level: mod_api::LevelSide<'_>,
+         event: &mut StateForPlacementEvent<'_>,
+     ) -> Option<Option<BlockState>> {
++        let (mod_api::LevelSide::Server(level) | mod_api::LevelSide::Client(level)) = level;
+         let faced = level.state_with_property(
+             event.state,
+             SUBFACING,
+@@ -331,11 +335,32 @@ impl BlockEntityPart for Chamber {
+     /// One server tick: decode the table if it changed, match the input slots and tank, run the
+     /// bar, and write the machine back. Every write lands in the entity view the tick owns, so
+     /// the default `Changed` reply keeps it and marks the chunk.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        let entity = &mut *event.entity;
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        struct Lent {
++            items: Vec<Option<ItemStack>>,
++            nbt: Compound,
++        }
++        let Some((handle, mut lent)) = event.subject.with_view(|view| {
++            let items = (0..view.item_slots() as u32)
++                .map(|slot| view.item_slot(slot).and_then(|stack| stack.to_owned()))
++                .collect();
++            (
++                view.handle(),
++                Lent {
++                    items,
++                    nbt: view.nbt().clone(),
++                },
++            )
++        }) else {
++            return;
++        };
++        let items_before = lent.items.clone();
++        let before = lent.nbt.clone();
++        let entity = &mut lent;
+         if entity.items.len() < SLOTS {
+             return;
+         }
++        let host = event.subject.host();
+         let stored = read_tanks(&entity.nbt);
+         let mut machine = Machine::from_saved(
+             read_int(&entity.nbt, KEY_ENERGY),
+@@ -345,7 +370,10 @@ impl BlockEntityPart for Chamber {
+         );
+         let held: Vec<Option<String>> = entity.items[..INPUT_SLOTS]
+             .iter()
+-            .map(|slot| slot.as_ref().map(|stack| stack.item().id(&*host)))
++            .map(|slot| {
++                slot.as_ref()
++                    .map(|stack| stack.item().id(&*host).unwrap_or_default().to_owned())
++            })
+             .collect();
+         let table = recipes(&mut *host);
+         let index = recipe_index(&table.rules, &held, &machine.input);
+@@ -378,6 +406,7 @@ impl BlockEntityPart for Chamber {
+         write_int(&mut entity.nbt, KEY_ENERGY, machine.energy);
+         write_int(&mut entity.nbt, KEY_PROGRESS, machine.progress);
+         write_tanks(&mut entity.nbt, &[machine.input, machine.output]);
++        crate::write_back(event, handle, &before, &lent.nbt, &items_before, &lent.items);
+     }
+ }
+ 
+@@ -584,7 +613,7 @@ pub(crate) fn readout(host: &mut dyn ServerHost, pos: [i32; 3]) -> String {
+                 .item_slot(&*host, slot as u32)
+                 .ok()
+                 .flatten()
+-                .map(|stack| stack.item().id(&*host))
++                .map(|stack| stack.item().id(&*host).unwrap_or_default().to_owned())
+         })
+         .collect();
+     let table = recipes(host);
+@@ -636,7 +665,7 @@ fn capability_tank(host: &mut dyn ServerHost, pos: [i32; 3]) -> (String, i32) {
+         return ("empty".to_owned(), 0);
+     };
+     let name = match resource.fluid() {
+-        FluidIdentity::Resolved(fluid) => fluid.id(host),
++        FluidIdentity::Resolved(fluid) => fluid.id(host).unwrap_or_default().to_owned(),
+         FluidIdentity::Unresolved(fluid) => fluid.id(host),
+         _ => "unknown".to_owned(),
+     };
+diff --git a/src/lib.rs b/src/lib.rs
+index c6720e6..bb4377f 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -50,7 +50,7 @@ use mod_api::{
+     Flow, FluidIdentity, Hand, Hooks, Host, HostSide, HostTransaction, InteractionResult, ItemKey,
+     ItemPart, ItemStack, LevelHost, LevelTickPostEvent, ModEnergyBuffer, ModFluidTanks,
+     OnBlockPlacedByEvent, RegisterCommandsEvent, Registrar, RegistrationContext,
+-    RunModCommandEvent, ServerHost, StateForPlacementEvent, Tag, Text, UseItemOnEvent,
++    ServerHost, StateForPlacementEvent, Tag, Text, UseItemOnEvent,
+ };
+ 
+ use crate::runtime::{
+@@ -188,7 +188,7 @@ impl Hooks for Mod {
+     /// `titanium:augments` is Titanium's `AugmentWrapper.ATTACHMENT`, the key every IF add-on
+     /// (and `mifa`) puts on its addon items.
+     fn component_types(&self, _context: &RegistrationContext, event: &mut ComponentTypesEvent<'_>) {
+-        event.types.push(AUGMENT_COMPONENT.to_owned());
++        event.register(AUGMENT_COMPONENT.to_owned());
+     }
+ 
+     /// After a level's tick pass: apply the augment seatings its right-clicks asked for. A block
+@@ -252,9 +252,18 @@ impl Hooks for Mod {
+         let Some(item) = item else {
+             return Flow::Continue;
+         };
+-        for drop in event.drops.iter_mut() {
+-            if drop.stack.item() == item {
+-                let _ = drop.stack.apply_components(&patch);
++        for index in 0..event.drops.len() {
++            let stack = event
++                .drops
++                .get(index)
++                .and_then(|drop| drop.stack())
++                .filter(|stack| stack.item() == item)
++                .and_then(|stack| stack.project());
++            if let Some(mut stack) = stack
++                && stack.apply_components(&patch).is_ok()
++                && let Some(mut drop) = event.drops.get_mut(index)
++            {
++                let _ = drop.set_stack(stack);
+             }
+         }
+         Flow::Continue
+@@ -265,7 +274,7 @@ impl Hooks for Mod {
+     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+         event
+             .commands
+-            .push(Command::new("industrialforegoing info <pos:block_pos>"));
++            .push(Command::new("industrialforegoing info <pos:block_pos>").executes(run_command));
+         for usage in [
+             "industrialforegoing energy <pos:block_pos> <amount:integer>",
+             "industrialforegoing water <pos:block_pos> <amount:integer>",
+@@ -273,109 +282,113 @@ impl Hooks for Mod {
+             "industrialforegoing drain <pos:block_pos> <amount:integer>",
+             "industrialforegoing fluid <pos:block_pos> <fluid:word> <amount:integer>",
+         ] {
+-            event.commands.push(Command::op(usage, 2));
++            event.commands.push(Command::op(usage, 2).executes(run_command));
+         }
+     }
++}
+ 
+-    /// The bodies of those commands (`run_mod_command`), on the typed invocation: the dispatcher has
+-    /// already parsed and resolved every argument, so nothing here splits a line.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        let invocation = event.command;
+-        if invocation.literals.first().map(String::as_str) != Some(COMMAND) {
+-            return Flow::Continue;
+-        }
+-        let Some(sub) = invocation.literals.get(1).map(String::as_str) else {
+-            say(
+-                host,
+-                "usage: /industrialforegoing info|energy|water|progress|drain ...",
+-            );
++/// The bodies of those commands (`run_mod_command`), on the typed invocation: the dispatcher has
++/// already parsed and resolved every argument, so nothing here splits a line.
++fn run_mod_command(host: &mut dyn ServerHost, invocation: &CommandInvocation) -> Flow {
++    if invocation.literals.first().map(String::as_str) != Some(COMMAND) {
++        return Flow::Continue;
++    }
++    let Some(sub) = invocation.literals.get(1).map(String::as_str) else {
++        say(
++            host,
++            "usage: /industrialforegoing info|energy|water|progress|drain ...",
++        );
++        return Flow::Cancel;
++    };
++    let Some(pos) = block_pos(invocation) else {
++        say(host, &usage(sub));
++        return Flow::Cancel;
++    };
++    if sub == "fluid" {
++        let Some(fluid) = string(invocation, "fluid") else {
++            say(host, &usage(sub));
+             return Flow::Cancel;
+         };
+-        let Some(pos) = block_pos(invocation) else {
++        let Some(amount) = integer(invocation, "amount") else {
+             say(host, &usage(sub));
+             return Flow::Cancel;
+         };
+-        if sub == "fluid" {
+-            let Some(fluid) = string(invocation, "fluid") else {
+-                say(host, &usage(sub));
+-                return Flow::Cancel;
++        let fluid = qualify_fluid(fluid);
++        dissolution::set_fluid(host, pos, &fluid, amount);
++        return Flow::Cancel;
++    }
++    match sub {
++        "info" => {
++            let line = match current_block(host, pos).as_deref() {
++                Some(dissolution::BLOCK) => dissolution::readout(host, pos),
++                _ => readout(host, pos),
+             };
+-            let Some(amount) = integer(invocation, "amount") else {
++            say(host, &line);
++        }
++        "energy" | "water" | "progress" => {
++            let (argument, full, unit, field) = match sub {
++                "energy" => ("amount", CAPACITY_FE, "FE", Field::Int(KEY_ENERGY)),
++                "water" => ("amount", TANK_CAPACITY_MB, "mB of water", Field::Tank),
++                _ => (
++                    "ticks",
++                    MAX_PROGRESS,
++                    "ticks of bar",
++                    Field::Int(KEY_PROGRESS),
++                ),
++            };
++            let Some(value) = integer(invocation, argument) else {
+                 say(host, &usage(sub));
+                 return Flow::Cancel;
+             };
+-            let fluid = qualify_fluid(fluid);
+-            dissolution::set_fluid(host, pos, &fluid, amount);
+-            return Flow::Cancel;
+-        }
+-        match sub {
+-            "info" => {
+-                let line = match current_block(host, pos).as_deref() {
+-                    Some(dissolution::BLOCK) => dissolution::readout(host, pos),
+-                    _ => readout(host, pos),
+-                };
+-                say(host, &line);
+-            }
+-            "energy" | "water" | "progress" => {
+-                let (argument, full, unit, field) = match sub {
+-                    "energy" => ("amount", CAPACITY_FE, "FE", Field::Int(KEY_ENERGY)),
+-                    "water" => ("amount", TANK_CAPACITY_MB, "mB of water", Field::Tank),
+-                    _ => (
+-                        "ticks",
+-                        MAX_PROGRESS,
+-                        "ticks of bar",
+-                        Field::Int(KEY_PROGRESS),
+-                    ),
++            let chamber = current_block(host, pos).as_deref() == Some(dissolution::BLOCK);
++            if chamber {
++                // The chamber's bar is its recipe's, and its buffer the same 10,000 FE.
++                let (full, unit) = match sub {
++                    "energy" => (CAPACITY_FE, "FE"),
++                    "progress" => (i32::MAX, "ticks of bar"),
++                    _ => (TANK_CAPACITY_MB, "mB of water"),
+                 };
+-                let Some(value) = integer(invocation, argument) else {
+-                    say(host, &usage(sub));
+-                    return Flow::Cancel;
+-                };
+-                let chamber = current_block(host, pos).as_deref() == Some(dissolution::BLOCK);
+-                if chamber {
+-                    // The chamber's bar is its recipe's, and its buffer the same 10,000 FE.
+-                    let (full, unit) = match sub {
+-                        "energy" => (CAPACITY_FE, "FE"),
+-                        "progress" => (i32::MAX, "ticks of bar"),
+-                        _ => (TANK_CAPACITY_MB, "mB of water"),
+-                    };
+-                    let value = value.clamp(0, full);
+-                    let key = if sub == "water" {
+-                        KEY_PROGRESS
+-                    } else {
+-                        field_key(field)
+-                    };
+-                    let changed = dissolution::set_int(host, pos, key, value);
+-                    say(
+-                        host,
+-                        &if changed {
+-                            format!("Dissolution Chamber at {pos:?}: {value}/{full} {unit}.")
+-                        } else {
+-                            format!("{pos:?} is not a dissolution chamber.")
+-                        },
+-                    );
+-                    return Flow::Cancel;
+-                }
+                 let value = value.clamp(0, full);
+-                let changed = set(host, pos, field, value);
++                let key = if sub == "water" {
++                    KEY_PROGRESS
++                } else {
++                    field_key(field)
++                };
++                let changed = dissolution::set_int(host, pos, key, value);
+                 say(
+                     host,
+                     &if changed {
+-                        format!("Water Condensator at {pos:?}: {value}/{full} {unit}.")
++                        format!("Dissolution Chamber at {pos:?}: {value}/{full} {unit}.")
+                     } else {
+-                        format!("{pos:?} is not a water condensator.")
++                        format!("{pos:?} is not a dissolution chamber.")
+                     },
+                 );
++                return Flow::Cancel;
+             }
+-            "drain" => drain(host, invocation, pos),
+-            _ => say(host, &usage(sub)),
++            let value = value.clamp(0, full);
++            let changed = set(host, pos, field, value);
++            say(
++                host,
++                &if changed {
++                    format!("Water Condensator at {pos:?}: {value}/{full} {unit}.")
++                } else {
++                    format!("{pos:?} is not a water condensator.")
++                },
++            );
+         }
+-        Flow::Cancel
++        "drain" => drain(host, invocation, pos),
++        _ => say(host, &usage(sub)),
+     }
++    Flow::Cancel
++}
++
++/// Every usage's executor: the old `run_mod_command` answer as the command's result.
++fn run_command(
++    host: &mut dyn ServerHost,
++    _source: &mod_api::CommandSource,
++    command: &CommandInvocation,
++) -> Option<i32> {
++    matches!(run_mod_command(host, command), Flow::Cancel).then_some(1)
+ }
+ 
+ /// The machine's Part, attached to the block (whether it ticks, and the state a placement takes) and
+@@ -388,9 +401,10 @@ impl BlockPart for Machine {
+     /// A placed machine faces its placer (`RotationType.FOUR_WAY` with the four `subfacing` values).
+     fn state_for_placement(
+         &self,
+-        level: &dyn LevelHost,
++        level: mod_api::LevelSide<'_>,
+         event: &mut StateForPlacementEvent<'_>,
+     ) -> Option<Option<BlockState>> {
++        let (mod_api::LevelSide::Server(level) | mod_api::LevelSide::Client(level)) = level;
+         let faced =
+             level.state_with_property(event.state, SUBFACING, facing_for_yaw(event.context.yaw))?;
+         Some(Some(faced))
+@@ -436,24 +450,66 @@ impl BlockEntityPart for Machine {
+     /// One server tick: count the bar down, and at zero pass the water sources beside it to the pure
+     /// attempt, then write back what changed. The view's write-back is checked: the default reply
+     /// (`Changed`) keeps the edits and marks the chunk, so nothing here calls `setChanged`.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        let pos = event.pos;
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        let Some((pos, handle, before)) = event
++            .subject
++            .with_view(|view| (view.position(), view.handle(), view.nbt().clone()))
++        else {
++            return;
++        };
++        let mut nbt = before.clone();
+         let mut machine = Condensator::from_saved(
+-            read_int(&event.entity.nbt, KEY_ENERGY),
+-            read_tank(&event.entity.nbt),
+-            read_progress(&event.entity.nbt),
++            read_int(&nbt, KEY_ENERGY),
++            read_tank(&nbt),
++            read_progress(&nbt),
+         );
+-        let before = (machine.energy, machine.water_mb, machine.progress);
+-        machine.tick_with_augments(water_sources(host, pos), read_augments(&event.entity.nbt));
+-        if machine.energy != before.0 {
+-            write_int(&mut event.entity.nbt, KEY_ENERGY, machine.energy);
++        let was = (machine.energy, machine.water_mb, machine.progress);
++        machine.tick_with_augments(water_sources(event.subject.host(), pos), read_augments(&nbt));
++        if machine.energy != was.0 {
++            write_int(&mut nbt, KEY_ENERGY, machine.energy);
++        }
++        if machine.water_mb != was.1 {
++            write_tank(&mut nbt, machine.water_mb);
+         }
+-        if machine.water_mb != before.1 {
+-            write_tank(&mut event.entity.nbt, machine.water_mb);
++        if machine.progress != was.2 {
++            write_int(&mut nbt, KEY_PROGRESS, machine.progress);
+         }
+-        if machine.progress != before.2 {
+-            write_int(&mut event.entity.nbt, KEY_PROGRESS, machine.progress);
++        write_back(event, handle, &before, &nbt, &[], &[]);
++    }
++}
++
++/// Write a tick's edits back to the resident block entity: the saved fields and item slots that
++/// differ from what the tick read, marking the chunk unsaved when any took (the old `Changed`
++/// reply).
++pub(crate) fn write_back(
++    event: &mut BlockEntityTickEvent<'_>,
++    handle: BlockEntityRef,
++    before: &Compound,
++    nbt: &Compound,
++    items_before: &[Option<ItemStack>],
++    items: &[Option<ItemStack>],
++) {
++    let changed = event.subject.with_view(|mut view| {
++        let mut changed = false;
++        for (slot, stack) in items.iter().enumerate() {
++            if items_before.get(slot) != Some(stack) {
++                changed |= view.set_item_slot(slot as u32, stack.clone()).unwrap_or(false);
++            }
++        }
++        for (key, value) in nbt.iter() {
++            if before.get(key) != Some(value) {
++                changed |= view.set_nbt(key.clone(), Some(value.clone()));
++            }
++        }
++        for (key, _) in before.iter() {
++            if nbt.get(key).is_none() {
++                changed |= view.set_nbt(key.clone(), None);
++            }
+         }
++        changed
++    });
++    if changed == Some(true) {
++        let _ = handle.set_changed(event.subject.host());
+     }
+ }
+ 
+@@ -572,7 +628,7 @@ fn qualify_fluid(fluid: &str) -> String {
+ /// The id of the block at `pos` in the command's dimension.
+ fn current_block(host: &mut dyn ServerHost, pos: [i32; 3]) -> Option<String> {
+     let level = host.level(host.dimension())?;
+-    level.block(host, pos).map(|key| key.id(&*host))
++    level.block(host, pos).and_then(|key| key.id(&*host).map(str::to_owned))
+ }
+ 
+ /// The saved key a [`Field`] writes.
+@@ -637,12 +693,12 @@ fn drain(host: &mut dyn ServerHost, invocation: &CommandInvocation, pos: [i32; 3
+             let Some(resource) = tanks.resource(host, 0) else {
+                 return Ok(format!("Water Condensator at {pos:?}: no drainable fluid."));
+             };
+-            let taken = tanks.extract(host, tx, 0, &resource, want);
++            let taken = tanks.extract_at(host, tx, 0, &resource, want);
+             if taken == 0 {
+                 return Ok(format!("Water Condensator at {pos:?}: no drainable fluid."));
+             }
+             let name = match resource.fluid() {
+-                FluidIdentity::Resolved(fluid) => fluid.id(host),
++                FluidIdentity::Resolved(fluid) => fluid.id(host).unwrap_or_default().to_owned(),
+                 FluidIdentity::Unresolved(fluid) => fluid.id(host),
+                 _ => "an unknown fluid".to_owned(),
+             };

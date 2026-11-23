@@ -1,0 +1,412 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 9ff0819..eae3940 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -31,7 +31,7 @@ use mod_api::{
+     ExplosionSettings, Flow, Hand, Hooks, HostSide, HostTransaction, Identifier, InteractionResult,
+     ItemKey, ItemPlace, ItemResource, ItemStack, LevelRef, ModContainer, ModEnergyBuffer,
+     ModFluidTanks, PlayerRef, Registrar, RegistrationContext, RightClickBlockEvent,
+-    RunModCommandEvent, ServerHost, StateForPlacementEvent, Tag, Text,
++    ServerHost, StateForPlacementEvent, Tag, Text,
+ };
+ 
+ use crate::runtime::{
+@@ -166,7 +166,7 @@ fn ticking_level(host: &mut dyn ServerHost) -> Option<LevelRef> {
+ 
+ /// The block id at `pos`, if the position is loaded.
+ fn block_at(host: &dyn mod_api::Host, level: LevelRef, pos: [i32; 3]) -> Option<String> {
+-    level.block(host, pos).map(|block| block.id(host))
++    level.block(host, pos).and_then(|block| block.id(host).map(str::to_owned))
+ }
+ 
+ /// The saved compound of the block entity at `pos`.
+@@ -230,6 +230,7 @@ impl Hooks for Mod {
+                 inputs: vec![BOILER_FUEL],
+                 outputs: vec![],
+                 menu: None,
++                insert_rules: Vec::new(),
+             },
+         );
+         r.block_container(
+@@ -240,6 +241,7 @@ impl Hooks for Mod {
+                 inputs: vec![MACERATOR_INPUT],
+                 outputs: vec![MACERATOR_OUTPUT],
+                 menu: None,
++                insert_rules: Vec::new(),
+             },
+         );
+ 
+@@ -291,14 +293,14 @@ impl Hooks for Mod {
+     ) {
+         event
+             .commands
+-            .push(Command::new("gtceu status <pos:block_pos> [tag:word]"));
++            .push(Command::new("gtceu status <pos:block_pos> [tag:word]").executes(run_command));
+         event
+             .commands
+-            .push(Command::new("gtceu take <pos:block_pos>"));
++            .push(Command::new("gtceu take <pos:block_pos>").executes(run_command));
+         event.commands.push(Command::op(
+             "gtceu fill <pos:block_pos> <amount:integer>",
+             OPERATOR_LEVEL,
+-        ));
++        ).executes(run_command));
+     }
+ 
+     /// A right click on a machine: insert fuel or ore, or read the machine.
+@@ -396,39 +398,73 @@ impl Hooks for Mod {
+         Flow::Cancel
+     }
+ 
+-    /// Run one registered `/gtceu` usage after the dispatcher parsed it.
+-    fn run_mod_command(
+-        &self,
++    /// After every level tick: push steam and EU into the neighbouring machine.
++    /// A block entity is out of the world during its own tick, so this is the
++    /// only point where both ends of the transfer can be read and written.
++    fn level_tick_post(&self, host: HostSide, event: &mut mod_api::LevelTickPostEvent) {
++        let HostSide::Server(host) = host else {
++            return;
++        };
++        let level = event.level;
++        let dimension = level.dimension_id().to_owned();
++        let queued = {
++            let mut queue = PUSH.lock().unwrap_or_else(|poison| poison.into_inner());
++            std::mem::take(&mut *queue)
++        };
++        if queued.is_empty() {
++            return;
++        }
++        let mut later = Vec::new();
++        for (dim, pos, push) in queued {
++            if dim != dimension {
++                later.push((dim, pos, push));
++                continue;
++            }
++            match push {
++                Push::Steam => push_steam(host, level, pos),
++                Push::Energy => push_energy(host, level, pos),
++            }
++        }
++        if !later.is_empty() {
++            PUSH.lock()
++                .unwrap_or_else(|poison| poison.into_inner())
++                .extend(later);
++        }
++    }
++}
++
++/// Run one registered `/gtceu` usage after the dispatcher parsed it.
++fn run_command(
+         host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        let Some(dimension) = event.command.dimension.id(host) else {
+-            return Flow::Continue;
++        source: &mod_api::CommandSource,
++        command: &mod_api::CommandInvocation,
++    ) -> Option<i32> {
++        let Some(dimension) = command.dimension.id(host) else {
++            return None;
+         };
+         let Some(level) = host.level(&dimension) else {
+-            return Flow::Continue;
++            return None;
+         };
+-        let source_player = match event.source {
++        let source_player = match source {
+             mod_api::CommandSource::Player { player, .. } => Some(*player),
+             _ => None,
+         };
+-        match event.command.literals.as_slice() {
++        match command.literals.as_slice() {
+             [root, action] if root == "gtceu" && action == "status" => {
+-                let Some(pos) = block_pos(event.command.argument("pos")) else {
+-                    return Flow::Continue;
++                let Some(pos) = block_pos(command.argument("pos")) else {
++                    return None;
+                 };
+-                let tag = match event.command.argument("tag") {
++                let tag = match command.argument("tag") {
+                     Some(CommandArgumentValue::String(tag)) => tag.clone(),
+                     _ => String::new(),
+                 };
+                 let line = status_text(host, level, pos, &tag);
+                 feedback(host, line);
+-                event.cancelled = true;
+-                Flow::Cancel
++                Some(1)
+             }
+             [root, action] if root == "gtceu" && action == "take" => {
+-                let Some(pos) = block_pos(event.command.argument("pos")) else {
+-                    return Flow::Continue;
++                let Some(pos) = block_pos(command.argument("pos")) else {
++                    return None;
+                 };
+                 // The output goes into the caller's inventory, so the command is the
+                 // player's own interaction with the machine and asks its reach rule: a
+@@ -441,8 +477,7 @@ impl Hooks for Mod {
+                         "gtceu take needs a player: the output goes to the caller's inventory"
+                             .to_owned(),
+                     );
+-                    event.cancelled = true;
+-                    return Flow::Cancel;
++                    return Some(1);
+                 };
+                 if !player_in_reach(host, player, pos) {
+                     let reach = reach_of(host, player);
+@@ -450,77 +485,38 @@ impl Hooks for Mod {
+                         host,
+                         format!("gtceu {pos:?} is out of reach: stand within {reach} blocks of it"),
+                     );
+-                    event.cancelled = true;
+-                    return Flow::Cancel;
++                    return Some(1);
+                 }
+                 let line = take_output(host, level, pos, Some(player));
+                 feedback(host, line);
+-                event.cancelled = true;
+-                Flow::Cancel
++                Some(1)
+             }
+             [root, action] if root == "gtceu" && action == "fill" => {
+-                let Some(pos) = block_pos(event.command.argument("pos")) else {
+-                    return Flow::Continue;
++                let Some(pos) = block_pos(command.argument("pos")) else {
++                    return None;
+                 };
+-                let Some(CommandArgumentValue::Integer(amount)) = event.command.argument("amount")
++                let Some(CommandArgumentValue::Integer(amount)) = command.argument("amount")
+                 else {
+-                    return Flow::Continue;
++                    return None;
+                 };
+                 // Creating fluid in a machine another player owns is an administrative
+                 // act: filling a hot dry boiler can make it explode, so the usage is
+                 // registered at the operator level and the body asks again (a merged
+                 // command tree is not a guarantee a body may lean on).
+-                if event.source.permission().level() < OPERATOR_LEVEL {
++                if source.permission().level() < OPERATOR_LEVEL {
+                     feedback(
+                         host,
+                         format!("gtceu fill needs an operator (permission level {OPERATOR_LEVEL})"),
+                     );
+-                    event.cancelled = true;
+-                    return Flow::Cancel;
++                    return Some(1);
+                 }
+                 let line = fill_tank(host, level, pos, *amount);
+                 feedback(host, line);
+-                event.cancelled = true;
+-                Flow::Cancel
+-            }
+-            _ => Flow::Continue,
+-        }
+-    }
+-
+-    /// After every level tick: push steam and EU into the neighbouring machine.
+-    /// A block entity is out of the world during its own tick, so this is the
+-    /// only point where both ends of the transfer can be read and written.
+-    fn level_tick_post(&self, host: HostSide, event: &mut mod_api::LevelTickPostEvent) {
+-        let HostSide::Server(host) = host else {
+-            return;
+-        };
+-        let level = event.level;
+-        let dimension = level.dimension_id().to_owned();
+-        let queued = {
+-            let mut queue = PUSH.lock().unwrap_or_else(|poison| poison.into_inner());
+-            std::mem::take(&mut *queue)
+-        };
+-        if queued.is_empty() {
+-            return;
+-        }
+-        let mut later = Vec::new();
+-        for (dim, pos, push) in queued {
+-            if dim != dimension {
+-                later.push((dim, pos, push));
+-                continue;
++                Some(1)
+             }
+-            match push {
+-                Push::Steam => push_steam(host, level, pos),
+-                Push::Energy => push_energy(host, level, pos),
+-            }
+-        }
+-        if !later.is_empty() {
+-            PUSH.lock()
+-                .unwrap_or_else(|poison| poison.into_inner())
+-                .extend(later);
++            _ => None,
+         }
+     }
+-}
+ 
+ fn dimension_id(dimension: mod_api::LevelDimension) -> Option<String> {
+     use mod_api::LevelDimension as L;
+@@ -533,7 +529,7 @@ fn dimension_id(dimension: mod_api::LevelDimension) -> Option<String> {
+ }
+ 
+ fn item_id(host: &dyn mod_api::Host, item: ItemKey) -> String {
+-    item.id(host)
++    item.id(host).unwrap_or_default().to_owned()
+ }
+ 
+ fn block_pos(argument: Option<&CommandArgumentValue>) -> Option<[i32; 3]> {
+@@ -604,9 +600,10 @@ impl BlockPart for MachinePart {
+     /// `Direction.fromYRot(yaw).getOpposite()`.
+     fn state_for_placement(
+         &self,
+-        level: &dyn mod_api::LevelHost,
++        level: mod_api::LevelSide<'_>,
+         event: &mut StateForPlacementEvent<'_>,
+     ) -> Option<Option<BlockState>> {
++        let (mod_api::LevelSide::Server(level) | mod_api::LevelSide::Client(level)) = level;
+         let facing = facing_for_yaw(event.context.yaw);
+         level
+             .state_with_property(event.state, FACING, facing)
+@@ -624,24 +621,72 @@ impl BlockEntityPart for MachinePart {
+     }
+ 
+     /// One server tick of a machine.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        let pos = event.pos;
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        let Some((pos, handle, mut entity)) = event.subject.with_view(|view| {
++            let items = (0..view.item_slots() as u32)
++                .map(|slot| view.item_slot(slot).and_then(|stack| stack.to_owned()))
++                .collect();
++            (
++                view.position(),
++                view.handle(),
++                Lent {
++                    id: view.id().to_owned(),
++                    items,
++                    nbt: view.nbt().clone(),
++                },
++            )
++        }) else {
++            return;
++        };
++        let before_items = entity.items.clone();
++        let before_nbt = entity.nbt.clone();
++        let host = event.subject.host();
+         let level = ticking_level(host);
+-        let kind = match event.entity.id() {
++        let kind = match entity.id.as_str() {
+             BOILER => Some(Kind::Boiler),
+             TURBINE => Some(Kind::Turbine),
+             MACERATOR => Some(Kind::Macerator),
+             _ => None,
+         };
+         match kind {
+-            Some(Kind::Boiler) => tick_boiler(host, level, pos, &mut event.entity),
+-            Some(Kind::Turbine) => tick_turbine(host, level, pos, &mut event.entity),
+-            Some(Kind::Macerator) => tick_macerator(host, level, pos, &mut event.entity),
++            Some(Kind::Boiler) => tick_boiler(host, level, pos, &mut entity),
++            Some(Kind::Turbine) => tick_turbine(host, level, pos, &mut entity),
++            Some(Kind::Macerator) => tick_macerator(host, level, pos, &mut entity),
+             None => {}
+         }
++        let changed = event.subject.with_view(|mut view| {
++            let mut changed = false;
++            for (slot, stack) in entity.items.iter().enumerate() {
++                if before_items.get(slot) != Some(stack) {
++                    changed |= view.set_item_slot(slot as u32, stack.clone()).unwrap_or(false);
++                }
++            }
++            for (key, value) in entity.nbt.iter() {
++                if before_nbt.get(key) != Some(value) {
++                    changed |= view.set_nbt(key.clone(), Some(value.clone()));
++                }
++            }
++            for (key, _) in before_nbt.iter() {
++                if entity.nbt.get(key).is_none() {
++                    changed |= view.set_nbt(key.clone(), None);
++                }
++            }
++            changed
++        });
++        if changed == Some(true) {
++            let _ = handle.set_changed(event.subject.host());
++        }
+     }
+ }
+ 
++/// What a machine's tick works on: the block entity's id, slots and saved compound, read
++/// from the view and written back to it when the tick is done.
++struct Lent {
++    id: String,
++    items: Vec<Option<ItemStack>>,
++    nbt: Compound,
++}
++
+ fn facing_for_yaw(yaw: f32) -> &'static str {
+     // Vanilla: 0 is south, 90 west, 180 north, 270 east; the front is the opposite.
+     let quarter = ((f64::from(yaw) / 90.0).round() as i32).rem_euclid(4);
+@@ -703,7 +748,7 @@ fn tick_boiler(
+     host: &mut dyn ServerHost,
+     level: Option<LevelRef>,
+     pos: [i32; 3],
+-    entity: &mut mod_api::ModBlockEntityView<'_>,
++    entity: &mut Lent,
+ ) {
+     let mut boiler = boiler_from(&entity.nbt);
+     if !boiler.burning()
+@@ -737,7 +782,7 @@ fn tick_boiler(
+ /// (a lava bucket's bucket) takes its place when the stack runs out.
+ fn consume_fuel(
+     host: &dyn mod_api::Host,
+-    entity: &mut mod_api::ModBlockEntityView<'_>,
++    entity: &mut Lent,
+     stack: &ItemStack,
+ ) {
+     let remainder = host.item_crafting_remainder(stack);
+@@ -818,7 +863,7 @@ fn tick_turbine(
+     host: &mut dyn ServerHost,
+     level: Option<LevelRef>,
+     pos: [i32; 3],
+-    entity: &mut mod_api::ModBlockEntityView<'_>,
++    entity: &mut Lent,
+ ) {
+     let mut turbine = turbine_from(&entity.nbt);
+     let _ = turbine.tick();
+@@ -851,10 +896,10 @@ fn store_macerator(nbt: &mut Compound, macerator: &Macerator) {
+ /// The input item the recipe table knows, and whether its output fits.
+ fn macerator_input(
+     host: &dyn mod_api::Host,
+-    entity: &mod_api::ModBlockEntityView<'_>,
++    entity: &Lent,
+ ) -> Option<ItemKey> {
+     let stack = entity.items.get(MACERATOR_INPUT).and_then(Option::as_ref)?;
+-    let result = macerator_output(&stack.item().id(host))?;
++    let result = macerator_output(stack.item().id(host).unwrap_or_default())?;
+     let result_key = host.item_key(&Identifier::parse_namespaced(result)?)?;
+     let limit = host.max_stack_size(result_key).unwrap_or(64);
+     let fits = match entity.items.get(MACERATOR_OUTPUT).and_then(Option::as_ref) {
+@@ -870,7 +915,7 @@ fn tick_macerator(
+     host: &mut dyn ServerHost,
+     level: Option<LevelRef>,
+     pos: [i32; 3],
+-    entity: &mut mod_api::ModBlockEntityView<'_>,
++    entity: &mut Lent,
+ ) {
+     let result = macerator_input(host, entity);
+     let mut macerator = macerator_from(&entity.nbt);
+@@ -888,7 +933,7 @@ fn tick_macerator(
+ 
+ fn finish_maceration(
+     host: &dyn mod_api::Host,
+-    entity: &mut mod_api::ModBlockEntityView<'_>,
++    entity: &mut Lent,
+     result: ItemKey,
+ ) {
+     let limit = host.max_stack_size(result).unwrap_or(64);
+@@ -1167,7 +1212,7 @@ fn take_output(
+     let amount = handler.amount(host, MACERATOR_OUTPUT);
+     let moved = host
+         .transaction(|host, tx| {
+-            Ok::<u32, ()>(handler.extract(host, tx, MACERATOR_OUTPUT, &resource, amount))
++            Ok::<u32, ()>(handler.extract_at(host, tx, MACERATOR_OUTPUT, &resource, amount))
+         })
+         .unwrap_or(0);
+     if moved == 0 {

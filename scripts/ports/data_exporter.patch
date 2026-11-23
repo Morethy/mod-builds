@@ -1,0 +1,169 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 312421c..42d4ac4 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -5,10 +5,10 @@ mod runtime;
+ 
+ use mod_api::{
+     ClientHost, ClientPlayerLoggingInEvent, Command, CommandSource, EntityPlaceEvent, Flow, Hand,
+-    Hooks, Host, ItemCraftedEvent, ItemPickedUpPartialEvent, ItemPickedUpPostEvent, ItemStack,
++    Hooks, Host, ItemCraftedEvent, ItemPickedUpPostEvent, ItemStack,
+     PlayerAdvancementDoneEvent, PlayerChangedDimensionEvent, PlayerDestroyedBlockEvent,
+     PlayerDiedEvent, PlayerLoggedInEvent, PlayerLoggedOutEvent, PlayerRef, PlayerStatAwardEvent,
+-    RegisterCommandsEvent, Registrar, RegistrationContext, RunModCommandEvent, ServerHost,
++    RegisterCommandsEvent, Registrar, RegistrationContext, ServerHost,
+     ServerTickEvent, ServerTickPhase, SettingChangedEvent, SettingSpec, Text,
+ };
+ use runtime as m;
+@@ -63,7 +63,7 @@ fn who(host: &dyn ServerHost, player: u128, name: Option<&str>) -> Fields {
+     let at = |i: usize| position.map_or(Field::Null, |p| Field::Float(p[i]));
+     let name = name
+         .map(str::to_owned)
+-        .or_else(|| found.and_then(|p| p.name(host)));
++        .or_else(|| found.and_then(|p| p.name(host).map(str::to_owned)));
+     vec![
+         ("player_uuid", text(m::uuid_text(player))),
+         ("player_name", name.map_or(Field::Null, text)),
+@@ -137,7 +137,7 @@ fn block(host: &dyn ServerHost, id: &'static str, pos: [i32; 3], name: String, h
+ }
+ 
+ fn item_id(host: &dyn Host, stack: &ItemStack) -> String {
+-    stack.item().id(host)
++    stack.item().id(host).unwrap_or_default().to_owned()
+ }
+ 
+ /// The stack a player places a block from: the hand holding that block's item, else the main
+@@ -146,9 +146,9 @@ fn placing_stack(host: &dyn ServerHost, player: PlayerRef, block: &str) -> Optio
+     let living = host.living(player.entity())?;
+     let held = |hand| {
+         living
+-            .hand_item(host, hand)
+-            .filter(|s| s.count() > 0)
+-            .map(|s| item_id(host, &s))
++            .with_hand_item(host, hand, |s| (s.count() > 0).then(|| s.item()))
++            .flatten()
++            .map(|item| item.id(host).unwrap_or_default().to_owned())
+     };
+     let (main, off) = (held(Hand::Main), held(Hand::Off));
+     match (&main, &off) {
+@@ -325,7 +325,7 @@ impl Hooks for DataExporter {
+         let Some(player) = host.players().acting_player() else {
+             return Flow::Continue;
+         };
+-        let block_id = event.state.block().id(&*host);
++        let block_id = event.state.block().id(&*host).unwrap_or_default().to_owned();
+         let held = placing_stack(&*host, player, &block_id).map_or(Field::Null, text);
+         let name = host.block_state_string(event.state).unwrap_or(block_id);
+         let pos = [event.pos.x, event.pos.y, event.pos.z];
+@@ -362,15 +362,6 @@ impl Hooks for DataExporter {
+         picked_up(&*host, event.player, event.original, left);
+     }
+ 
+-    fn item_picked_up_partial(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut ItemPickedUpPartialEvent<'_>,
+-    ) {
+-        let left = event.remaining.as_ref().map_or(0, ItemStack::count);
+-        picked_up(&*host, event.player, event.original, left);
+-    }
+-
+     fn player_advancement_done(
+         &self,
+         host: &mut dyn ServerHost,
+@@ -418,53 +409,53 @@ impl Hooks for DataExporter {
+ 
+     fn register_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+         event.commands.extend([
+-            Command::new("data_exporter"),
+-            Command::new("data_exporter open"),
++            Command::new("data_exporter").executes(run_command),
++            Command::new("data_exporter open").executes(run_command),
+         ]);
+     }
++}
+ 
+-    /// `/data_exporter` says what was saved and where the profile is; `/data_exporter open` shows
+-    /// the profile in the file manager, for the world's owner (it opens on the server's computer).
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        let literals = &event.command.literals;
+-        if literals.first().map(String::as_str) != Some("data_exporter") {
+-            return Flow::Continue;
+-        }
+-        let CommandSource::Player { player, .. } = event.source else {
+-            return Flow::Cancel;
+-        };
+-        if !ensure(&*host) {
+-            return Flow::Cancel;
+-        }
+-        let path = m::profile_path()
+-            .map(|p| p.display().to_string())
+-            .unwrap_or_default();
+-        if literals.get(1).map(String::as_str) == Some("open") {
+-            let line = if !m::is_owner(player.uuid()) {
+-                "Data Exporter: only the world's owner can open its folder".to_owned()
+-            } else {
+-                match m::profile_path().map(|p| m::reveal(&p)) {
+-                    Some(Ok(())) => format!("Data Exporter: opened {path}"),
+-                    Some(Err(error)) => format!("Data Exporter: can't open the folder: {error}"),
+-                    None => "Data Exporter: no profile yet".to_owned(),
+-                }
+-            };
+-            tell(host, *player, line);
++/// `/data_exporter` says what was saved and where the profile is; `/data_exporter open` shows
++/// the profile in the file manager, for the world's owner (it opens on the server's computer).
++fn run_command(
++    host: &mut dyn ServerHost,
++    source: &CommandSource,
++    command: &mod_api::CommandInvocation,
++) -> Option<i32> {
++    let literals = &command.literals;
++    if literals.first().map(String::as_str) != Some("data_exporter") {
++        return None;
++    }
++    let CommandSource::Player { player, .. } = source else {
++        return Some(1);
++    };
++    if !ensure(&*host) {
++        return Some(1);
++    }
++    let path = m::profile_path()
++        .map(|p| p.display().to_string())
++        .unwrap_or_default();
++    if literals.get(1).map(String::as_str) == Some("open") {
++        let line = if !m::is_owner(player.uuid()) {
++            "Data Exporter: only the world's owner can open its folder".to_owned()
+         } else {
+-            let status = m::status_line().unwrap_or_default();
+-            tell(
+-                host,
+-                *player,
+-                format!("Data Exporter {}: {status}", m::VERSION),
+-            );
+-            tell(host, *player, format!("Profile: {path}"));
+-        }
+-        Flow::Cancel
++            match m::profile_path().map(|p| m::reveal(&p)) {
++                Some(Ok(())) => format!("Data Exporter: opened {path}"),
++                Some(Err(error)) => format!("Data Exporter: can't open the folder: {error}"),
++                None => "Data Exporter: no profile yet".to_owned(),
++            }
++        };
++        tell(host, *player, line);
++    } else {
++        let status = m::status_line().unwrap_or_default();
++        tell(
++            host,
++            *player,
++            format!("Data Exporter {}: {status}", m::VERSION),
++        );
++        tell(host, *player, format!("Profile: {path}"));
+     }
++    Some(1)
+ }
+ 
+ fn picked_up(host: &dyn ServerHost, player: u128, original: &ItemStack, left: u32) {

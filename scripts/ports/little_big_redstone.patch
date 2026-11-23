@@ -1,0 +1,113 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index b8285e9..d348789 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -34,7 +34,7 @@ pub mod support;
+ 
+ use mod_api::{
+     self, Flow, Hooks, HostSide, LevelTickPostEvent, RegisterCommandsEvent, Registrar,
+-    RegistrationContext, RunModCommandEvent, ServerHost, WorldLifecycleEvent,
++    RegistrationContext, ServerHost, WorldLifecycleEvent,
+ };
+ 
+ /// The mod keeps no state of its own: the registry lives in `support` (one per session, shared by
+@@ -54,15 +54,6 @@ impl Hooks for Mod {
+         support::declare_commands(event.commands);
+     }
+ 
+-    /// Run one of the commands above and take it.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        support::run_command(host, event)
+-    }
+-
+     /// End of a level's tick: evaluate every microchip whose block entity ticked, write its saved
+     /// compound, its face properties and the neighbour notifications.
+     fn level_tick_post(&self, host: HostSide<'_>, event: &mut LevelTickPostEvent) {
+diff --git a/src/support.rs b/src/support.rs
+index 7fb6070..46ea591 100644
+--- a/src/support.rs
++++ b/src/support.rs
+@@ -23,10 +23,10 @@ use std::collections::{BTreeMap, BTreeSet};
+ use std::sync::{Mutex, MutexGuard, PoisonError};
+ 
+ use mod_api::{
+-    BlockEntityEvent, BlockEntityPart, BlockEntityTickEvent, BlockEntityTickReply,
++    BlockEntityEvent, BlockEntityPart, BlockEntityTickEvent,
+     BlockEntityTicksEvent, BlockPart, BlockSignalEvent, Command, CommandArgument,
+     CommandArgumentValue, CommandInvocation, Compound, Direction, Flow, Host, IsSignalSourceEvent,
+-    LevelHost, LevelRef, LevelSide, NeighbourUpdate, Registrar, RunModCommandEvent, ServerHost,
++    LevelHost, LevelRef, LevelSide, NeighbourUpdate, Registrar, ServerHost,
+     Tag, Text, WorldLifecycleEvent,
+ };
+ 
+@@ -150,12 +150,16 @@ impl BlockEntityPart for MicrochipEntity {
+     /// One server tick: register the position for this tick's evaluation and keep
+     /// `block_signal`'s answer in step with the saved compound. Nothing is written here — a block
+     /// entity's own tick cannot persist its compound.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        let power = stored_power(&event.entity.nbt);
+-        let Some(level) = level_in_place(host) else {
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        let Some((power, pos)) = event
++            .subject
++            .with_view(|entity| (stored_power(entity.nbt()), entity.position()))
++        else {
++            return;
++        };
++        let Some(level) = level_in_place(event.subject.host()) else {
+             return;
+         };
+-        let pos = event.pos;
+         {
+             let mut guard = registry();
+             let registry = guard.get_or_insert_with(Registry::default);
+@@ -168,7 +172,6 @@ impl BlockEntityPart for MicrochipEntity {
+             registry.chips.insert(pos);
+             registry.power.insert(pos, power);
+         }
+-        *event.reply = BlockEntityTickReply::Unchanged;
+     }
+ }
+ 
+@@ -366,9 +369,9 @@ fn is_microchip_at(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> bool {
+ // ---------------------------------------------------------------------------
+ 
+ /// Declare the `/lbr` usages this slice implements (`register_commands`, API 8).
+-pub fn declare_commands(commands: &mut Vec<Command>) {
++pub fn declare_commands(commands: &mut Vec<mod_api::CommandRegistration>) {
+     for (usage, level) in usages() {
+-        commands.push(Command::op(&usage, level));
++        commands.push(Command::op(&usage, level).executes(run_command));
+     }
+ }
+ 
+@@ -398,17 +401,20 @@ pub fn usages() -> Vec<(String, u8)> {
+ /// Run a `/lbr` line (`run_mod_command`, API 8, which replaces `perform_command`). Upstream edits a
+ /// circuit in the microchip's GUI; the port offers the same operations on the command line (a
+ /// documented deviation).
+-pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>) -> Flow {
+-    let invocation: &CommandInvocation = event.command;
++pub fn run_command(
++    host: &mut dyn ServerHost,
++    _source: &mod_api::CommandSource,
++    invocation: &CommandInvocation,
++) -> Option<i32> {
+     match action(&invocation.literals, &invocation.arguments) {
+-        Ok(Action::Unknown) => Flow::Continue,
++        Ok(Action::Unknown) => None,
+         Ok(command) => {
+             perform(host, command, invocation.dimension);
+-            Flow::Cancel
++            Some(1)
+         }
+         Err(error) => {
+             say(host, format!("lbr: {error} (try /lbr help)"));
+-            Flow::Cancel
++            Some(1)
+         }
+     }
+ }

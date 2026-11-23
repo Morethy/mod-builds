@@ -1,0 +1,176 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index d5fb4e8..0cd4ff6 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -22,12 +22,12 @@
+ //! Not ported: the equipment tab (a server menu moves no items; equipping by hand is vanilla's),
+ //! typed position values, sliders, and the name edit box.
+ use std::collections::HashMap;
+-use std::sync::Mutex;
++use std::sync::{Arc, Mutex};
+ use std::sync::atomic::{AtomicU64, Ordering};
+ 
+ use mod_api::{
+     Compound, EntityInteractEvent, GameMode, HostSide, Hooks, Host, Identifier, InteractionResult, ItemStack,
+-    MenuClickedEvent, MenuClosedEvent, MenuReplace, ServerHost, ServerTickEvent, ServerTickPhase, Tag, Text,
++    Flow, MenuClickedEvent, MenuClosedEvent, MenuPart, MenuReplace, RegistrationContext, Registrar, ServerHost, ServerTickEvent, ServerTickPhase, Tag, Text,
+ };
+ 
+ /// ArmorStandPose.VALUES: name, by (Minecraft or Vanilla Tweaks), and head, body, left arm, right
+@@ -290,9 +290,15 @@ struct Session {
+ struct Mod {
+     /// Players to open the menu for at the tick's end, and the stand.
+     opens: Mutex<Vec<(u128, u32)>>,
+-    sessions: Mutex<HashMap<u128, Session>>,
++    sessions: Arc<Mutex<HashMap<u128, Session>>>,
+     /// Copied poses, by player.
+-    clipboard: Mutex<HashMap<u128, [[f32; 3]; 6]>>,
++    clipboard: Arc<Mutex<HashMap<u128, [[f32; 3]; 6]>>>,
++}
++
++/// The clicks of the six-row server menu (`minecraft:generic_9x6`), sharing the mod's sessions.
++struct Clicks {
++    sessions: Arc<Mutex<HashMap<u128, Session>>>,
++    clipboard: Arc<Mutex<HashMap<u128, [[f32; 3]; 6]>>>,
+ }
+ 
+ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+@@ -548,7 +554,7 @@ fn creative(host: &dyn Host, uuid: u128) -> bool {
+ 
+ fn read(host: &mut dyn ServerHost, id: u32) -> Option<Stand> {
+     let e = host.entity(id)?;
+-    if e.kind(&*host).map(|k| k.id(&*host)).as_deref() != Some("minecraft:armor_stand") {
++    if e.kind(&*host).and_then(|k| k.id(&*host)).as_deref() != Some("minecraft:armor_stand") {
+         return None;
+     }
+     e.nbt(host).map(|c| Stand::from_nbt(&Tag::Compound(c)))
+@@ -566,6 +572,14 @@ fn title(stand: &Stand) -> Text {
+ 
+ #[mod_api::sunrise_mod]
+ impl Hooks for Mod {
++    fn register(&self, registrar: &mut dyn Registrar, _context: &RegistrationContext) {
++        // The menu `open_menu` opens with six rows; a click on another mod's is no session of ours.
++        registrar.menu_part(
++            "minecraft:generic_9x6",
++            Clicks { sessions: self.sessions.clone(), clipboard: self.clipboard.clone() },
++        );
++    }
++
+     fn entity_interact(&self, host: HostSide<'_>, event: &mut EntityInteractEvent<'_>) -> Option<InteractionResult> {
+         let HostSide::Server(host) = host else { return None };
+         if event.kind != "minecraft:armor_stand" || event.stack.is_some() || !host.on("armorstatues") {
+@@ -616,56 +630,6 @@ impl Hooks for Mod {
+         }
+     }
+ 
+-    fn menu_clicked(&self, host: &mut dyn ServerHost, event: &mut MenuClickedEvent) {
+-        let Some(mut session) = lock(&self.sessions).get(&event.uuid).cloned() else { return };
+-        if session.window != event.window {
+-            return;
+-        }
+-        // PICKUP and QUICK_MOVE with either button; a drag, swap or throw does nothing.
+-        if !matches!(event.mode, 0 | 1) || !(0..54).contains(&event.slot) {
+-            return;
+-        }
+-        let Some(stand) = read(host, session.entity) else {
+-            host.close_menu(event.uuid);
+-            return;
+-        };
+-        let creative = creative(&*host, event.uuid);
+-        if stand.flags[6] && !creative {
+-            host.close_menu(event.uuid);
+-            return;
+-        }
+-        match click(&stand, &session, event.slot, creative) {
+-            Change::None => return,
+-            Change::Close => {
+-                host.close_menu(event.uuid);
+-                return;
+-            }
+-            Change::Tab(t) => session.tab = t,
+-            Change::Part(p) => session.part = p,
+-            Change::Increment(i) => session.increment = i,
+-            Change::Copy => {
+-                lock(&self.clipboard).insert(event.uuid, stand.pose);
+-            }
+-            Change::Paste => {
+-                let copied = lock(&self.clipboard).get(&event.uuid).copied();
+-                if let Some(pose) = copied {
+-                    merge(host, session.entity, pose_nbt(&pose));
+-                }
+-            }
+-            Change::Merge(parts) => {
+-                for nbt in parts {
+-                    merge(host, session.entity, nbt);
+-                }
+-            }
+-        }
+-        let stand = read(host, session.entity).unwrap_or(stand);
+-        let shown = stacks(&*host, items(&stand, &session, creative));
+-        if let Err(e) = host.menu_set_items(event.uuid, event.window, shown) {
+-            eprintln!("[armorstatues] menu_set_items: {e:?}");
+-        }
+-        lock(&self.sessions).insert(event.uuid, session);
+-    }
+-
+     fn menu_closed(&self, _host: &mut dyn ServerHost, event: &mut MenuClosedEvent) {
+         let mut sessions = lock(&self.sessions);
+         if sessions.get(&event.uuid).is_some_and(|s| s.window == event.window) {
+@@ -778,3 +742,57 @@ mod tests {
+         }
+     }
+ }
++
++#[mod_api::sunrise_part]
++impl MenuPart for Clicks {
++    fn menu_clicked(&self, host: &mut dyn ServerHost, event: &mut MenuClickedEvent<'_>) -> Flow {
++        let Some(mut session) = lock(&self.sessions).get(&event.uuid).cloned() else { return Flow::Continue };
++        if session.window != event.window {
++            return Flow::Continue;
++        }
++        // PICKUP and QUICK_MOVE with either button; a drag, swap or throw does nothing.
++        if !matches!(event.mode, 0 | 1) || !(0..54).contains(&event.slot) {
++            return Flow::Continue;
++        }
++        let Some(stand) = read(host, session.entity) else {
++            host.close_menu(event.uuid);
++            return Flow::Continue;
++        };
++        let creative = creative(&*host, event.uuid);
++        if stand.flags[6] && !creative {
++            host.close_menu(event.uuid);
++            return Flow::Continue;
++        }
++        match click(&stand, &session, event.slot, creative) {
++            Change::None => return Flow::Continue,
++            Change::Close => {
++                host.close_menu(event.uuid);
++                return Flow::Continue;
++            }
++            Change::Tab(t) => session.tab = t,
++            Change::Part(p) => session.part = p,
++            Change::Increment(i) => session.increment = i,
++            Change::Copy => {
++                lock(&self.clipboard).insert(event.uuid, stand.pose);
++            }
++            Change::Paste => {
++                let copied = lock(&self.clipboard).get(&event.uuid).copied();
++                if let Some(pose) = copied {
++                    merge(host, session.entity, pose_nbt(&pose));
++                }
++            }
++            Change::Merge(parts) => {
++                for nbt in parts {
++                    merge(host, session.entity, nbt);
++                }
++            }
++        }
++        let stand = read(host, session.entity).unwrap_or(stand);
++        let shown = stacks(&*host, items(&stand, &session, creative));
++        if let Err(e) = host.menu_set_items(event.uuid, event.window, shown) {
++            eprintln!("[armorstatues] menu_set_items: {e:?}");
++        }
++        lock(&self.sessions).insert(event.uuid, session);
++        Flow::Continue
++    }
++}

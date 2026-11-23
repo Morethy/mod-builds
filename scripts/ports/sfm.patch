@@ -1,0 +1,233 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 42c0238..ac85e76 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -18,7 +18,7 @@ mod support;
+ 
+ use mod_api::{
+     self, Flow, Hooks, HostSide, LevelTickPostEvent, RegisterCommandsEvent, Registrar,
+-    RegistrationContext, RunModCommandEvent, ServerHost,
++    RegistrationContext, ServerHost,
+ };
+ 
+ #[derive(Default)]
+@@ -37,14 +37,6 @@ impl Hooks for Mod {
+         support::declare_commands(event);
+     }
+ 
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        support::run_command(host, event)
+-    }
+-
+     /// After the level's tick: every manager that ticked this tick counts up and runs the
+     /// programs whose timer is due. A client's level has no server block entities to run.
+     fn level_tick_post(&self, host: HostSide<'_>, event: &mut LevelTickPostEvent) {
+diff --git a/src/support.rs b/src/support.rs
+index 47fffb0..f6053de 100644
+--- a/src/support.rs
++++ b/src/support.rs
+@@ -28,7 +28,7 @@ use mod_api::{
+     BlockEntityPart, BlockEntityTickEvent, BlockEntityTicksEvent, BlockKey, BlockPart, Capability,
+     Command, CommandArgumentValue, CommandInvocation, Compound, Direction, Flow, Host,
+     HostTransaction, ITEMS, ItemResource, LevelRef, RegisterCommandsEvent, Registrar,
+-    ResourceHandler, RunModCommandEvent, ServerHost, Tag, Text, Transaction,
++    ResourceHandler, ServerHost, Tag, Text, Transaction,
+ };
+ 
+ /// The manager block (`assets/sfm/block/manager.json` read as a template declaration).
+@@ -94,12 +94,14 @@ impl BlockEntityPart for ManagerPart {
+     }
+ 
+     /// Queue the manager for this tick's pass and change nothing of its own payload.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        if let Some(level) = level_in_place(host) {
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        let Some(pos) = event.subject.with_view(|view| view.position()) else {
++            return;
++        };
++        if let Some(level) = level_in_place(event.subject.host()) {
+             let mut queue = QUEUED.lock().expect("sfm tick queue poisoned");
+-            queue.push((level, event.pos));
++            queue.push((level, pos));
+         }
+-        *event.reply = mod_api::BlockEntityTickReply::Unchanged;
+     }
+ }
+ 
+@@ -281,7 +283,8 @@ fn snapshot(host: &mut dyn ServerHost, level: LevelRef, pos: Pos, labels: &[Labe
+                 let resource = handler.resource(host, index);
+                 let item = resource
+                     .as_ref()
+-                    .map(|resource| resource.item().id(&*host))
++                    .and_then(|resource| resource.item().id(&*host))
++                    .map(str::to_owned)
+                     .unwrap_or_default();
+                 let count = u64::from(handler.amount(host, index));
+                 slots.push(Slot {
+@@ -348,18 +351,20 @@ fn run_move(
+     let Some(target) = level.capability(host, &ITEMS, step.to, Some(to)) else {
+         return Ok(0);
+     };
+-    let taken = source.extract(host, tx, index, &resource, max);
++    let taken = source.extract_at(host, tx, index, &resource, max);
+     if taken == 0 {
+         return Ok(0);
+     }
+-    let put = target.insert_any(host, tx, &resource, taken);
++    let put = target
++        .insert(host, tx, &resource, taken)
++        .map_err(|_| ())?;
+     if put == taken {
+         return Ok(u64::from(put));
+     }
+     // Give the refused part back: the slot it came from has room for it again, and the whole
+     // program tick is one transaction. A source that cannot take it back is a lost item, so
+     // the tick is rolled back instead of committed.
+-    let returned = source.insert(host, tx, index, &resource, taken - put);
++    let returned = source.insert_at(host, tx, index, &resource, taken - put);
+     Ok(u64::from(settle(taken, put, returned).map_err(|_| ())?))
+ }
+ 
+@@ -373,7 +378,7 @@ fn first_of(
+         let Some(resource) = handler.resource(host, index) else {
+             continue;
+         };
+-        if resource.item().id(&*host) == item {
++        if resource.item().id(&*host) == Some(item) {
+             return Some((index, resource));
+         }
+     }
+@@ -390,57 +395,60 @@ fn first_of(
+ pub(crate) fn declare_commands(event: &mut RegisterCommandsEvent<'_>) {
+     event
+         .commands
+-        .push(Command::op("sfm program <pos:block_pos> <program:text>", 2));
++        .push(Command::op("sfm program <pos:block_pos> <program:text>", 2).executes(run_command));
+     event
+         .commands
+-        .push(Command::new("sfm show <pos:block_pos>"));
++        .push(Command::new("sfm show <pos:block_pos>").executes(run_command));
+     event.commands.push(Command::op(
+         "sfm label <pos:block_pos> <target:block_pos> <name:text>",
+         2,
+-    ));
++    ).executes(run_command));
+     event.commands.push(Command::op(
+         "sfm unlabel <pos:block_pos> <target:block_pos> <name:text>",
+         2,
+-    ));
++    ).executes(run_command));
+     event
+         .commands
+-        .push(Command::new("sfm labels <pos:block_pos>"));
++        .push(Command::new("sfm labels <pos:block_pos>").executes(run_command));
+     event
+         .commands
+-        .push(Command::op("sfm tick <pos:block_pos> <value:integer>", 2));
++        .push(Command::op("sfm tick <pos:block_pos> <value:integer>", 2).executes(run_command));
+ }
+ 
+ const USAGE: &str = "usage: /sfm program|show|label|unlabel|labels|tick <x> <y> <z> …";
+ 
+ /// `/sfm program|show|label|unlabel|labels|tick`, with the arguments the command tree
+-/// resolved. Answers `Flow::Cancel` when it handled one.
+-pub(crate) fn run_command(host: &mut dyn ServerHost, event: &RunModCommandEvent<'_>) -> Flow {
+-    let invocation = event.command;
++/// resolved. Answers `Some(1)` when it handled one.
++pub(crate) fn run_command(
++    host: &mut dyn ServerHost,
++    _source: &mod_api::CommandSource,
++    invocation: &mod_api::CommandInvocation,
++) -> Option<i32> {
+     if invocation.literals.first().map(String::as_str) != Some("sfm") {
+-        return Flow::Continue;
++        return None;
+     }
+     let Some(subcommand) = invocation.literals.get(1).map(String::as_str) else {
+         feedback(host, USAGE);
+-        return Flow::Cancel;
++        return Some(1);
+     };
+     let Some(CommandArgumentValue::BlockPos(pos)) = invocation.argument("pos") else {
+         feedback(host, USAGE);
+-        return Flow::Cancel;
++        return Some(1);
+     };
+     let pos = *pos;
+     let Some(level) = level_of(host, invocation) else {
+         feedback(host, format!("no {MANAGER} at {}", format_pos(pos)));
+-        return Flow::Cancel;
++        return Some(1);
+     };
+     if !manager_at(host, level, pos) {
+         feedback(host, format!("no {MANAGER} at {}", format_pos(pos)));
+-        return Flow::Cancel;
++        return Some(1);
+     }
+     // `show` and `labels` report the manager's counters and its label table, which are its
+     // owner's build, so they are a nearby read or an operator's, not a remote probe.
+     if matches!(subcommand, "show" | "labels") && !diagnostics_allowed(host, pos) {
+         feedback(host, INFO_DENIED);
+-        return Flow::Cancel;
++        return Some(1);
+     }
+     match subcommand {
+         "program" => {
+@@ -450,7 +458,7 @@ pub(crate) fn run_command(host: &mut dyn ServerHost, event: &RunModCommandEvent<
+             };
+             if text.trim().is_empty() {
+                 feedback(host, "usage: /sfm program <x> <y> <z> <program>");
+-                return Flow::Cancel;
++                return Some(1);
+             }
+             if text.len() > MAX_PROGRAM_LENGTH {
+                 feedback(
+@@ -460,7 +468,7 @@ pub(crate) fn run_command(host: &mut dyn ServerHost, event: &RunModCommandEvent<
+                         text.len()
+                     ),
+                 );
+-                return Flow::Cancel;
++                return Some(1);
+             }
+             let compiled = Program::parse(&text);
+             // The program is stored as typed, as upstream keeps it on the disk; an
+@@ -492,7 +500,7 @@ pub(crate) fn run_command(host: &mut dyn ServerHost, event: &RunModCommandEvent<
+                         host,
+                         format!("usage: /sfm {subcommand} <manager x y z> <block x y z> <name>"),
+                     );
+-                    return Flow::Cancel;
++                    return Some(1);
+                 }
+             };
+             let name = match invocation.argument("name") {
+@@ -504,7 +512,7 @@ pub(crate) fn run_command(host: &mut dyn ServerHost, event: &RunModCommandEvent<
+                     host,
+                     format!("usage: /sfm {subcommand} <manager x y z> <block x y z> <name>"),
+                 );
+-                return Flow::Cancel;
++                return Some(1);
+             }
+             let adding = subcommand == "label";
+             let changed = edit_manager(host, level, pos, |data| {
+@@ -532,7 +540,7 @@ pub(crate) fn run_command(host: &mut dyn ServerHost, event: &RunModCommandEvent<
+             };
+             let Some(value) = value else {
+                 feedback(host, "usage: /sfm tick <x> <y> <z> <value>");
+-                return Flow::Cancel;
++                return Some(1);
+             };
+             let mut guard = state();
+             let entries = guard.get_or_insert_with(HashMap::new);
+@@ -543,7 +551,7 @@ pub(crate) fn run_command(host: &mut dyn ServerHost, event: &RunModCommandEvent<
+         }
+         _ => feedback(host, USAGE),
+     }
+-    Flow::Cancel
++    Some(1)
+ }
+ 
+ /// The refusal `/sfm show` and `/sfm labels` answer a source without reach or permission.

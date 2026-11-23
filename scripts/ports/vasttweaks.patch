@@ -1,0 +1,13 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 52daadf..8a8da5b 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -35,7 +35,7 @@ struct VastTweaks;
+ #[mod_api::sunrise_mod]
+ impl Hooks for VastTweaks {
+     fn register(&self, _: &mut dyn Registrar, cx: &RegistrationContext) {
+-        if let Some(dir) = cx.instance_dir().ok().and_then(path) {
++        if let Some(dir) = cx.instance_dir().and_then(path) {
+             let _ = INSTANCE.set(dir);
+         }
+     }

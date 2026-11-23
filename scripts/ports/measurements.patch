@@ -1,0 +1,28 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 4f14057..5957c17 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -123,15 +123,17 @@ fn is_held_slot(slot: u32, selected: Option<u32>) -> bool {
+ /// covers both hands (`ClientClass.java:29`). An unreadable inventory keeps the session: a
+ /// read that failed is not evidence the tape is gone.
+ fn holds_tape(host: &mut dyn ServerHost, player: PlayerRef) -> bool {
+-    let Some(slots) = player.inventory_slots(host) else {
+-        return true;
+-    };
+     let selected = player
+         .selected_slot(host)
+         .and_then(|slot| u32::try_from(slot).ok());
+-    slots.iter().any(|(slot, stack)| {
+-        is_held_slot(*slot, selected) && is_tape_measure(&stack.item().id(host))
+-    })
++    let host: &dyn ServerHost = host;
++    player
++        .with_inventory(host, |view| {
++            view.iter().any(|(slot, stack)| {
++                is_held_slot(slot, selected) && is_tape_measure(stack.item().id(host).unwrap_or_default())
++            })
++        })
++        .unwrap_or(true)
+ }
+ 
+ /// The tape measure's Part: one `use_on` per right click with it on a block.

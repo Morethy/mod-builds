@@ -1,0 +1,221 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 0e62711..553d935 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -13,10 +13,10 @@ use std::sync::{Mutex, MutexGuard};
+ 
+ use mod_api::{
+     self, ClientHost, ClientTickPreEvent, Command, CommandArgumentValue, CommandInvocation,
+-    CommandSource, Component, ComponentTypesEvent, Compound, EnergyHandler, EquipmentSlot, Flow,
++    CommandSource, Component, ComponentTypesEvent, Compound, EnergyHandler, EquipmentSlot,
+     GameMode, Hooks, HostSide, ITEM_ENERGY, Identifier, ItemPlace, ItemStack, PlayerInputEvent,
+     PlayerRef, PlayerTickPostEvent, RegisterCommandsEvent, Registrar, RegistrationContext,
+-    RunModCommandEvent, ServerHost, Tag, Text, Transaction,
++    ServerHost, Tag, Text, Transaction,
+ };
+ use runtime::{Action, Flags, IRON, Input, State, input_from_flags, parse, step};
+ 
+@@ -102,10 +102,46 @@ fn energy(stack: &ItemStack) -> u32 {
+     }
+ }
+ 
++/// The custom data of a stack, whether it is an owned copy or the component editor an item
++/// place lends for an edit in place.
++trait CustomDataStore {
++    fn custom_data(&self) -> Option<Compound>;
++    fn clear_custom_data(&mut self);
++    fn set_custom_data(&mut self, data: Compound);
++}
++
++impl CustomDataStore for ItemStack {
++    fn custom_data(&self) -> Option<Compound> {
++        self.get(&CustomData)
++    }
++
++    fn clear_custom_data(&mut self) {
++        self.remove(&CustomData);
++    }
++
++    fn set_custom_data(&mut self, data: Compound) {
++        let _ = self.set(&CustomData, data);
++    }
++}
++
++impl CustomDataStore for mod_api::ItemComponentEditor<'_> {
++    fn custom_data(&self) -> Option<Compound> {
++        self.get(&CustomData)
++    }
++
++    fn clear_custom_data(&mut self) {
++        self.remove(&CustomData);
++    }
++
++    fn set_custom_data(&mut self, data: Compound) {
++        let _ = self.set(&CustomData, data);
++    }
++}
++
+ /// Writes the stack's energy; zero removes the key, as the retired tank did.
+-fn with_energy(stack: &mut ItemStack, amount: u32) {
++fn with_energy(stack: &mut impl CustomDataStore, amount: u32) {
+     let mut kept: Compound = stack
+-        .get(&CustomData)
++        .custom_data()
+         .unwrap_or_default()
+         .into_iter()
+         .filter(|(key, _)| key.to_string_lossy() != ENERGY_KEY)
+@@ -115,9 +151,9 @@ fn with_energy(stack: &mut ItemStack, amount: u32) {
+         kept.insert(ENERGY_KEY.into(), Tag::Int(amount));
+     }
+     if kept.is_empty() {
+-        stack.remove(&CustomData);
++        stack.clear_custom_data();
+     } else {
+-        let _ = stack.set(&CustomData, kept);
++        stack.set_custom_data(kept);
+     }
+ }
+ 
+@@ -142,7 +178,10 @@ struct JetpackTank {
+ 
+ impl EnergyHandler for JetpackTank {
+     fn amount(&self, host: &mut dyn ServerHost) -> u32 {
+-        self.place.stack(host).map_or(0, |stack| energy(&stack))
++        self.place
++            .with_stack(host, |stack| stack.project())
++            .flatten()
++            .map_or(0, |stack| energy(&stack))
+     }
+ 
+     fn capacity(&self, _host: &mut dyn ServerHost) -> u32 {
+@@ -150,15 +189,16 @@ impl EnergyHandler for JetpackTank {
+     }
+ 
+     fn insert(&self, host: &mut dyn ServerHost, tx: &Transaction, amount: u32) -> u32 {
+-        let Some(stack) = self.place.stack(host) else {
++        let Some(stack) = self.place.with_stack(host, |stack| stack.project()).flatten() else {
+             return 0;
+         };
+         let before = energy(&stack);
+         let moved = amount.min(IRON.capacity.saturating_sub(before));
+         if moved == 0
+-            || !self
++            || self
+                 .place
+                 .edit(host, tx, |stack| with_energy(stack, before + moved))
++                .is_err()
+         {
+             return 0;
+         }
+@@ -166,15 +206,16 @@ impl EnergyHandler for JetpackTank {
+     }
+ 
+     fn extract(&self, host: &mut dyn ServerHost, tx: &Transaction, amount: u32) -> u32 {
+-        let Some(stack) = self.place.stack(host) else {
++        let Some(stack) = self.place.with_stack(host, |stack| stack.project()).flatten() else {
+             return 0;
+         };
+         let before = energy(&stack);
+         let moved = amount.min(before);
+         if moved == 0
+-            || !self
++            || self
+                 .place
+                 .edit(host, tx, |stack| with_energy(stack, before - moved))
++                .is_err()
+         {
+             return 0;
+         }
+@@ -219,7 +260,10 @@ fn fly(host: &mut dyn ServerHost, player: PlayerRef) {
+     let Some(living) = host.living(player.entity()) else {
+         return;
+     };
+-    let Some(stack) = living.equipment(host, EquipmentSlot::Chest) else {
++    let Some(stack) = living
++        .with_equipment(host, EquipmentSlot::Chest, |stack| stack.project())
++        .flatten()
++    else {
+         return;
+     };
+     if !is_jetpack(&*host, &stack) {
+@@ -282,7 +326,9 @@ fn feedback(host: &mut dyn ServerHost, line: String) {
+ /// The worn jetpack the command acts on, or the feedback saying there is none.
+ fn worn(host: &mut dyn ServerHost, player: PlayerRef) -> Option<(mod_api::LivingRef, ItemStack)> {
+     let living = host.living(player.entity())?;
+-    let stack = living.equipment(host, EquipmentSlot::Chest)?;
++    let stack = living
++        .with_equipment(host, EquipmentSlot::Chest, |stack| stack.project())
++        .flatten()?;
+     is_jetpack(&*host, &stack).then_some((living, stack))
+ }
+ 
+@@ -360,7 +406,7 @@ impl Hooks for Mod {
+     }
+ 
+     fn component_types(&self, _cx: &RegistrationContext, event: &mut ComponentTypesEvent<'_>) {
+-        event.types.push(ENGINE.to_owned());
++        event.register(ENGINE.into());
+     }
+ 
+     fn client_tick_pre(&self, host: &mut dyn ClientHost, _event: &mut ClientTickPreEvent) {
+@@ -368,10 +414,8 @@ impl Hooks for Mod {
+             return;
+         };
+         let down = host
+-            .mapping("key.jump")
+-            .ok()
+-            .flatten()
+-            .is_some_and(|mapping| mapping.down);
++            .vanilla_key_mapping("key.jump")
++            .is_ok_and(|mapping| mapping.is_down(&*host).unwrap_or(false));
+         let mut guard = store();
+         guard
+             .get_or_insert_with(Store::default)
+@@ -395,28 +439,32 @@ impl Hooks for Mod {
+     }
+ 
+     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+-        event.commands.push(Command::op("ironjetpacks fuel", 2));
+         event
+             .commands
+-            .push(Command::op("ironjetpacks fuel <amount:integer>", 2));
+-        event.commands.push(Command::new("ironjetpacks engine"));
++            .push(Command::op("ironjetpacks fuel", 2).executes(run_command));
+         event
+             .commands
+-            .push(Command::new("ironjetpacks engine <on:boolean>"));
++            .push(Command::op("ironjetpacks fuel <amount:integer>", 2).executes(run_command));
++        event
++            .commands
++            .push(Command::new("ironjetpacks engine").executes(run_command));
++        event
++            .commands
++            .push(Command::new("ironjetpacks engine <on:boolean>").executes(run_command));
+     }
++}
+ 
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        let action = parse(&command_line(event.command));
+-        if action == Action::Unknown {
+-            return Flow::Continue;
+-        }
+-        perform(host, event.source, action);
+-        Flow::Cancel
++fn run_command(
++    host: &mut dyn ServerHost,
++    source: &CommandSource,
++    command: &CommandInvocation,
++) -> Option<i32> {
++    let action = parse(&command_line(command));
++    if action == Action::Unknown {
++        return None;
+     }
++    perform(host, source, action);
++    Some(1)
+ }
+ 
+ pub mod runtime;

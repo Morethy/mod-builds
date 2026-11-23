@@ -1,0 +1,25 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 9b6d83a..2fc970e 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -30,9 +30,9 @@ impl Hooks for Mod {
+             show_durability: host.setting_bool("show_durability").unwrap_or(true),
+             show_stack: host.setting_bool("show_stack").unwrap_or(true),
+         };
+-        let id = event.stack.item().id(host);
++        let id = event.stack.item().id(host).unwrap_or_default();
+         let data = ItemData {
+-            id: &id,
++            id,
+             count: event.stack.count(),
+             max_stack: host.max_stack_size(event.stack.item()).unwrap_or(64),
+             damage: event.stack.damage(),
+@@ -45,7 +45,7 @@ impl Hooks for Mod {
+             // through gives GRAY (0x808080) an alpha of zero and hides the ID
+             // and stack lines entirely; GREEN is only 1/3 opaque. The colour is
+             // already on the Text, so keep the trailing value fully opaque.
+-            event.lines.push((text, u32::MAX));
++            let _ = event.lines.push(text, u32::MAX);
+         }
+     }
+ }

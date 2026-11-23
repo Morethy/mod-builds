@@ -1,0 +1,185 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 2c5f1b8..3dd7316 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -40,7 +40,7 @@ pub mod support;
+ 
+ use mod_api::{
+     self, ComponentTypesEvent, Flow, Hooks, RegisterCommandsEvent, Registrar, RegistrationContext,
+-    RunModCommandEvent, ServerHost, ServerStoppingEvent, ServerTickEvent, ValidateTicketsEvent,
++    ServerHost, ServerStoppingEvent, ServerTickEvent, ValidateTicketsEvent,
+     WorldLifecycleEvent,
+ };
+ 
+@@ -60,7 +60,11 @@ impl Hooks for Mod {
+     /// The three item components a machine carries, registered before content (and so the item
+     /// stack codec) loads.
+     fn component_types(&self, _context: &RegistrationContext, event: &mut ComponentTypesEvent<'_>) {
+-        support::declare_components(event.types);
++        let mut types = Vec::new();
++        support::declare_components(&mut types);
++        for id in types {
++            event.register(id);
++        }
+     }
+ 
+     /// `/compactmachines rooms|info|give new|give existing|teleport`.
+@@ -68,15 +72,6 @@ impl Hooks for Mod {
+         support::declare_commands(event.commands);
+     }
+ 
+-    /// Run one of the commands above and take it.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        support::run_command(host, event)
+-    }
+-
+     /// A click on a machine without the device says what the room is.
+     fn right_click_block(
+         &self,
+diff --git a/src/support.rs b/src/support.rs
+index 1d33da8..4690d19 100644
+--- a/src/support.rs
++++ b/src/support.rs
+@@ -23,11 +23,11 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
+ use std::time::{SystemTime, UNIX_EPOCH};
+ 
+ use mod_api::{
+-    BlockClick, BlockEntityPart, BlockEntityTickEvent, BlockEntityTickReply, BlockEntityTicksEvent,
++    BlockClick, BlockEntityPart, BlockEntityTickEvent, BlockEntityTicksEvent,
+     BlockKey, BlockPart, BlockState, BlockUpdateFlags, BreakBlockEvent, Command, CommandArgument,
+     CommandArgumentValue, CommandSource, Component, Flow, Host, HostSide, Identifier,
+     InteractionResult, ItemKey, ItemPart, ItemStack, LevelRef, LootDropsEvent,
+-    OnBlockPlacedByEvent, PlayerRef, Registrar, RightClickBlockEvent, RunModCommandEvent,
++    OnBlockPlacedByEvent, PlayerRef, Registrar, RightClickBlockEvent,
+     ServerHost, ServerTickEvent, ServerTickPhase, Tag, Text, TicketController, TicketOwner,
+     UseItemEvent, UseItemOnEvent, ValidateTicketsEvent, WorldLifecycleEvent, WorldPhase,
+ };
+@@ -488,9 +488,7 @@ impl BlockEntityPart for MachinePart {
+         event.ticks = true;
+     }
+ 
+-    fn block_entity_tick(&self, _host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        *event.reply = BlockEntityTickReply::Unchanged;
+-    }
++    fn block_entity_tick(&self, _event: &mut BlockEntityTickEvent<'_>) {}
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -1261,12 +1259,12 @@ fn blocked_site(host: &dyn Host, level: LevelRef, room_box: &RoomBox) -> Option<
+ // ---------------------------------------------------------------------------
+ 
+ /// `/compactmachines rooms|info|give new|give existing|teleport`.
+-pub fn declare_commands(commands: &mut Vec<Command>) {
+-    commands.push(Command::new(USAGE_ROOMS));
+-    commands.push(Command::new(USAGE_INFO));
+-    commands.push(Command::op(USAGE_GIVE_NEW, 2));
+-    commands.push(Command::op(USAGE_GIVE_EXISTING, 2));
+-    commands.push(Command::op(USAGE_TELEPORT, 2));
++pub fn declare_commands(commands: &mut Vec<mod_api::CommandRegistration>) {
++    commands.push(Command::new(USAGE_ROOMS).executes(run_command));
++    commands.push(Command::new(USAGE_INFO).executes(run_command));
++    commands.push(Command::op(USAGE_GIVE_NEW, 2).executes(run_command));
++    commands.push(Command::op(USAGE_GIVE_EXISTING, 2).executes(run_command));
++    commands.push(Command::op(USAGE_TELEPORT, 2).executes(run_command));
+ }
+ 
+ /// The words the 0.1.0 grammar parsed, rebuilt from the typed invocation so
+@@ -1286,19 +1284,22 @@ fn words_of(literals: &[String], arguments: &[CommandArgument]) -> Vec<String> {
+ }
+ 
+ /// Run one of the commands above and take it.
+-pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>) -> Flow {
+-    let invocation = event.command;
++pub fn run_command(
++    host: &mut dyn ServerHost,
++    source: &CommandSource,
++    invocation: &mod_api::CommandInvocation,
++) -> Option<i32> {
+     let line = words_of(&invocation.literals, &invocation.arguments);
+     if line.first().map(String::as_str) != Some("compactmachines") {
+-        return Flow::Continue;
++        return None;
+     }
+     let args: Vec<&str> = line.iter().skip(1).map(String::as_str).collect();
+     let parsed = crate::runtime::parse(&args);
+     if parsed == RoomCommand::Unknown {
+-        return Flow::Continue;
++        return None;
+     }
+     ensure_world(host);
+-    let player = match event.source {
++    let player = match source {
+         CommandSource::Player { player, .. } => Some(*player),
+         _ => None,
+     };
+@@ -1360,13 +1361,13 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
+         RoomCommand::GiveNew { template } => {
+             let Some(key) = item_key(host, NEW_MACHINE) else {
+                 reply(host, player, cannot_give());
+-                return Flow::Cancel;
++                return Some(1);
+             };
+             let mut stack = ItemStack::of(key);
+             let named = format!("compactmachines:{}", template.id());
+             if !write_component(&mut stack, &ROOM_TEMPLATE, &named) {
+                 reply(host, player, cannot_give());
+-                return Flow::Cancel;
++                return Some(1);
+             }
+             let _ = write_component(&mut stack, &MACHINE_COLOR, &template.color_hex());
+             give(host, player, stack);
+@@ -1384,16 +1385,16 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
+                     player,
+                     tr("rooms.errors.compactmachines.room_not_found", &[&code]),
+                 );
+-                return Flow::Cancel;
++                return Some(1);
+             }
+             let Some(key) = item_key(host, MACHINE) else {
+                 reply(host, player, cannot_give());
+-                return Flow::Cancel;
++                return Some(1);
+             };
+             let mut stack = ItemStack::of(key);
+             if !write_component(&mut stack, &ROOM_CODE, &code) {
+                 reply(host, player, cannot_give());
+-                return Flow::Cancel;
++                return Some(1);
+             }
+             give(host, player, stack);
+         }
+@@ -1410,7 +1411,7 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
+                     player,
+                     tr("rooms.errors.compactmachines.room_not_found", &[&code]),
+                 );
+-                return Flow::Cancel;
++                return Some(1);
+             }
+             let Some(player) = player else {
+                 // A console cannot be put in a room.
+@@ -1419,10 +1420,10 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
+                     None,
+                     tr("rooms.errors.compactmachines.room_not_found", &[&code]),
+                 );
+-                return Flow::Cancel;
++                return Some(1);
+             };
+             let Some(pos) = player_pos(player, &*host) else {
+-                return Flow::Cancel;
++                return Some(1);
+             };
+             let dimension = player
+                 .dimension(&*host)
+@@ -1431,7 +1432,7 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
+         }
+         RoomCommand::Unknown => {}
+     }
+-    Flow::Cancel
++    Some(1)
+ }
+ 
+ fn cannot_give() -> Text {

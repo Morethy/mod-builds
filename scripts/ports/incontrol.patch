@@ -1,0 +1,144 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index fad1ebe..dd5bdf0 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -30,14 +30,14 @@
+ #[rustfmt::skip]
+ pub mod runtime;
+ 
+-use std::sync::Mutex;
++use std::sync::{Arc, Mutex};
+ use std::sync::MutexGuard;
+ 
+ use mod_api::serde_json::Value;
+ use mod_api::{
+-    self, Command, Component, Compound, ConfigFileError, ConfigFiles, ConfigPath, EntityRef, Flow,
++    self, Command, Component, Compound, ConfigFileError, ConfigFiles, ConfigPath, EntityRef,
+     Hooks, Host, Identifier, ItemKey, ItemStack, LevelRef, LightLayer, LootDropsEvent,
+-    MobSpawnedEvent, RandomSource, RegisterCommandsEvent, RunModCommandEvent,
++    MobSpawnedEvent, RegisterCommandsEvent,
+     ServerAboutToStartEvent, ServerHost, Tag, Text,
+ };
+ 
+@@ -89,7 +89,7 @@ struct Core {
+ /// a `Mutex` and not a `RefCell`.
+ #[derive(Default)]
+ struct Mod {
+-    core: Mutex<Option<Core>>,
++    core: Arc<Mutex<Option<Core>>>,
+ }
+ 
+ impl Mod {
+@@ -299,8 +299,28 @@ impl Hooks for Mod {
+     /// Declares `/incontrol reload` and `/incontrol status` at permission level 1
+     /// (upstream's reload level, `CmdReload.java:16-40`).
+     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+-        event.commands.push(Command::op("incontrol reload", 1));
+-        event.commands.push(Command::op("incontrol status", 1));
++        // Each executor shares the session state the hooks read.
++        let core = self.core.clone();
++        event.commands.push(Command::op("incontrol reload", 1).executes(move |host, _source, _command| {
++            let this = Mod { core: core.clone() };
++            let report = this.reload(host.config_files());
++            feedback(host, report.message);
++            for warning in report.warnings.iter().take(5) {
++                feedback(host, warning.clone());
++            }
++            if report.warnings.len() > 5 {
++                feedback(host, format!("and {} more", report.warnings.len() - 5));
++            }
++            Some(1)
++        }));
++        let core = self.core.clone();
++        event.commands.push(Command::op("incontrol status", 1).executes(move |host, _source, _command| {
++            let this = Mod { core: core.clone() };
++            for line in this.status_lines() {
++                feedback(host, line);
++            }
++            Some(1)
++        }));
+     }
+ 
+     /// Before the server starts: read both rule files.
+@@ -321,35 +341,6 @@ impl Hooks for Mod {
+     fn loot_drops(&self, host: &mut dyn ServerHost, event: &mut LootDropsEvent<'_>) {
+         self.rewrite_drops(host, event);
+     }
+-
+-    /// Runs the two commands; another usage is left to the game.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        let literals: Vec<&str> = event.command.literals.iter().map(String::as_str).collect();
+-        match literals.as_slice() {
+-            ["incontrol", "reload"] => {
+-                let report = self.reload(host.config_files());
+-                feedback(host, report.message);
+-                for warning in report.warnings.iter().take(5) {
+-                    feedback(host, warning.clone());
+-                }
+-                if report.warnings.len() > 5 {
+-                    feedback(host, format!("and {} more", report.warnings.len() - 5));
+-                }
+-                Flow::Cancel
+-            }
+-            ["incontrol", "status"] => {
+-                for line in self.status_lines() {
+-                    feedback(host, line);
+-                }
+-                Flow::Cancel
+-            }
+-            _ => Flow::Continue,
+-        }
+-    }
+ }
+ 
+ /// Reads one rule file, if it exists. A read error is the caller's to keep.
+@@ -385,15 +376,22 @@ fn discard_newest(host: &mut dyn ServerHost, dimension: &str, mob: &str, pos: [f
+     let min = [pos[0] - 1.0, pos[1] - 1.0, pos[2] - 1.0];
+     let max = [pos[0] + 1.0, pos[1] + 1.0, pos[2] + 1.0];
+     let keys: &dyn Host = host;
+-    let Some(entities) = level.entities_in(keys, min, max) else {
++    let mut entities = Vec::new();
++    if level
++        .visit_entities_in(keys, min, max, &mut |entity| {
++            entities.push(entity);
++            std::ops::ControlFlow::Continue(())
++        })
++        .is_err()
++    {
+         return false;
+-    };
++    }
+     let mut newest: Option<(u32, EntityRef)> = None;
+     for entity in entities {
+         let Some(kind) = entity.kind(keys) else {
+             continue;
+         };
+-        if kind.id(keys) != mob {
++        if kind.id(keys).as_deref() != Some(mob) {
+             continue;
+         }
+         let Some(entity_pos) = entity.position(keys) else {
+@@ -420,8 +418,8 @@ fn apply_loot_ops(host: &mut dyn ServerHost, drops: &mut Vec<ItemStack>, ops: Ve
+         match op {
+             LootOp::Clear => drops.clear(),
+             LootOp::Remove(ids) => drops.retain(|stack| {
+-                let held = stack.item().id(keys);
+-                !ids.contains(&held)
++                let held = stack.item().id(keys).unwrap_or_default();
++                !ids.iter().any(|id| id == held)
+             }),
+             LootOp::Add(stacks) => {
+                 for drop in stacks {
+@@ -455,7 +453,7 @@ fn roll(level: Option<LevelRef>, host: &mut dyn ServerHost, bound: u32) -> u32 {
+         return 0;
+     };
+     level
+-        .with_random(host, |random| random.next_int_bound(bound).unwrap_or(0))
++        .with_random(host, |random| random.next_int_bound(bound))
+         .and_then(|drawn| u32::try_from(drawn).ok())
+         .unwrap_or(0)
+ }

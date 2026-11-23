@@ -1,0 +1,275 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index e51c012..dbbd89e 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -21,7 +21,7 @@ mod support;
+ 
+ use mod_api::{
+     self, Flow, Hooks, HostSide, RegisterCommandsEvent, Registrar, RegistrationContext,
+-    RightClickBlockEvent, RunModCommandEvent, ServerHost,
++    RightClickBlockEvent, ServerHost,
+ };
+ 
+ /// The mod keeps no state of its own: every router's modules, upgrades and
+@@ -50,14 +50,4 @@ impl Hooks for Mod {
+     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+         support::declare_commands(event.commands);
+     }
+-
+-    /// Run the five usages [`Hooks::register_commands`] declares, after the game
+-    /// has parsed and permission-checked them.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        support::run_command(host, event)
+-    }
+ }
+diff --git a/src/support.rs b/src/support.rs
+index c0a3b33..4cd34d8 100644
+--- a/src/support.rs
++++ b/src/support.rs
+@@ -21,7 +21,7 @@ use mod_api::{
+     BlockUpdateFlags, Capability, Command, CommandArgumentValue, Compound, Direction, Flow,
+     GameMode, Hand, Host, HostSide, HostTransaction, ITEMS, Identifier, ItemKey, ItemResource,
+     ItemStack, LevelHost, LevelRef, ModContainer, PlayerRef, Registrar, ResourceHandler,
+-    RightClickBlockEvent, RunModCommandEvent, ServerHost, StateForPlacementEvent, Tag, Text,
++    RightClickBlockEvent, ServerHost, StateForPlacementEvent, Tag, Text,
+ };
+ 
+ use crate::runtime::{
+@@ -72,9 +72,10 @@ impl BlockPart for Router {
+     /// as upstream's `ctx.getHorizontalDirection().getOpposite()` does.
+     fn state_for_placement(
+         &self,
+-        level: &dyn LevelHost,
++        level: mod_api::LevelSide<'_>,
+         event: &mut StateForPlacementEvent<'_>,
+     ) -> Option<Option<BlockState>> {
++        let (mod_api::LevelSide::Server(level) | mod_api::LevelSide::Client(level)) = level;
+         // `state_for_placement` is asked for every block placed, so answer only
+         // for this one (`BlockState.getBlock()`).
+         if level.state_block(event.state) != Some(ROUTER) {
+@@ -101,8 +102,8 @@ impl BlockEntityPart for RouterEntity {
+ 
+     /// One server tick of one router (`ModularRouterBlockEntity.serverTick`): on
+     /// the router's own operation tick, run every installed module in slot order.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        run_tick(host, event);
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        run_tick(event);
+     }
+ }
+ 
+@@ -134,6 +135,7 @@ fn container() -> ModContainer {
+         inputs: vec![BUFFER_SLOT],
+         outputs: vec![BUFFER_SLOT],
+         menu: None,
++        insert_rules: Vec::new(),
+     }
+ }
+ 
+@@ -247,7 +249,7 @@ fn component_key(stack: &ItemStack) -> String {
+ /// key that tells two stacks of one item apart.
+ fn saved_stack(host: &dyn Host, stack: &ItemStack) -> Stack {
+     Stack {
+-        item: stack.item().id(host),
++        item: stack.item().id(host).unwrap_or_default().to_owned(),
+         count: stack.count(),
+         extra: component_key(stack),
+     }
+@@ -305,7 +307,7 @@ fn read_offered(
+             continue;
+         };
+         let item = resource.item();
+-        let id = item.id(&*host);
++        let id = item.id(&*host).unwrap_or_default().to_owned();
+         let max = host.max_stack_size(item).unwrap_or(64);
+         keys.insert(id.clone(), (item, max));
+         let count = handler.amount(host, index);
+@@ -322,7 +324,7 @@ fn pull(
+     pos: Pos,
+     face: usize,
+     module: &Module,
+-    entity: &mut mod_api::ModBlockEntityView<'_>,
++    entity: &mut Lent,
+     items: u32,
+ ) -> bool {
+     let source = step(pos, face);
+@@ -346,7 +348,7 @@ fn pull(
+         return false;
+     };
+     let taken = host
+-        .transaction(|host, tx| Ok::<u32, ()>(container.extract(host, tx, slot, &resource, wanted)))
++        .transaction(|host, tx| Ok::<u32, ()>(container.extract_at(host, tx, slot, &resource, wanted)))
+         .unwrap_or(0);
+     if taken == 0 {
+         return false;
+@@ -399,7 +401,7 @@ fn send(
+     pos: Pos,
+     face: usize,
+     module: &Module,
+-    entity: &mut mod_api::ModBlockEntityView<'_>,
++    entity: &mut Lent,
+     items: u32,
+ ) -> bool {
+     let Some(stack) = entity
+@@ -422,7 +424,7 @@ fn send(
+     };
+     let resource = ItemResource::of(&stack);
+     let sent = host
+-        .transaction(|host, tx| Ok::<u32, ()>(container.insert_any(host, tx, &resource, wanted)))
++        .transaction(|host, tx| Ok::<u32, ()>(container.insert(host, tx, &resource, wanted).unwrap_or(0)))
+         .unwrap_or(0);
+     if sent == 0 {
+         return false;
+@@ -441,7 +443,7 @@ fn send(
+ }
+ 
+ /// Put a stack in the buffer slot, growing the list when the entity has none.
+-fn write_buffer(entity: &mut mod_api::ModBlockEntityView<'_>, stack: Option<ItemStack>) {
++fn write_buffer(entity: &mut Lent, stack: Option<ItemStack>) {
+     if entity.items.len() == BUFFER_SLOT {
+         entity.items.resize(BUFFER_SLOT + 1, None);
+     }
+@@ -460,16 +462,54 @@ fn show_active(host: &mut dyn ServerHost, level: LevelRef, pos: Pos, active: boo
+ 
+ /// One server tick of one router: on the router's own operation tick, run every
+ /// installed module in slot order.
+-fn run_tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-    let pos = event.pos;
++fn run_tick(event: &mut BlockEntityTickEvent<'_>) {
++    let Some((pos, handle, mut entity)) = event.subject.with_view(|view| {
++        let items = (0..view.item_slots() as u32)
++            .map(|slot| view.item_slot(slot).and_then(|stack| stack.to_owned()))
++            .collect();
++        (
++            view.position(),
++            view.handle(),
++            Lent {
++                items,
++                nbt: view.nbt().clone(),
++            },
++        )
++    }) else {
++        return;
++    };
++    let before = entity.items.clone();
++    run_tick_on(event.subject.host(), pos, &mut entity);
++    // The tick no longer commits the slots it was lent: write the ones that moved.
++    let changed = event.subject.with_view(|mut view| {
++        let mut changed = false;
++        for (slot, stack) in entity.items.iter().enumerate() {
++            if before.get(slot) != Some(stack) {
++                changed |= view.set_item_slot(slot as u32, stack.clone()).unwrap_or(false);
++            }
++        }
++        changed
++    });
++    if changed == Some(true) {
++        let _ = handle.set_changed(event.subject.host());
++    }
++}
++
++/// What a tick reads of the router's block entity and the buffer it writes.
++struct Lent {
++    items: Vec<Option<ItemStack>>,
++    nbt: Compound,
++}
++
++fn run_tick_on(host: &mut dyn ServerHost, pos: Pos, entity: &mut Lent) {
+     let Some(level) = level_in_place(&*host) else {
+         return;
+     };
+-    if event.entity.items.len() == BUFFER_SLOT {
+-        event.entity.items.resize(BUFFER_SLOT + 1, None);
++    if entity.items.len() == BUFFER_SLOT {
++        entity.items.resize(BUFFER_SLOT + 1, None);
+     }
+-    let speed = count(&event.entity.nbt, KEY_SPEED);
+-    let stacks = count(&event.entity.nbt, KEY_STACK);
++    let speed = count(&entity.nbt, KEY_SPEED);
++    let stacks = count(&entity.nbt, KEY_STACK);
+     let rate = tick_rate(speed);
+     let Some(game_time) = level.game_time(&*host) else {
+         return;
+@@ -478,7 +518,7 @@ fn run_tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+     if !is_operation_tick(game_time, phase_of(pos, rate), rate) {
+         return;
+     }
+-    let modules = read_modules(&event.entity.nbt);
++    let modules = read_modules(&entity.nbt);
+     let facing = facing_at(&*host, level, pos);
+     let items = items_per_operation(stacks);
+     let mut worked = false;
+@@ -487,8 +527,8 @@ fn run_tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+             continue;
+         };
+         let ran = match module.kind {
+-            ModuleKind::PullerMk1 => pull(host, level, pos, face, module, &mut event.entity, items),
+-            ModuleKind::SenderMk1 => send(host, level, pos, face, module, &mut event.entity, items),
++            ModuleKind::PullerMk1 => pull(host, level, pos, face, module, &mut *entity, items),
++            ModuleKind::SenderMk1 => send(host, level, pos, face, module, &mut *entity, items),
+         };
+         worked |= ran;
+     }
+@@ -531,7 +571,7 @@ pub(crate) fn right_click(host: HostSide<'_>, event: &mut RightClickBlockEvent<'
+     if !is_router(&*host, level, click.pos) {
+         return Flow::Continue;
+     }
+-    if !is_module(&held.item().id(&*host)) {
++    if !is_module(held.item().id(&*host).unwrap_or_default()) {
+         return Flow::Continue;
+     }
+     let installed = install_from_hand(host, level, click.pos, held, click.player);
+@@ -555,7 +595,7 @@ fn install_from_hand(
+     stack: &ItemStack,
+     player: u128,
+ ) -> bool {
+-    let item = stack.item().id(&*host);
++    let item = stack.item().id(&*host).unwrap_or_default().to_owned();
+     let Some(kind) = ModuleKind::from_item(&item) else {
+         return false;
+     };
+@@ -612,11 +652,11 @@ fn consume_one(host: &mut dyn ServerHost, player: PlayerRef) {
+ /// The stack in the player's selected slot, with that slot.
+ fn held(host: &dyn ServerHost, player: PlayerRef) -> Option<(u32, ItemStack)> {
+     let slot = u32::try_from(player.selected_slot(host)?).ok()?;
+-    player
+-        .inventory_slots(host)?
+-        .into_iter()
+-        .find(|(at, _)| *at == slot)
+-        .map(|(_, stack)| (slot, stack))
++    player.with_inventory(host, |view| {
++        view.iter()
++            .find(|(at, _)| *at == slot)
++            .and_then(|(_, stack)| Some((slot, stack.project()?)))
++    })?
+ }
+ 
+ fn tell(host: &mut dyn ServerHost, player: PlayerRef, line: &str) {
+@@ -784,9 +824,11 @@ fn readout(host: &mut dyn ServerHost, level: LevelRef, pos: Pos) -> Vec<String>
+ // ---------------------------------------------------------------------------
+ 
+ /// Declare `/modularrouters info|install|remove|direction|filter`.
+-pub(crate) fn declare_commands(commands: &mut Vec<Command>) {
++pub(crate) fn declare_commands(commands: &mut Vec<mod_api::CommandRegistration>) {
+     for (usage, level) in usages() {
+-        commands.push(Command::op(usage, level));
++        commands.push(Command::op(usage, level).executes(|host, _source, command| {
++            matches!(run_command(host, command), Flow::Cancel).then_some(1)
++        }));
+     }
+ }
+ 
+@@ -846,8 +888,7 @@ const USAGE: &str = "Usage: /modularrouters info|install|remove|direction|filter
+ 
+ /// Run `/modularrouters info|install|remove|direction|filter`: the GUI's
+ /// controls, as the harness and a player without the screen use them.
+-pub(crate) fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>) -> Flow {
+-    let invocation = event.command;
++pub(crate) fn run_command(host: &mut dyn ServerHost, invocation: &mod_api::CommandInvocation) -> Flow {
+     let literals: Vec<&str> = invocation.literals.iter().map(String::as_str).collect();
+     let sub: &[&str] = match literals.as_slice() {
+         ["modularrouters", sub @ ..] => sub,

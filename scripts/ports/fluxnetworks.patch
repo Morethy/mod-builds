@@ -1,0 +1,289 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index a9c09cf..2c5466a 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -26,12 +26,12 @@ pub mod runtime;
+ use std::sync::{Mutex, OnceLock};
+ 
+ use mod_api::{
+-    self, BlockEntityEvent, BlockEntityPart, BlockEntityTickEvent, BlockEntityTickReply,
++    self, BlockEntityEvent, BlockEntityPart, BlockEntityTickEvent,
+     BlockEntityTicksEvent, BlockKey, BlockPart, BlockState, BlockUpdateFlags, Command,
+     CommandArgumentValue, CommandInvocation, Compound, Direction, ENERGY, Flow, Hooks, Host,
+     HostBlockStates, HostSide, HostTransaction, ItemKey, ItemStack, LeftClickBlockEvent, LevelRef,
+     LevelSide, LevelTickPostEvent, ModEnergyBuffer, ParticleKey, ParticleOptions, RandomSource,
+-    RegisterCommandsEvent, Registrar, RegistrationContext, RunModCommandEvent, ServerHost,
++    RegisterCommandsEvent, Registrar, RegistrationContext, ServerHost,
+     SoundSource, Tag, Text, WorldLifecycleEvent, move_energy,
+ };
+ 
+@@ -311,23 +311,93 @@ fn queue(level: LevelRef, pos: [i32; 3]) {
+     }
+ }
+ 
++/// The `/fluxnetworks` bodies.
++fn run_command(
++    host: &mut dyn ServerHost,
++    _source: &mod_api::CommandSource,
++    command: &CommandInvocation,
++) -> Option<i32> {
++    let Some(subcommand) = subcommand(&command.literals) else {
++        return None;
++    };
++    let Some(level) = level_of(host, command) else {
++        feedback(host, NO_DEVICE);
++        return Some(1);
++    };
++    match subcommand {
++        Subcommand::Info => {
++            let Some(pos) = position_argument(command.argument("pos")) else {
++                feedback(host, "Usage: /fluxnetworks info <x> <y> <z>");
++                return Some(1);
++            };
++            let line = readout(host, level, pos);
++            feedback(host, &line);
++        }
++        Subcommand::Energy => {
++            let Some(pos) = position_argument(command.argument("pos")) else {
++                feedback(host, "Usage: /fluxnetworks energy <amount> <x> <y> <z>");
++                return Some(1);
++            };
++            let Some(amount) = integer_argument(command.argument("amount")) else {
++                feedback(host, "The amount must be a whole number of FE.");
++                return Some(1);
++            };
++            match set_energy(host, level, pos, amount) {
++                Some(after) => feedback(host, &format!("Energy set to {after} FE.")),
++                None => feedback(host, NO_DEVICE),
++            }
++        }
++        Subcommand::Network => {
++            let Some(pos) = position_argument(command.argument("pos")) else {
++                feedback(host, "Usage: /fluxnetworks network <id> <x> <y> <z>");
++                return Some(1);
++            };
++            let Some(id) = integer_argument(command.argument("id")) else {
++                feedback(host, "The network id must be a whole number.");
++                return Some(1);
++            };
++            if set_device_int(host, level, pos, "network_id", id) {
++                feedback(host, &format!("Network id set to {id}."));
++            } else {
++                feedback(host, NO_DEVICE);
++            }
++        }
++        Subcommand::Priority => {
++            let Some(pos) = position_argument(command.argument("pos")) else {
++                feedback(host, "Usage: /fluxnetworks priority <priority> <x> <y> <z>");
++                return Some(1);
++            };
++            let Some(priority) = integer_argument(command.argument("priority")) else {
++                feedback(host, "The priority must be a whole number.");
++                return Some(1);
++            };
++            if set_device_int(host, level, pos, "priority", clamp_priority(priority)) {
++                feedback(host, &format!("Priority set to {priority}."));
++            } else {
++                feedback(host, NO_DEVICE);
++            }
++        }
++    }
++    Some(1)
++}
++
+ /// The four usages `/fluxnetworks` declares. All are administrative: each reads or writes a
+ /// device at coordinates the caller chooses, so they are operator diagnostics (level 2), not
+ /// gameplay. Upstream's own control surface is its configurator GUI, which is not ported.
+-fn declare_commands(commands: &mut Vec<Command>) {
+-    commands.push(Command::op("fluxnetworks info <pos:block_pos>", 2));
++fn declare_commands(commands: &mut Vec<mod_api::CommandRegistration>) {
++    commands.push(Command::op("fluxnetworks info <pos:block_pos>", 2).executes(run_command));
+     commands.push(Command::op(
+         "fluxnetworks energy <amount:integer> <pos:block_pos>",
+         2,
+-    ));
++    ).executes(run_command));
+     commands.push(Command::op(
+         "fluxnetworks network <id:integer> <pos:block_pos>",
+         2,
+-    ));
++    ).executes(run_command));
+     commands.push(Command::op(
+         "fluxnetworks priority <priority:integer> <pos:block_pos>",
+         2,
+-    ));
++    ).executes(run_command));
+ }
+ 
+ /// The mod has no settings; the only state is the two per-world tables above.
+@@ -369,75 +439,6 @@ impl Hooks for Mod {
+         declare_commands(event.commands);
+     }
+ 
+-    /// The `/fluxnetworks` bodies.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        let Some(subcommand) = subcommand(&event.command.literals) else {
+-            return Flow::Continue;
+-        };
+-        let Some(level) = level_of(host, event.command) else {
+-            feedback(host, NO_DEVICE);
+-            return Flow::Cancel;
+-        };
+-        match subcommand {
+-            Subcommand::Info => {
+-                let Some(pos) = position_argument(event.command.argument("pos")) else {
+-                    feedback(host, "Usage: /fluxnetworks info <x> <y> <z>");
+-                    return Flow::Cancel;
+-                };
+-                let line = readout(host, level, pos);
+-                feedback(host, &line);
+-            }
+-            Subcommand::Energy => {
+-                let Some(pos) = position_argument(event.command.argument("pos")) else {
+-                    feedback(host, "Usage: /fluxnetworks energy <amount> <x> <y> <z>");
+-                    return Flow::Cancel;
+-                };
+-                let Some(amount) = integer_argument(event.command.argument("amount")) else {
+-                    feedback(host, "The amount must be a whole number of FE.");
+-                    return Flow::Cancel;
+-                };
+-                match set_energy(host, level, pos, amount) {
+-                    Some(after) => feedback(host, &format!("Energy set to {after} FE.")),
+-                    None => feedback(host, NO_DEVICE),
+-                }
+-            }
+-            Subcommand::Network => {
+-                let Some(pos) = position_argument(event.command.argument("pos")) else {
+-                    feedback(host, "Usage: /fluxnetworks network <id> <x> <y> <z>");
+-                    return Flow::Cancel;
+-                };
+-                let Some(id) = integer_argument(event.command.argument("id")) else {
+-                    feedback(host, "The network id must be a whole number.");
+-                    return Flow::Cancel;
+-                };
+-                if set_device_int(host, level, pos, "network_id", id) {
+-                    feedback(host, &format!("Network id set to {id}."));
+-                } else {
+-                    feedback(host, NO_DEVICE);
+-                }
+-            }
+-            Subcommand::Priority => {
+-                let Some(pos) = position_argument(event.command.argument("pos")) else {
+-                    feedback(host, "Usage: /fluxnetworks priority <priority> <x> <y> <z>");
+-                    return Flow::Cancel;
+-                };
+-                let Some(priority) = integer_argument(event.command.argument("priority")) else {
+-                    feedback(host, "The priority must be a whole number.");
+-                    return Flow::Cancel;
+-                };
+-                if set_device_int(host, level, pos, "priority", clamp_priority(priority)) {
+-                    feedback(host, &format!("Priority set to {priority}."));
+-                } else {
+-                    feedback(host, NO_DEVICE);
+-                }
+-            }
+-        }
+-        Flow::Cancel
+-    }
+ 
+     /// Upstream's `EventHandler.onPlayerInteract`: redstone lying between a bedrock (or flux
+     /// block) base and an obsidian block becomes flux dust when the player left-clicks the
+@@ -458,7 +459,10 @@ impl Hooks for Mod {
+         let Some(base) = level.block(host, base) else {
+             return Flow::Continue;
+         };
+-        if !flux_creation_site(&event.state.block().id(host), &base.id(host)) {
++        if !flux_creation_site(
++            event.state.block().id(host).unwrap_or_default(),
++            base.id(host).unwrap_or_default(),
++        ) {
+             return Flow::Continue;
+         }
+         let at = [
+@@ -538,7 +542,7 @@ impl Hooks for Mod {
+             GapAfter::Cobblestone => "minecraft:entity.dragon_fireball.explode",
+             GapAfter::Obsidian => "minecraft:entity.generic.explode",
+         };
+-        let _ = level.play_sound(host, sound, at, SoundSource::Blocks, 1.0, 1.0);
++        let _ = level.play_sound(host, sound, at, SoundSource::Blocks, 1.0, 1.0, None);
+         let _ = level.send_particles(
+             host,
+             &ParticleOptions::simple(keys.lava),
+@@ -597,14 +601,16 @@ impl BlockEntityPart for DevicePart {
+         event.ticks = true;
+     }
+ 
+-    /// A device only says it is here; the tick changes nothing in its own compound, so it answers
+-    /// `Unchanged` and does not dirty the chunk every tick.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        let Some(level) = level_in_place(host) else {
++    /// A device only says it is here; the tick changes nothing in its own compound, so it never
++    /// marks the chunk changed and does not dirty it every tick.
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        let Some(pos) = event.subject.with_view(|view| view.position()) else {
++            return;
++        };
++        let Some(level) = level_in_place(event.subject.host()) else {
+             return;
+         };
+-        queue(level, event.pos);
+-        *event.reply = BlockEntityTickReply::Unchanged;
++        queue(level, pos);
+     }
+ }
+ 
+@@ -810,9 +816,16 @@ fn flux_creation_site(clicked: &str, base: &str) -> bool {
+ fn take_redstone(host: &mut dyn ServerHost, level: LevelRef, gap: [i32; 3]) -> i32 {
+     let min = [f64::from(gap[0]), f64::from(gap[1]), f64::from(gap[2])];
+     let max = [min[0] + 1.0, min[1] + 1.0, min[2] + 1.0];
+-    let Some(entities) = level.entities_in(host, min, max) else {
++    let mut entities = Vec::new();
++    if level
++        .visit_entities_in(host, min, max, &mut |entity| {
++            entities.push(entity);
++            std::ops::ControlFlow::Continue(())
++        })
++        .is_err()
++    {
+         return 0;
+-    };
++    }
+     let mut taken = 0;
+     for entity in entities {
+         if taken >= runtime::CREATION_CAP {
+@@ -821,16 +834,18 @@ fn take_redstone(host: &mut dyn ServerHost, level: LevelRef, gap: [i32; 3]) -> i
+         let Some(item) = host.item_entity(entity) else {
+             continue;
+         };
+-        let Some(stack) = item.stack(host) else {
++        let Some((stack_item, stack_count)) =
++            item.with_stack(host, |stack| (stack.item(), stack.count()))
++        else {
+             continue;
+         };
+-        if stack.item().id(&*host) != REDSTONE {
++        if stack_item.id(&*host) != Some(REDSTONE) {
+             continue;
+         }
+-        taken += i32::try_from(stack.count()).unwrap_or(i32::MAX);
++        taken += i32::try_from(stack_count).unwrap_or(i32::MAX);
+         if !entity.discard(host) {
+             // A redstone the game will not remove is left where it is; it is not counted either.
+-            taken -= i32::try_from(stack.count()).unwrap_or(0);
++            taken -= i32::try_from(stack_count).unwrap_or(0);
+         }
+     }
+     taken
+@@ -922,7 +937,7 @@ fn device_at(host: &dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> Option<De
+ 
+ /// The block at `pos` in `level`, as its id.
+ fn block_at(host: &dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> Option<String> {
+-    Some(level.block(host, pos)?.id(host))
++    Some(level.block(host, pos)?.id(host).unwrap_or_default().to_owned())
+ }
+ 
+ /// The level the server ticks now; its block entities and capabilities are the ones a tick may

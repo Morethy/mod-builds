@@ -1,0 +1,252 @@
+diff --git a/src/support.rs b/src/support.rs
+index 0db6661..1b0bbac 100644
+--- a/src/support.rs
++++ b/src/support.rs
+@@ -15,10 +15,11 @@ use std::collections::HashMap;
+ use std::sync::Mutex;
+ 
+ use mod_api::{
+-    AnalogOutputEvent, BlockEntityPart, BlockEntityTickEvent, BlockEntityTickReply,
+-    BlockEntityTicksEvent, BlockPart, BlockState, Flow, Hand, HasAnalogOutputEvent, Host, HostSide,
+-    InteractionResult, ItemStack, LevelHost, LevelRef, LevelTickPostEvent, ModContainer,
+-    NeighbourUpdate, Registrar, RightClickBlockEvent, Screen, ScreenEvent, ServerHost,
++    AnalogOutputEvent, BlockEntityPart, BlockEntityTickEvent, BlockEntityTicksEvent, BlockPart,
++    BlockState, ClientHost, Flow, Hand, HasAnalogOutputEvent, Host, HostSide, InteractionResult,
++    ItemStack, LevelHost, LevelRef, LevelTickPostEvent, MenuScreen, MenuScreenLayout,
++    MenuScreenOpen, ModContainer, NeighbourUpdate, Registrar, RightClickBlockEvent, ScreenSlot,
++    ServerHost,
+ };
+ 
+ use crate::runtime::{
+@@ -89,12 +90,22 @@ pub fn declare(r: &mut dyn Registrar) {
+     r.block_entity_part(&kind, BookcasePart)
+         .expect("the bookcase Part attaches to the type this mod just declared");
+     r.block_container(&bookcase, container_of(BOOKCASE));
++    r.register_menu_screen(
++        menu(BOOKCASE).expect("a storage block declares its menu in runtime.rs"),
++        std::sync::Arc::new(bookcase_screen),
++    )
++    .expect("the bookcase's menu is the mod's own");
+ 
+     let shelf = r.block_key(SHELF);
+     let kind = r.block_entity_type(SHELF_TYPE).blocks(SHELF_BLOCKS).build();
+     r.block_entity_part(&kind, ShelfPart)
+         .expect("the shelf Part attaches to the type this mod just declared");
+     r.block_container(&shelf, container_of(SHELF));
++    r.register_menu_screen(
++        menu(SHELF).expect("a storage block declares its menu in runtime.rs"),
++        std::sync::Arc::new(shelf_screen),
++    )
++    .expect("the shelf's menu is the mod's own");
+ }
+ 
+ /// `block`'s container: the slots and the menu `runtime` declares for it, reachable and both
+@@ -145,8 +156,8 @@ impl BlockPart for BookcasePart {
+ 
+     /// `BlockBehaviour.getAnalogOutputSignal`: the slot index of the highest slot holding a
+     /// redstone book, as the book entity's tick last read it (upstream `BookcaseBlock:57-66`).
+-    fn analog_output(&self, level: &dyn LevelHost, event: &mut AnalogOutputEvent) {
+-        if !is_block(level, event.state, BOOKCASE) {
++    fn analog_output(&self, level: &mut dyn mod_api::LevelRandomHost, event: &mut AnalogOutputEvent) {
++        if !is_block(&*level, event.state, BOOKCASE) {
+             return;
+         }
+         let dimension = event.dimension.key().id().to_owned();
+@@ -173,58 +184,58 @@ impl BlockEntityPart for BookcasePart {
+ 
+     /// One server tick: materialise the slots, hand back anything that is not a book, and note the
+     /// comparator answer.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        bookcase_tick(host, event);
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        bookcase_tick(event);
+     }
++}
+ 
+-    /// The bookcase's menu layout: upstream's two rows of eight, the player's inventory beneath.
+-    fn screen(&self, _host: &dyn Host, event: &mut ScreenEvent<'_>) -> Option<Screen> {
+-        let slots = slots(event.block)?;
+-        let positions = (0..slots)
+-            .map(|index| {
+-                let column = index % 8;
+-                let row = index / 8;
+-                Some([17.0 + column as f32 * 18.0, 17.0 + row as f32 * 25.0])
+-            })
+-            .collect();
+-        Some(panel(positions))
+-    }
++/// The bookcase's menu layout: upstream's two rows of eight, the player's inventory beneath.
++fn bookcase_screen(_host: &dyn ClientHost, _open: MenuScreenOpen<'_>) -> Option<MenuScreen> {
++    let slots = slots(BOOKCASE)?;
++    let positions = (0..slots)
++        .map(|index| {
++            let column = index % 8;
++            let row = index / 8;
++            Some([17.0 + column as f32 * 18.0, 17.0 + row as f32 * 25.0])
++        })
++        .collect();
++    Some(MenuScreen::new(panel(positions)))
+ }
+ 
++/// The shelf's four slots are the container's declared ones (`ModContainer.slots`), so it has no
++/// tick of its own any more: the tick only ever sized the slot list, and the game sizes it now.
+ #[mod_api::sunrise_part]
+-impl BlockEntityPart for ShelfPart {
+-    /// `EntityBlock.getTicker`: the shelf ticks only to materialise its slots.
+-    fn block_entity_ticks(&self, _host: &dyn Host, event: &mut BlockEntityTicksEvent<'_>) {
+-        event.ticks = true;
+-    }
+-
+-    /// One server tick: materialise the four slots; the shelf keeps anything.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        shelf_tick(host, event);
+-    }
+-
+-    /// The shelf's menu layout: upstream's 2 x 2 grid (`ShelfMenu.addSlots`).
+-    fn screen(&self, _host: &dyn Host, event: &mut ScreenEvent<'_>) -> Option<Screen> {
+-        slots(event.block)?;
+-        let positions = vec![
+-            Some([53.0, 15.0]),
+-            Some([107.0, 15.0]),
+-            Some([53.0, 53.0]),
+-            Some([107.0, 53.0]),
+-        ];
+-        Some(panel(positions))
+-    }
++impl BlockEntityPart for ShelfPart {}
++
++/// The shelf's menu layout: upstream's 2 x 2 grid (`ShelfMenu.addSlots`).
++fn shelf_screen(_host: &dyn ClientHost, _open: MenuScreenOpen<'_>) -> Option<MenuScreen> {
++    slots(SHELF)?;
++    let positions = vec![
++        Some([53.0, 15.0]),
++        Some([107.0, 15.0]),
++        Some([53.0, 53.0]),
++        Some([107.0, 53.0]),
++    ];
++    Some(MenuScreen::new(panel(positions)))
+ }
+ 
+ /// A container panel of the given slot positions, with the player's inventory beneath it.
+-fn panel(positions: Vec<Option<[f32; 2]>>) -> Screen {
+-    Screen {
++fn panel(positions: Vec<Option<[f32; 2]>>) -> MenuScreenLayout {
++    MenuScreenLayout {
+         width: PANEL_WIDTH,
+         height: PANEL_HEIGHT,
+-        slots: positions,
++        slots: positions
++            .into_iter()
++            .map(|position| {
++                position.map(|position| ScreenSlot {
++                    position,
++                    no_item_icon: None,
++                })
++            })
++            .collect(),
+         inventory_x: INVENTORY_X,
+         inventory_y: INVENTORY_Y,
+-        ..Screen::default()
++        ..MenuScreenLayout::default()
+     }
+ }
+ 
+@@ -232,46 +243,63 @@ fn panel(positions: Vec<Option<[f32; 2]>>) -> Screen {
+ // The ticks
+ // ---------------------------------------------------------------------------
+ 
+-/// A bookcase's tick: size the slots once, hand back anything that is not a book, and note the
+-/// comparator answer. Only a real change asks the game to save, so an idle bookcase does not dirty
+-/// its chunk every tick.
+-fn bookcase_tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-    let pos = event.pos;
+-    let mut changed = false;
+-    if event.entity.items.len() != BOOKCASE_SLOTS {
+-        event.entity.items.resize(BOOKCASE_SLOTS, None);
+-        changed = true;
+-    }
++/// A bookcase's tick: hand back anything that is not a book, and note the comparator answer.
++/// Only a real change asks the game to save, so an idle bookcase does not dirty its chunk every
++/// tick. The slot list is the container's declared one, so there is nothing to size here.
++fn bookcase_tick(event: &mut BlockEntityTickEvent<'_>) {
++    let Some((pos, handle, mut items)) = event.subject.with_view(|view| {
++        let items: Vec<Option<ItemStack>> = (0..BOOKCASE_SLOTS as u32)
++            .map(|slot| view.item_slot(slot).and_then(|stack| stack.to_owned()))
++            .collect();
++        (view.position(), view.handle(), items)
++    }) else {
++        return;
++    };
++    let host = event.subject.host();
+     let level = level_in_place(&*host);
+     let mut redstone = vec![false; BOOKCASE_SLOTS];
++    let mut rejected: Vec<(usize, ItemStack)> = Vec::new();
+     for (index, has_redstone) in redstone.iter_mut().enumerate() {
+-        let Some(stack) = event.entity.items[index].as_ref() else {
++        let Some(stack) = items[index].as_ref() else {
+             continue;
+         };
+         let is_book = item_in_tag(&*host, stack.item(), BOOKCASE_BOOKS);
+-        *has_redstone = is_book && stack.item().id(&*host) == REDSTONE_BOOK;
++        *has_redstone = is_book && stack.item().id(&*host) == Some(REDSTONE_BOOK);
+         if is_book {
+             continue;
+         }
+         // Upstream's `isValid` refuses a non-book on insert; the pin's container has no slot
+         // filter, so the tick hands it back instead (notes.md, deviation).
+-        let stack = event.entity.items[index].take();
+-        if let (Some(stack), Some(level)) = (stack, level) {
+-            eject(host, level, pos, stack);
++        if let Some(stack) = items[index].take() {
++            rejected.push((index, stack));
+         }
+-        changed = true;
+     }
+-    note_signal(host, pos, signal(&redstone));
+-    if changed {
+-        *event.reply = BlockEntityTickReply::Changed;
++    let mut changed = false;
++    if !rejected.is_empty() {
++        // Empty the slots first, then drop what really left them.
++        let cleared: Vec<bool> = event
++            .subject
++            .with_view(|mut view| {
++                rejected
++                    .iter()
++                    .map(|(index, _)| view.set_item_slot(*index as u32, None).is_ok())
++                    .collect()
++            })
++            .unwrap_or_default();
++        let host = event.subject.host();
++        for ((_, stack), cleared) in rejected.into_iter().zip(cleared) {
++            if !cleared {
++                continue;
++            }
++            if let Some(level) = level {
++                eject(host, level, pos, stack);
++            }
++            changed = true;
++        }
+     }
+-}
+-
+-/// A shelf's tick: size the four slots once; anything may sit in them (upstream has no filter).
+-fn shelf_tick(_host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-    if event.entity.items.len() != SHELF_SLOTS {
+-        event.entity.items.resize(SHELF_SLOTS, None);
+-        *event.reply = BlockEntityTickReply::Changed;
++    note_signal(event.subject.host(), pos, signal(&redstone));
++    if changed {
++        let _ = handle.set_changed(event.subject.host());
+     }
+ }
+ 
+@@ -308,7 +336,7 @@ pub fn right_click_block(host: HostSide<'_>, event: &mut RightClickBlockEvent<'_
+     let Some(block) = level.block(&*server, click.pos) else {
+         return Flow::Continue;
+     };
+-    if slots(&block.id(&*server)).is_none() {
++    if slots(block.id(&*server).unwrap_or_default()).is_none() {
+         return Flow::Continue;
+     }
+     let Some(entity) = server.block_entity(level, click.pos) else {

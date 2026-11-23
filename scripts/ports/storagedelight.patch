@@ -1,0 +1,110 @@
+diff --git a/src/support.rs b/src/support.rs
+index 73bb321..bcbcff2 100644
+--- a/src/support.rs
++++ b/src/support.rs
+@@ -23,13 +23,12 @@
+ //! | `screen` (`screen` 19) | [`StoragePart::screen`] returning [`screen`] |
+ //! | `container-viewers` (`mod_container_viewers` 124) | `Hooks::mod_container_viewers` → [`viewers`] |
+ use mod_api::{
+-    self, BlockEntityEvent, BlockEntityPart, BlockPart, Compound, Host, LevelSide, ModContainer,
+-    ModContainerViewersEvent, Registrar, RegistrationContext, Screen, ScreenEvent, ServerHost,
++    self, BlockEntityEvent, BlockEntityPart, BlockPart, Compound, LevelSide, ModContainer,
++    ModContainerViewersEvent, Registrar, RegistrationContext, ServerHost,
+ };
+ 
+ use crate::runtime::{
+-    BLOCKS, CONTAINER, INVENTORY_X, INVENTORY_Y, MOD_ID, SCREEN_HEIGHT, SCREEN_WIDTH, is_open,
+-    is_our_block, screen_slots,
++    BLOCKS, CONTAINER, MOD_ID, is_open, is_our_block,
+ };
+ 
+ /// The block entity type path this mod declares for `block` (`"oak_drawer"`):
+@@ -50,26 +49,11 @@ pub(crate) fn container() -> ModContainer {
+         faces: std::array::from_fn(|_| all.clone()),
+         inputs: all.clone(),
+         outputs: all,
++        insert_rules: Vec::new(),
+         menu: Some(CONTAINER.menu.to_owned()),
+     }
+ }
+ 
+-/// The screen: a plain 176x166 chest panel with the slots at vanilla's chest
+-/// positions and the player inventory below. The per-block GUI texture and
+-/// title are a later slice, so Horizon draws its own panel and labels.
+-pub(crate) fn screen() -> Screen {
+-    Screen {
+-        width: SCREEN_WIDTH,
+-        height: SCREEN_HEIGHT,
+-        slots: screen_slots(),
+-        inventory_y: INVENTORY_Y,
+-        inventory_x: INVENTORY_X,
+-        own_labels: false,
+-        own_background: false,
+-        ..Screen::default()
+-    }
+-}
+-
+ /// The `open` block property's value for a viewer count: vanilla's `OPEN`.
+ pub(crate) fn open_state(open: bool) -> &'static str {
+     if open { "true" } else { "false" }
+@@ -84,15 +68,15 @@ pub(crate) fn should_write(previous: u32, viewers: u32) -> bool {
+ 
+ /// Declare what the game answers for every block: a block entity type each, its
+ /// 27-slot container, and [`StoragePart`] for the type's compound and screen.
+-pub(crate) fn declare(registrar: &mut dyn Registrar, context: &RegistrationContext) {
++pub(crate) fn declare(registrar: &mut dyn Registrar, _context: &RegistrationContext) {
+     for block in BLOCKS {
+         let Some(path) = type_path(block) else {
+-            context.refuse(&format!("{block} is not a Storage Delight furniture id"));
++            registrar.refuse(&format!("{block} is not a Storage Delight furniture id"));
+             continue;
+         };
+         let kind = registrar.block_entity_type(path).blocks(&[path]).build();
+         if let Err(error) = registrar.block_entity_part(&kind, StoragePart) {
+-            context.refuse(&error.to_string());
++            registrar.refuse(&error.to_string());
+         }
+         let key = registrar.block_key(block);
+         registrar.block_container(&key, container());
+@@ -115,7 +99,7 @@ pub(crate) fn viewers(host: &mut dyn ServerHost, event: &ModContainerViewersEven
+     };
+     // Only this mod's furniture carries the state: a vanilla barrel at the same
+     // coordinates in another level must not be opened from here.
+-    if !is_our_block(&block.id(host)) {
++    if !is_our_block(block.id(host).unwrap_or_default()) {
+         return;
+     }
+     let _ = host.set_block_property(event.pos, "open", open_state(is_open(event.viewers)));
+@@ -140,12 +124,6 @@ impl BlockEntityPart for StoragePart {
+     ) -> Option<Compound> {
+         Some(Compound::new())
+     }
+-
+-    /// `EntityBlock.getMenuProvider` at the screen layer: the 27-slot chest
+-    /// panel.
+-    fn screen(&self, _host: &dyn Host, _event: &mut ScreenEvent<'_>) -> Option<Screen> {
+-        Some(screen())
+-    }
+ }
+ 
+ #[cfg(test)]
+@@ -186,19 +164,6 @@ mod tests {
+         assert_eq!(container.menu.as_deref(), Some("minecraft:generic_9x3"));
+     }
+ 
+-    #[test]
+-    fn the_screen_is_the_vanilla_three_row_chest_panel() {
+-        let screen = screen();
+-        assert_eq!((screen.width, screen.height), (176.0, 166.0));
+-        assert_eq!((screen.inventory_x, screen.inventory_y), (8.0, 84.0));
+-        assert_eq!(screen.slots.len(), 27);
+-        assert_eq!(screen.slots.first().copied(), Some(Some([8.0, 18.0])));
+-        assert_eq!(screen.slots.last().copied(), Some(Some([152.0, 54.0])));
+-        assert!(!screen.own_labels, "the title is vanilla's for now");
+-        assert!(!screen.own_background, "the panel is Horizon's plain one");
+-        assert!(screen.recipe_book.is_none());
+-    }
+-
+     #[test]
+     fn the_open_property_takes_vanillas_values() {
+         assert_eq!(open_state(true), "true");

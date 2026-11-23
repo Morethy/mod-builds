@@ -1,0 +1,309 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 48208a0..144a8ed 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -27,7 +27,7 @@ pub mod runtime;
+ pub mod support;
+ 
+ use mod_api::{
+-    self, Flow, Hooks, RegisterCommandsEvent, Registrar, RegistrationContext, RunModCommandEvent,
++    self, Flow, Hooks, RegisterCommandsEvent, Registrar, RegistrationContext,
+     ServerHost,
+ };
+ 
+@@ -49,13 +49,4 @@ impl Hooks for Mod {
+     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+         support::declare_commands(event.commands);
+     }
+-
+-    /// Run one of the commands above and take it.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        support::run_command(host, event)
+-    }
+ }
+diff --git a/src/support.rs b/src/support.rs
+index dfcdfb4..b63686a 100644
+--- a/src/support.rs
++++ b/src/support.rs
+@@ -21,7 +21,7 @@ use mod_api::{
+     BlockClick, BlockEntityPart, BlockEntityRef, BlockEntityTickEvent, BlockEntityTicksEvent,
+     BlockPart, Command, CommandArgumentValue, Compound, Flow, GameMode, Hand, Host, HostSide,
+     HostTransaction, Identifier, InteractionResult, ItemPart, ItemPlace, ItemResource, ItemStack,
+-    LevelRef, ModContainer, PlayerRef, Registrar, RunModCommandEvent, ServerHost, Tag, Text,
++    LevelRef, ModContainer, PlayerRef, Registrar, ServerHost, Tag, Text,
+     UseItemEvent, UseItemOnEvent, UseWithoutItemEvent,
+ };
+ 
+@@ -89,22 +89,21 @@ fn container() -> ModContainer {
+         inputs: vec![SLOT],
+         outputs: vec![SLOT],
+         menu: None,
++        insert_rules: Vec::new(),
+     }
+ }
+ 
+ /// `/neovitae altar|lp|insert`: the harness readouts and setters. Upstream has no commands; these
+ /// exist so a scenario can read and set an altar without a GUI (precedent `/charginggadgets
+ /// info|energy`).
+-pub fn declare_commands(commands: &mut Vec<Command>) {
+-    commands.push(Command::new("neovitae altar <pos:block_pos>"));
+-    commands.push(Command::op(
+-        "neovitae lp <pos:block_pos> <amount:integer>",
+-        2,
+-    ));
+-    commands.push(Command::op(
+-        "neovitae insert <pos:block_pos> <item:word>",
+-        2,
+-    ));
++pub fn declare_commands(commands: &mut Vec<mod_api::CommandRegistration>) {
++    commands.push(Command::new("neovitae altar <pos:block_pos>").executes(run_command));
++    commands.push(
++        Command::op("neovitae lp <pos:block_pos> <amount:integer>", 2).executes(run_command),
++    );
++    commands.push(
++        Command::op("neovitae insert <pos:block_pos> <item:word>", 2).executes(run_command),
++    );
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -154,8 +153,8 @@ impl BlockEntityPart for AltarEntity {
+ 
+     /// One server tick: settle a queued click, pay a queued sacrifice, revalidate the structure
+     /// every five seconds, then run the crafting loop (`AraVitaeTile.tick`).
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        tick(host, event);
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        tick(event);
+     }
+ }
+ 
+@@ -277,7 +276,7 @@ impl ItemPart for Orb {
+         let HostSide::Server(server) = host else {
+             return None;
+         };
+-        if event.stack.item().id(&*server) != BLOOD_ORB_WEAK {
++        if event.stack.item().id(&*server) != Some(BLOOD_ORB_WEAK) {
+             return None;
+         }
+         let player = server.player(event.player)?;
+@@ -329,41 +328,76 @@ fn find_altar(host: &dyn Host, level: LevelRef, at: [i32; 3]) -> Option<[i32; 3]
+ 
+ /// One server tick (`AraVitaeTile.tick`): settle a queued click, pay a queued self-sacrifice,
+ /// revalidate the structure every five seconds, run the crafting loop, then store the result.
+-fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
++fn tick(event: &mut BlockEntityTickEvent<'_>) {
++    // The tick no longer hands over the payload: copy the slot and the compound out of the
++    // view, run the tick on the copies, and write back what moved.
++    let Some((pos, handle, old_nbt, old_items)) = event.subject.with_view(|view| {
++        let items: Vec<Option<ItemStack>> = (0..=SLOT as u32)
++            .map(|slot| view.item_slot(slot).and_then(|stack| stack.to_owned()))
++            .collect();
++        (view.position(), view.handle(), view.nbt().clone(), items)
++    }) else {
++        return;
++    };
++    let host = event.subject.host();
+     let Some(level) = level_in_place(host) else {
+         return;
+     };
+-    let Some(key) = altar_key(&*host, level, event.pos) else {
++    let Some(key) = altar_key(&*host, level, pos) else {
+         return;
+     };
+-    if event.entity.items.is_empty() {
+-        event.entity.items.resize(SLOT + 1, None);
+-    }
+-    settle_request(host, &key, &mut event.entity.items);
+-    let mut altar = read_altar(&event.entity.nbt);
++    let mut items = old_items.clone();
++    let mut nbt = old_nbt.clone();
++    settle_request(host, &key, &mut items);
++    let mut altar = read_altar(&nbt);
+     settle_sacrifice(host, &key, &mut altar);
+-    let check = read_int(&event.entity.nbt, KEY_CHECK).wrapping_add(1);
++    let check = read_int(&nbt, KEY_CHECK).wrapping_add(1);
+     if check % STRUCTURE_CHECK_INTERVAL == 0 || altar.tier < 0 {
+-        let (found, modifier) = scan(&*host, level, event.pos);
++        let (found, modifier) = scan(&*host, level, pos);
+         altar.set_structure(found, modifier);
+     }
+     if altar.cooldown > 0 {
+         altar.cooldown -= 1;
+     }
+-    if let Some(stack) = event.entity.items[SLOT].clone()
++    if let Some(stack) = items[SLOT].clone()
+         && altar.cooldown == 0
+     {
+-        let recipe = recipe_for(&stack.item().id(&*host), altar.tier, |tag, item| {
+-            in_tag(&*host, item, tag)
+-        });
++        let recipe = recipe_for(
++            stack.item().id(&*host).unwrap_or_default(),
++            altar.tier,
++            |tag, item| in_tag(&*host, item, tag),
++        );
+         if altar.craft_tick(recipe, i32::try_from(stack.count()).unwrap_or(1)) == Craft::Done
+             && let Some(recipe) = recipe
+             && let Some(output) = item_stack(&*host, recipe.output, stack.count())
+         {
+-            event.entity.items[SLOT] = Some(output);
++            items[SLOT] = Some(output);
+         }
+     }
+-    write_altar(&mut event.entity.nbt, &altar, check);
++    write_altar(&mut nbt, &altar, check);
++    let mut changed = false;
++    event.subject.with_view(|mut view| {
++        for (slot, stack) in items.into_iter().enumerate() {
++            if old_items.get(slot) != Some(&stack)
++                && view.set_item_slot(slot as u32, stack).is_ok()
++            {
++                changed = true;
++            }
++        }
++        for (key, _) in old_nbt.iter() {
++            if nbt.get(key).is_none() && view.set_nbt(key.clone(), None) {
++                changed = true;
++            }
++        }
++        for (key, value) in nbt.iter() {
++            if old_nbt.get(key) != Some(value) && view.set_nbt(key.clone(), Some(value.clone())) {
++                changed = true;
++            }
++        }
++    });
++    if changed {
++        let _ = handle.set_changed(event.subject.host());
++    }
+ }
+ 
+ /// The altar's tier and the capacity multiplier of the runes standing at its layout's `upgrade`
+@@ -527,11 +561,22 @@ fn give_inventory(host: &mut dyn ServerHost, uuid: u128, stack: ItemStack) -> Op
+     let max = host.max_stack_size(stack.item()).unwrap_or(64).max(1);
+     let mut left = stack;
+     let mut taken: Vec<u32> = Vec::new();
+-    for (slot, here) in player.inventory_slots(&*host).unwrap_or_default() {
++    let slots: Vec<(u32, Option<ItemStack>)> = player
++        .with_inventory(&*host, |view| {
++            view.iter()
++                .map(|(slot, stack)| (slot, stack.project()))
++                .collect()
++        })
++        .unwrap_or_default();
++    for (slot, here) in slots {
+         taken.push(slot);
+         if left.count() == 0 {
+             break;
+         }
++        // An occupied slot whose stack cannot be handed to a mod stays as it is.
++        let Some(here) = here else {
++            continue;
++        };
+         if !here.is_stackable_with(&left) {
+             continue;
+         }
+@@ -634,24 +679,27 @@ fn health_of(host: &dyn Host, player: PlayerRef) -> Option<f32> {
+ 
+ /// `/neovitae altar|lp|insert` (`Hooks::run_mod_command`). Upstream has no commands; the readout
+ /// text is kept byte-identical to 0.1.0's.
+-pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>) -> Flow {
+-    let invocation = event.command;
++pub fn run_command(
++    host: &mut dyn ServerHost,
++    _source: &mod_api::CommandSource,
++    invocation: &mod_api::CommandInvocation,
++) -> Option<i32> {
+     let Some(root) = invocation.literals.first().map(String::as_str) else {
+-        return Flow::Continue;
++        return None;
+     };
+     if root != "neovitae" {
+-        return Flow::Continue;
++        return None;
+     }
+     let sub = invocation.literals.get(1).map(String::as_str);
+     let level = invocation
+         .dimension
+         .id(&*host)
+-        .and_then(|id| host.level(&id));
++        .and_then(|id| host.level(id));
+     match sub {
+         Some("altar") => {
+             let Some(pos) = block_pos(invocation, "pos") else {
+                 say(host, "usage: /neovitae altar <x> <y> <z>");
+-                return Flow::Cancel;
++                return Some(1);
+             };
+             let line = match level {
+                 Some(level) => readout(host, level, pos),
+@@ -664,19 +712,19 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
+                 (block_pos(invocation, "pos"), integer(invocation, "amount"))
+             else {
+                 say(host, "usage: /neovitae lp <x> <y> <z> <amount>");
+-                return Flow::Cancel;
++                return Some(1);
+             };
+             let Some(level) = level else {
+                 say(host, &format!("{pos:?} is not an Ara Vitae."));
+-                return Flow::Cancel;
++                return Some(1);
+             };
+             let Some(entity) = altar_entity(&*host, level, pos) else {
+                 say(host, &format!("{pos:?} is not an Ara Vitae."));
+-                return Flow::Cancel;
++                return Some(1);
+             };
+             let Some(mut data) = entity.data(&*host) else {
+                 say(host, &format!("{pos:?} is not an Ara Vitae."));
+-                return Flow::Cancel;
++                return Some(1);
+             };
+             let mut altar = read_altar(&data);
+             let capacity = altar.capacity();
+@@ -699,7 +747,7 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
+             let (Some(pos), Some(item)) = (block_pos(invocation, "pos"), word(invocation, "item"))
+             else {
+                 say(host, "usage: /neovitae insert <x> <y> <z> <item>");
+-                return Flow::Cancel;
++                return Some(1);
+             };
+             let placed = level
+                 .and_then(|level| {
+@@ -720,7 +768,7 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
+         }
+         _ => say(host, "usage: /neovitae altar|lp|insert ..."),
+     }
+-    Flow::Cancel
++    Some(1)
+ }
+ 
+ /// One feedback line to the command's source, vanilla's silence and track-output rules included.
+@@ -772,7 +820,11 @@ fn readout(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> String
+     let altar = read_altar(&data);
+     let slots = entity.item_slot(&*host, SLOT_U32).ok().flatten();
+     let slot = match slots {
+-        Some(stack) => format!("{} x{}", stack.item().id(&*host), stack.count()),
++        Some(stack) => format!(
++            "{} x{}",
++            stack.item().id(&*host).unwrap_or_default(),
++            stack.count()
++        ),
+         None => "empty".to_owned(),
+     };
+     let time = level.game_time(&*host).unwrap_or(0);
+@@ -819,7 +871,10 @@ fn slot_stack(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> Option<ItemSta
+ 
+ /// The id of the block at `pos`, or `None` when that position is not loaded.
+ fn block_id(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> Option<String> {
+-    level.block(host, pos).map(|key| key.id(host))
++    level
++        .block(host, pos)
++        .and_then(|key| key.id(host))
++        .map(str::to_owned)
+ }
+ 
+ /// A fresh stack of `id`, or `None` for an id this game does not know.

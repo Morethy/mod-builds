@@ -1,0 +1,204 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 2e704c5..2f32ece 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -17,8 +17,8 @@ mod network;
+ use std::sync::{Arc, Mutex};
+ 
+ use mod_api::{
+-  self, Flow, Hooks, HostSide, LevelTickPostEvent, RegisterCommandsEvent, Registrar,
+-  RegistrationContext, RunModCommandEvent, ServerHost,
++  self, Hooks, HostSide, LevelTickPostEvent, RegisterCommandsEvent, Registrar,
++  RegistrationContext, ServerHost,
+ };
+ 
+ use crate::network::{ConnectorShape, Kind, LightShape, Queue, RelayShape, Ticker};
+@@ -72,8 +72,10 @@ impl Hooks for Mod {
+     // buffer: a formed tower's pooled charge and its `blocks * 2,000,000` capacity are what a
+     // neighbour sees, as upstream's controller answers for every part of the multiblock
+     // (`handlerForCapability`). The connectors keep the declared buffer.
+-    registrar.block_capability_before_game(&mod_api::ENERGY, &accumulator, |_, at, _, entity| {
+-      entity.map(|_| network::accumulator_energy(at.level, at.pos))
++    registrar.block_capability_before_game(&mod_api::ENERGY, &accumulator, |_, at, _, entity, offer| {
++      if entity.is_some() {
++        offer.offer(|| network::accumulator_energy(at.level, at.pos));
++      }
+     });
+   }
+ 
+@@ -103,19 +105,4 @@ impl Hooks for Mod {
+   fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+     event.commands.extend(network::command_declarations());
+   }
+-
+-  /// Run the five usages [`Hooks::register_commands`] declares, after the game parsed and
+-  /// permission-checked them.
+-  fn run_mod_command(&self, host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>) -> Flow {
+-    let literals: Vec<&str> = event.command.literals.iter().map(String::as_str).collect();
+-    match literals.as_slice() {
+-      ["createaddition", "info"] => network::command_info(host, event.command),
+-      ["createaddition", "energy"] => network::command_energy(host, event.command),
+-      ["createaddition", "link"] => network::command_link(host, event.command),
+-      ["createaddition", "unlink"] => network::command_unlink(host, event.command),
+-      ["createaddition", "mode"] => network::command_mode(host, event.command),
+-      _ => return Flow::Continue,
+-    }
+-    Flow::Cancel
+-  }
+ }
+diff --git a/src/network.rs b/src/network.rs
+index 8fffa49..e4e694f 100644
+--- a/src/network.rs
++++ b/src/network.rs
+@@ -674,7 +674,11 @@ impl BlockEntityPart for Ticker {
+ 
+   /// One tick: queue the position for the level's pass. A block entity is out of the world
+   /// during its own tick, so nothing is read or moved here.
+-  fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
++  fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++    let Some(pos) = event.subject.with_view(|view| view.position()) else {
++      return;
++    };
++    let host = event.subject.host();
+     let Some(level) = level_in_place(host) else {
+       return;
+     };
+@@ -682,7 +686,7 @@ impl BlockEntityPart for Ticker {
+       .queue
+       .lock()
+       .expect("the createaddition tick queue lock is held for one insert")
+-      .push(level, event.pos);
++      .push(level, pos);
+   }
+ }
+ 
+@@ -695,9 +699,10 @@ impl BlockPart for ConnectorShape {
+   /// `getClickedFace().getOpposite()` has it.
+   fn state_for_placement(
+     &self,
+-    level: &dyn mod_api::LevelHost,
++    level: mod_api::LevelSide<'_>,
+     event: &mut StateForPlacementEvent<'_>,
+   ) -> Option<Option<mod_api::BlockState>> {
++    let (mod_api::LevelSide::Server(level) | mod_api::LevelSide::Client(level)) = level;
+     let facing = face_name(event.context.face.opposite());
+     let placed = level.state_with_property(event.state, FACING, facing)?;
+     Some(Some(placed))
+@@ -724,9 +729,10 @@ impl BlockPart for RelayShape {
+   /// face it was placed on (`getStateForPlacement`).
+   fn state_for_placement(
+     &self,
+-    level: &dyn mod_api::LevelHost,
++    level: mod_api::LevelSide<'_>,
+     event: &mut StateForPlacementEvent<'_>,
+   ) -> Option<Option<mod_api::BlockState>> {
++    let (mod_api::LevelSide::Server(level) | mod_api::LevelSide::Client(level)) = level;
+     let face = event.context.face;
+     let (vertical, facing) = if face == Direction::Up || face == Direction::Down {
+       (false, clockwise(yaw_facing(event.context.yaw)))
+@@ -762,9 +768,10 @@ impl BlockPart for LightShape {
+   /// A placed lamp is mounted on the face it was clicked against, as the small connector is.
+   fn state_for_placement(
+     &self,
+-    level: &dyn mod_api::LevelHost,
++    level: mod_api::LevelSide<'_>,
+     event: &mut StateForPlacementEvent<'_>,
+   ) -> Option<Option<mod_api::BlockState>> {
++    let (mod_api::LevelSide::Server(level) | mod_api::LevelSide::Client(level)) = level;
+     let facing = face_name(event.context.face.opposite());
+     let placed = level.state_with_property(event.state, FACING, facing)?;
+     Some(Some(placed))
+@@ -966,9 +973,27 @@ fn pending_of(stack: &ItemStack) -> Option<(Pos, i32)> {
+   ))
+ }
+ 
+-/// Write (or clear) the pending selection inside the stack's custom data.
+-fn set_pending(stack: &mut ItemStack, at: Option<(Pos, i32)>) {
+-  let mut data = custom_data(stack);
++/// A component named by its id alone, for clearing an override the spool no longer carries.
++struct Named<'a>(&'a str);
++
++impl mod_api::Component for Named<'_> {
++  type Value = Tag;
++  fn id(&self) -> &str {
++    self.0
++  }
++  fn decode(&self, value: &Tag) -> Option<Tag> {
++    Some(value.clone())
++  }
++  fn encode(&self, value: Tag) -> Tag {
++    value
++  }
++}
++
++/// Write (or clear) the pending selection inside the stack's custom data. The stack's patch
++/// becomes the custom data alone (its damage is kept), as replacing the patch did.
++fn set_pending(stack: &mut mod_api::ItemComponentEditor<'_>, at: Option<(Pos, i32)>) {
++  let original = stack.original().project();
++  let mut data = original.as_ref().map(custom_data).unwrap_or_default();
+   match at {
+     Some((pos, node)) => {
+       let mut entry = Compound::new();
+@@ -982,9 +1007,20 @@ fn set_pending(stack: &mut ItemStack, at: Option<(Pos, i32)>) {
+       data.remove(&NODE.into());
+     }
+   }
++  if let Some(components) = original.as_ref().and_then(ItemStack::components) {
++    for (key, _) in components.as_nbt().iter() {
++      let Ok(key) = key.to_string() else {
++        continue;
++      };
++      let id = key.strip_prefix('!').unwrap_or(&key);
++      if id != PENDING && id != "minecraft:damage" {
++        stack.remove(&Named(id));
++      }
++    }
++  }
+   let mut patch = Compound::new();
+   patch.insert(PENDING.into(), Tag::Compound(data));
+-  let _ = stack.set_components(patch);
++  let _ = stack.apply_components(&patch);
+ }
+ 
+ fn refusal_text(refusal: Refusal) -> &'static str {
+@@ -2161,21 +2197,37 @@ pub(crate) fn command_usages() -> [&'static str; 5] {
+ /// The command tree: `info` and `mode` are ordinary player controls (level 0, with the reach
+ /// check below), while `energy`, `link` and `unlink` are administrative writes that stand in for
+ /// an item the player would have to hold (a spool) and are operator-only (level 2).
+-pub(crate) fn command_declarations() -> Vec<Command> {
++pub(crate) fn command_declarations() -> Vec<mod_api::CommandRegistration> {
+   command_usages()
+     .iter()
+     .map(|usage| {
+       let player_control =
+         usage.starts_with("createaddition info") || usage.starts_with("createaddition mode");
+-      if player_control {
++      let command = if player_control {
+         Command::new(usage)
+       } else {
+         Command::op(usage, 2)
+-      }
++      };
++      command.executes(|host, _source, command| run_command(host, command))
+     })
+     .collect()
+ }
+ 
++/// Run the five usages [`command_declarations`] declares, after the game parsed and
++/// permission-checked them.
++fn run_command(host: &mut dyn ServerHost, command: &CommandInvocation) -> Option<i32> {
++  let literals: Vec<&str> = command.literals.iter().map(String::as_str).collect();
++  match literals.as_slice() {
++    ["createaddition", "info"] => command_info(host, command),
++    ["createaddition", "energy"] => command_energy(host, command),
++    ["createaddition", "link"] => command_link(host, command),
++    ["createaddition", "unlink"] => command_unlink(host, command),
++    ["createaddition", "mode"] => command_mode(host, command),
++    _ => return None,
++  }
++  Some(1)
++}
++
+ /// A player's interaction reach, in blocks: vanilla's ~4.5 plus a margin.
+ const REACH: f64 = 6.0;
+ 

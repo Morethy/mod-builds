@@ -1,0 +1,211 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 15bf241..ba7de80 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -13,8 +13,8 @@
+ use mod_api::{
+     BlockEntityEvent, BlockEntityPart, BlockEntitySubmitEvent, BlockEntityTickEvent,
+     BlockEntityTicksEvent, BlockEntityUpdateTagEvent, BlockPart, BlockState, Capability,
+-    ClientHost, Command, CommandArgumentValue, Compound, Direction, Flow, Hooks, LevelHost,
+-    LevelRef, LevelSide, Registrar, RegistrationContext, RunModCommandEvent, ServerHost,
++    ClientHost, Command, CommandArgumentValue, Compound, Direction, Hooks,
++    LevelRef, LevelSide, Registrar, RegistrationContext, ServerHost,
+     StateForPlacementEvent, Tag, Text,
+ };
+ 
+@@ -131,9 +131,10 @@ impl BlockPart for ComputerPart {
+     /// a block moment like this one is asked.
+     fn state_for_placement(
+         &self,
+-        host: &dyn LevelHost,
++        host: LevelSide<'_>,
+         event: &mut StateForPlacementEvent<'_>,
+     ) -> Option<Option<BlockState>> {
++        let (LevelSide::Server(host) | LevelSide::Client(host)) = host;
+         if host
+             .state_block(event.state)
+             .is_none_or(|block| !family::is_computer(block))
+@@ -168,19 +169,26 @@ impl BlockEntityPart for ComputerPart {
+     /// One server tick: a powered computer that has not run its program yet runs it now —
+     /// with its neighbours answering `peripheral.*` — keeps the terminal, lights `state=on` and
+     /// pushes both to clients.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        let mut computer = Computer::read(&event.entity.nbt);
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        let Some((pos, saved)) = event
++            .subject
++            .with_view(|view| (view.position(), view.nbt().clone()))
++        else {
++            return;
++        };
++        let host = event.subject.host();
++        let mut computer = Computer::read(&saved);
+         if !computer.powered || computer.running {
+             return;
+         }
+         let mut terminal = runtime::Terminal::new(runtime::TERM_WIDTH, runtime::TERM_LINES);
+         let outcome = match in_place_level(host) {
+             Some(level) => {
+-                let facing = facing_at(host, level, event.pos);
++                let facing = facing_at(host, level, pos);
+                 let mut world = Lookup {
+                     host: &mut *host,
+                     level,
+-                    pos: event.pos,
++                    pos,
+                     facing,
+                 };
+                 runtime::run_with(&computer.program, &mut terminal, &mut world)
+@@ -194,11 +202,26 @@ impl BlockEntityPart for ComputerPart {
+         }
+         computer.buffer = terminal.lines().to_vec();
+         computer.running = true;
+-        computer.write(&mut event.entity.nbt);
+-        let _ = host.set_block_property(event.pos, "state", "on");
++        let mut nbt = saved.clone();
++        computer.write(&mut nbt);
++        // Write back the fields the tick changed, as the tick's own compound was kept before.
++        let written = event.subject.with_view(|mut view| {
++            let mut changed = false;
++            for (key, value) in nbt.iter() {
++                if saved.get(key) != Some(value) {
++                    changed |= view.set_nbt(key.clone(), Some(value.clone()));
++                }
++            }
++            (changed, view.handle())
++        });
++        if let Some((true, handle)) = written {
++            let _ = handle.set_changed(event.subject.host());
++        }
++        let host = event.subject.host();
++        let _ = host.set_block_property(pos, "state", "on");
+         // `Level.sendBlockUpdated`: a client's copy of the block entity only gets a new tag
+         // when its block changes, so the terminal is pushed explicitly.
+-        host.block_entity_sync(event.pos);
++        host.block_entity_sync(pos);
+     }
+ 
+     /// `BlockEntity.getUpdateTag`: clients get the terminal, so the screen draws what the
+@@ -266,7 +289,7 @@ impl Hooks for Mod {
+         r.block_capability(
+             &peripheral::PERIPHERAL,
+             &harness,
+-            |_host, _at, _state, _entity| Some(Box::new(peripheral::Harness)),
++            |_host, _at, _state, _entity, offer| offer.offer(|| Box::new(peripheral::Harness)),
+         );
+     }
+ 
+@@ -278,56 +301,55 @@ impl Hooks for Mod {
+         event: &mut mod_api::RegisterCommandsEvent<'_>,
+     ) {
+         for (usage, level) in commands::usages() {
+-            event.commands.push(Command::op(usage, level));
++            event.commands.push(Command::op(usage, level).executes(run_command));
+         }
+     }
++}
+ 
+-    /// A player ran one of our usages: the server parsed it, so the arguments are typed and
+-    /// the permission check is done. Answer it and take it.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        let invocation = event.command;
+-        if invocation.literals.first().map(String::as_str) != Some("computercraft") {
+-            return Flow::Continue;
+-        }
+-        let sub = invocation.literals.get(1).map_or("", String::as_str);
+-        let program = match invocation.argument("program") {
+-            Some(CommandArgumentValue::String(text)) => Some(text.as_str()),
+-            _ => None,
+-        };
+-        let switch = match invocation.argument("switch") {
+-            Some(CommandArgumentValue::String(word)) => Some(word.as_str()),
+-            _ => None,
+-        };
+-        let asked = commands::asked(sub, program, switch);
+-        let action = match asked {
+-            commands::Asked::Do(action) => action,
+-            commands::Asked::Refused(hint) => {
+-                let _ = host.commands().feedback(Text::literal(hint));
+-                return Flow::Cancel;
+-            }
+-            commands::Asked::Unknown => {
+-                let _ = host.commands().feedback(Text::literal(format!(
+-                    "Unknown usage: /computercraft {sub}"
+-                )));
+-                return Flow::Cancel;
+-            }
+-        };
+-        let Some(at) = invocation.argument("pos").and_then(|value| match value {
+-            CommandArgumentValue::BlockPos(at) => Some(*at),
+-            _ => None,
+-        }) else {
+-            let _ = host
+-                .commands()
+-                .feedback(Text::literal("Usage: /computercraft <usage> <x> <y> <z>"));
+-            return Flow::Cancel;
+-        };
+-        act(host, invocation.dimension, at, action);
+-        Flow::Cancel
++/// A player ran one of our usages: the server parsed it, so the arguments are typed and
++/// the permission check is done. Answer it and take it.
++fn run_command(
++    host: &mut dyn ServerHost,
++    _source: &mod_api::CommandSource,
++    invocation: &mod_api::CommandInvocation,
++) -> Option<i32> {
++    if invocation.literals.first().map(String::as_str) != Some("computercraft") {
++        return None;
+     }
++    let sub = invocation.literals.get(1).map_or("", String::as_str);
++    let program = match invocation.argument("program") {
++        Some(CommandArgumentValue::String(text)) => Some(text.as_str()),
++        _ => None,
++    };
++    let switch = match invocation.argument("switch") {
++        Some(CommandArgumentValue::String(word)) => Some(word.as_str()),
++        _ => None,
++    };
++    let asked = commands::asked(sub, program, switch);
++    let action = match asked {
++        commands::Asked::Do(action) => action,
++        commands::Asked::Refused(hint) => {
++            let _ = host.commands().feedback(Text::literal(hint));
++            return Some(1);
++        }
++        commands::Asked::Unknown => {
++            let _ = host.commands().feedback(Text::literal(format!(
++                "Unknown usage: /computercraft {sub}"
++            )));
++            return Some(1);
++        }
++    };
++    let Some(at) = invocation.argument("pos").and_then(|value| match value {
++        CommandArgumentValue::BlockPos(at) => Some(*at),
++        _ => None,
++    }) else {
++        let _ = host
++            .commands()
++            .feedback(Text::literal("Usage: /computercraft <usage> <x> <y> <z>"));
++        return Some(1);
++    };
++    act(host, invocation.dimension, at, action);
++    Some(1)
+ }
+ 
+ /// Runs one answered command against the computer at `at` in `dimension`, answering the
+@@ -411,9 +433,9 @@ fn computer_at(
+     at: [i32; 3],
+ ) -> Option<(String, mod_api::BlockEntityRef)> {
+     let name = dimension.id(host)?;
+-    let level = host.level(&name)?;
++    let level = host.level(name)?;
+     let block = level.block(host, at)?;
+-    let id = block.id(host).to_string();
++    let id = block.id(host).unwrap_or_default().to_string();
+     if !family::is_computer(&id) {
+         return None;
+     }

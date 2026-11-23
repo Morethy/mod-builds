@@ -1,0 +1,407 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 13fb628..61eedb6 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -11,7 +11,7 @@ mod world;
+ use mod_api::{
+     BlockChangedEvent, BlockEntityTypeKey, BlockKey, BlocksEvent, BreakBlockEvent, Flow, Hooks, HostSide,
+     InteractionResult, ItemKey, ItemsEvent, LevelHost, ModContainer, ParticleKey, PlayerLoggedInEvent,
+-    RegisterCommandsEvent, Registrar, RegistrationContext, RightClickBlockEvent, RunModCommandEvent, ServerHost,
++    RegisterCommandsEvent, Registrar, RegistrationContext, RightClickBlockEvent, ServerHost,
+     ServerTickEvent, TicketController, ValidateTicketsEvent,
+ };
+ use std::sync::OnceLock;
+@@ -69,9 +69,12 @@ impl Hooks for Mod {
+                 inputs: vec![rules::FUEL_SLOT],
+                 outputs: Vec::new(),
+                 menu: Some(rules::MENU.to_owned()),
++                insert_rules: Vec::new(),
+             },
+         );
+         r.menu_part(rules::MENU, quarry::QuarryMenu);
++        r.register_menu_screen(rules::MENU, std::sync::Arc::new(quarry::screen))
++            .expect("the quarry's menu is the mod's own");
+         let item = r.item_key(rules::BLOCK);
+         r.item_part(item, quarry::QuarryItem);
+         let tickets = r.register_ticket_controller(rules::BLOCK, true);
+@@ -90,21 +93,17 @@ impl Hooks for Mod {
+     }
+ 
+     fn blocks(&self, _: &RegistrationContext, event: &mut BlocksEvent<'_>) {
+-        world::blocks(event.blocks);
++        world::blocks(event);
+     }
+ 
+     fn items(&self, _: &RegistrationContext, event: &mut ItemsEvent<'_>) {
+-        world::items(event.items);
++        world::items(event);
+     }
+ 
+     fn register_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+         world::commands(event.commands);
+     }
+ 
+-    fn run_mod_command(&self, host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>) -> Flow {
+-        world::command(host, event)
+-    }
+-
+     /// Another player's quarry doesn't open, nor break.
+     fn right_click_block(&self, host: HostSide<'_>, event: &mut RightClickBlockEvent<'_>) -> Flow {
+         let HostSide::Server(host) = host else {
+diff --git a/src/quarry.rs b/src/quarry.rs
+index 1bce9c2..7fb2406 100644
+--- a/src/quarry.rs
++++ b/src/quarry.rs
+@@ -2,11 +2,12 @@
+ 
+ use crate::{keys, rules, upgrade_of, world};
+ use mod_api::{
+-    BlockEntityPart, BlockEntityRenderBoundingBoxEvent, BlockEntitySubmitEvent, BlockEntityTickEvent,
++    Flow, BlockEntityPart, BlockEntityRenderBoundingBoxEvent, BlockEntitySubmitEvent, BlockEntityTickEvent,
+     BlockEntityTicksEvent, BlockEntityUpdateTagEvent, BlockPart, BlockState, BlockUpdateFlags, ClientHost,
+     Compound, CubeFace, Direction, Host, HostBlockStates, HostTransaction, ItemPart, ItemResource, ItemStack,
+     LevelRef, LightLayer, MenuButtonEvent, MenuContainer, MenuPart, MenuSlotRulesEvent,
+-    OnBlockPlacedByEvent, ParticleOptions, Screen, ScreenClickEvent, ScreenDrawEvent, ScreenEvent, ServerHost,
++    MenuButtonValidEvent, MenuScreen, MenuScreenFrame, MenuScreenLayout, OnBlockPlacedByEvent, ParticleOptions,
++    ScreenSlot, ServerHost,
+     SoundSource, Tag, Text, ITEMS,
+ };
+ use rules::{Action, Cell, Input, Quarry as State, Upgrade, Upgrades};
+@@ -115,7 +116,7 @@ fn offset(pos: [i32; 3], by: [i32; 3]) -> [i32; 3] {
+ fn find_chest(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> Option<([i32; 3], Direction)> {
+     AROUND.iter().find_map(|(by, face)| {
+         let at = offset(pos, *by);
+-        let storage = level.block(host, at).is_some_and(|b| rules::is_storage(&b.id(host)));
++        let storage = level.block(host, at).is_some_and(|b| rules::is_storage(b.id(host).unwrap_or_default()));
+         (storage && level.capability(host, &ITEMS, at, Some(*face)).is_some_and(|items| items.size(host) > 0))
+             .then_some((at, *face))
+     })
+@@ -129,7 +130,7 @@ fn insert(host: &mut dyn ServerHost, level: LevelRef, (at, face): ([i32; 3], Dir
+     let resource = ItemResource::of(&stack);
+     let count = stack.count();
+     let moved = host
+-        .transaction(|host, tx| Ok::<u32, ()>(items.insert_any(host, tx, &resource, count)))
++        .transaction(|host, tx| Ok::<u32, ()>(items.insert(host, tx, &resource, count).unwrap_or(0)))
+         .unwrap_or(0);
+     resource.to_stack(count - moved)
+ }
+@@ -177,7 +178,7 @@ fn classify(host: &mut dyn ServerHost, level: LevelRef, at: [i32; 3]) -> Cell {
+         return Cell::Unbreakable;
+     }
+     let contents = host.block_states().has_block_entity(state).unwrap_or(false);
+-    if block == keys().block || (contents && block.id(host) != "minecraft:spawner") {
++    if block == keys().block || (contents && block.id(host) != Some("minecraft:spawner")) {
+         return Cell::Kept;
+     }
+     Cell::Solid
+@@ -223,7 +224,7 @@ fn effects(host: &mut dyn ServerHost, level: LevelRef, at: [i32; 3], state: Bloc
+     let center = at.map(|c| f64::from(c) + 0.5);
+     let particle = ParticleOptions::simple(keys().block_particle);
+     level.send_particles(host, &particle, Some(state), center, [0.25; 3], 0.1, 8);
+-    level.play_sound(host, "minecraft:block.stone.break", center, SoundSource::Blocks, 0.6, 1.0);
++    level.play_sound(host, "minecraft:block.stone.break", center, SoundSource::Blocks, 0.6, 1.0, None);
+ }
+ 
+ /// What can't burn leaves the fuel slot for the chest: lava's empty bucket, and whatever a hopper or a
+@@ -287,13 +288,63 @@ fn hold_chunks(
+     }
+ }
+ 
+-fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-    let pos = event.pos;
+-    let Some(level) = host.level(host.dimension()) else {
++/// What the tick works on: the block entity's slots, menu data and saved compound, read from the view and
++/// written back to it when the tick is done.
++struct Lent {
++    items: Vec<Option<ItemStack>>,
++    data: Vec<i32>,
++    nbt: Compound,
++}
++
++fn tick(event: &mut BlockEntityTickEvent<'_>) {
++    let Some((pos, handle, mut lent)) = event.subject.with_view(|view| {
++        let items = (0..view.item_slots() as u32)
++            .map(|slot| view.item_slot(slot).and_then(|stack| stack.to_owned()))
++            .collect();
++        (
++            view.position(),
++            view.handle(),
++            Lent {
++                items,
++                data: view.data_slots().to_vec(),
++                nbt: view.nbt().clone(),
++            },
++        )
++    }) else {
++        return;
++    };
++    let before_items = lent.items.clone();
++    let before_nbt = lent.nbt.clone();
++    let Some(sync) = tick_lent(event.subject.host(), pos, &mut lent) else {
+         return;
+     };
++    let changed = event.subject.with_view(|mut view| {
++        let mut changed = false;
++        for (slot, stack) in lent.items.iter().enumerate() {
++            if before_items.get(slot) != Some(stack) {
++                changed |= view.set_item_slot(slot as u32, stack.clone()).unwrap_or(false);
++            }
++        }
++        view.set_data_slots(&lent.data);
++        for (key, value) in lent.nbt.iter() {
++            if before_nbt.get(key) != Some(value) {
++                changed |= view.set_nbt(key.clone(), Some(value.clone()));
++            }
++        }
++        changed
++    });
++    if changed == Some(true) {
++        let _ = handle.set_changed(event.subject.host());
++    }
++    if sync {
++        event.subject.host().block_entity_sync(pos);
++    }
++}
++
++/// One tick on the lent state. `Some(true)` when clients need the block entity again.
++fn tick_lent(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut Lent) -> Option<bool> {
++    let level = host.level(host.dimension())?;
+     let dimension = host.dimension().to_owned();
+-    let entity = &mut *event.entity;
+     if entity.items.len() < rules::SLOTS {
+         entity.items.resize(rules::SLOTS, None);
+     }
+@@ -359,15 +410,14 @@ fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+     ];
+     // What clients draw changes with the target and with working or not.
+     let working = |d: &[i32]| d.first() == Some(&0);
+-    if broke || working(&data) != working(&entity.data) || was.as_ref().is_none_or(|w| w.side != quarry.side) {
+-        host.block_entity_sync(pos);
+-    }
++    let sync = broke || working(&data) != working(&entity.data) || was.as_ref().is_none_or(|w| w.side != quarry.side);
+     if entity.data != data {
+         entity.data = data;
+     }
+     if was.as_ref() != Some(&quarry) {
+         store(&mut entity.nbt, &quarry);
+     }
++    Some(sync)
+ }
+ 
+ // ---- the menu ------------------------------------------------------------------
+@@ -391,13 +441,68 @@ impl MenuPart for QuarryMenu {
+         match event.slot {
+             0 => event.may_place = upgrade.is_none() && burn_time(host, event.stack) > 0,
+             1..5 => {
+-                let main = event.context.slots.first().map_or(&[][..], Vec::as_slice);
+-                event.may_place = upgrade.is_some_and(|kind| rules::accepts(&upgrade_slots(main), event.slot - 1, kind));
++                let main: Vec<Option<ItemStack>> =
++                    (0..rules::SLOTS).map(|slot| event.context.slot(MenuContainer::Main, slot)).collect();
++                event.may_place = upgrade.is_some_and(|kind| rules::accepts(&upgrade_slots(&main), event.slot - 1, kind));
+                 event.max_stack = 1;
+             }
+             _ => event.may_place = false,
+         }
+     }
++
++    fn menu_button_valid(&self, _: &dyn Host, event: &mut MenuButtonValidEvent<'_>) -> Flow {
++        if event.id == TOGGLE { Flow::Cancel } else { Flow::Continue }
++    }
++
++    fn menu_button(&self, event: &mut MenuButtonEvent<'_>) {
++        if event.context.id != TOGGLE {
++            return;
++        }
++        event.subject.with_view(|mut view| {
++            if let Some(mut quarry) = load(view.nbt()) {
++                quarry.on = !quarry.on;
++                let mut nbt = Compound::new();
++                store(&mut nbt, &quarry);
++                for (key, value) in nbt.iter() {
++                    view.set_nbt(key.clone(), Some(value.clone()));
++                }
++            }
++        });
++    }
++}
++
++/// The quarry's screen, one per opening of its menu.
++pub(crate) fn screen(_: &dyn ClientHost, _: mod_api::MenuScreenOpen<'_>) -> Option<MenuScreen> {
++    // tools/make_textures.py draws the frames in the same places; the slots past this list are
++    // hidden, and the server's menu leaves them out.
++    let slot = |position: [f32; 2]| Some(ScreenSlot { position, no_item_icon: None });
++    let layout = MenuScreenLayout {
++        width: 176.0,
++        height: 166.0,
++        slots: vec![
++            slot([17.0, 35.0]),
++            slot([62.0, 35.0]),
++            slot([80.0, 35.0]),
++            slot([98.0, 35.0]),
++            slot([116.0, 35.0]),
++        ],
++        inventory_y: 84.0,
++        inventory_x: 8.0,
++        own_labels: true,
++        own_background: true,
++        recipe_book: None,
++        recipe_book_toggle: None,
++        ..MenuScreenLayout::default()
++    };
++    Some(
++        MenuScreen::new(layout)
++            .with_draw(|host, frame, draw| screen_draw(host, &frame, draw))
++            .with_click(|_, frame, right| {
++                let [bx, by, bw, bh] = BUTTON;
++                let [ax, ay] = frame.at;
++                (!right && (bx..bx + bw).contains(&ax) && (by..by + bh).contains(&ay)).then_some(TOGGLE)
++            }),
++    )
+ }
+ 
+ // ---- the screen ----------------------------------------------------------------
+@@ -405,12 +510,11 @@ impl MenuPart for QuarryMenu {
+ /// A language line with its `%s` filled in, in the player's language.
+ fn tr(host: &dyn ClientHost, key: &str, args: &[String]) -> String {
+     let text = Text::translate(key, args.iter().map(|a| Text::literal(a.clone())).collect());
+-    host.text_string(&text).unwrap_or_else(|_| key.to_owned())
++    host.text_string(&text)
+ }
+ 
+-fn screen_draw(host: &dyn ClientHost, event: &mut ScreenDrawEvent<'_>) {
++fn screen_draw(host: &dyn ClientHost, event: &MenuScreenFrame<'_>, draw: &mut dyn mod_api::DrawContext) {
+     let [x, y] = event.origin;
+-    let draw = &mut *event.draw;
+     draw.sprite("deepbore_quarry:gui/quarry", [0.0, 0.0, 176.0, 166.0], [x, y, 176.0, 166.0], None);
+     const LABEL: u32 = 0x40_4040;
+     let get = |i: usize| event.data.get(i).copied().unwrap_or(0);
+@@ -594,49 +698,8 @@ impl BlockEntityPart for Quarry {
+         event.ticks = true;
+     }
+ 
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        tick(host, event);
+-    }
+-
+-    fn menu_button(&self, _: &mut dyn ServerHost, event: &mut MenuButtonEvent<'_>) {
+-        if event.context.id == TOGGLE
+-            && let Some(mut quarry) = load(&event.entity.nbt)
+-        {
+-            quarry.on = !quarry.on;
+-            store(&mut event.entity.nbt, &quarry);
+-        }
+-    }
+-
+-    fn screen(&self, _: &dyn Host, _: &mut ScreenEvent<'_>) -> Option<Screen> {
+-        // tools/make_textures.py draws the frames in the same places; the slots past this list are
+-        // hidden, and the server's menu leaves them out.
+-        Some(Screen {
+-            width: 176.0,
+-            height: 166.0,
+-            slots: vec![
+-                Some([17.0, 35.0]),
+-                Some([62.0, 35.0]),
+-                Some([80.0, 35.0]),
+-                Some([98.0, 35.0]),
+-                Some([116.0, 35.0]),
+-            ],
+-            inventory_y: 84.0,
+-            inventory_x: 8.0,
+-            own_labels: true,
+-            own_background: true,
+-            recipe_book: None,
+-            recipe_book_toggle: None,
+-        })
+-    }
+-
+-    fn screen_draw(&self, host: &dyn ClientHost, event: &mut ScreenDrawEvent<'_>) {
+-        screen_draw(host, event);
+-    }
+-
+-    fn screen_click(&self, _: &dyn ClientHost, event: &mut ScreenClickEvent<'_>) -> Option<i32> {
+-        let [bx, by, bw, bh] = BUTTON;
+-        let [ax, ay] = event.at;
+-        (!event.right && (bx..bx + bw).contains(&ax) && (by..by + bh).contains(&ay)).then_some(TOGGLE)
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        tick(event);
+     }
+ 
+     fn block_entity_update_tag(&self, event: &mut BlockEntityUpdateTagEvent<'_>) -> Option<Compound> {
+diff --git a/src/world.rs b/src/world.rs
+index 5a5a4c0..a66488c 100644
+--- a/src/world.rs
++++ b/src/world.rs
+@@ -3,7 +3,7 @@
+ 
+ use crate::{keys, rules};
+ use mod_api::{
+-    Block, BlockProperties, Command, CommandArgumentValue, Flow, Item, Rarity, RunModCommandEvent,
++    Block, BlockProperties, Command, CommandArgumentValue, Flow, Item, Rarity,
+     ServerHost, Text, TicketOwner, ValidateTicketsEvent, text::TextStyle,
+ };
+ use rules::store;
+@@ -295,7 +295,7 @@ pub(crate) fn logged_in(host: &mut dyn ServerHost, player: u128) {
+ 
+ /// The quarry. A furnace is its template: it opens a menu when used, and its `facing` is the side
+ /// towards the player who placed it.
+-pub(crate) fn blocks(blocks: &mut Vec<Block>) {
++pub(crate) fn blocks(blocks: &mut mod_api::BlocksEvent<'_>) {
+     let mut block = Block::new(rules::BLOCK, "minecraft:furnace").with_item(true);
+     block.properties = BlockProperties {
+         hardness: Some(3.5),
+@@ -304,21 +304,21 @@ pub(crate) fn blocks(blocks: &mut Vec<Block>) {
+         sounds: Some("minecraft:netherite_block".into()),
+         ..Default::default()
+     };
+-    blocks.push(block);
++    let _ = blocks.register(block);
+ }
+ 
+-pub(crate) fn items(items: &mut Vec<Item>) {
++pub(crate) fn items(items: &mut mod_api::ItemsEvent<'_>) {
+     for id in crate::UPGRADES {
+         let mut item = Item::new(id, "minecraft:paper");
+         item.max_stack_size = Some(16);
+         item.rarity = Some(Rarity::Uncommon);
+-        items.push(item);
++        let _ = items.register(item);
+     }
+ }
+ 
+-pub(crate) fn commands(commands: &mut Vec<Command>) {
+-    commands.push(Command::op("deepbore maxsize", 2));
+-    commands.push(Command::op("deepbore maxsize <size:text>", 2));
++pub(crate) fn commands(commands: &mut Vec<mod_api::CommandRegistration>) {
++    commands.push(Command::op("deepbore maxsize", 2).executes(run));
++    commands.push(Command::op("deepbore maxsize <size:text>", 2).executes(run));
+ }
+ 
+ fn size_line(side: i32) -> Text {
+@@ -326,11 +326,15 @@ fn size_line(side: i32) -> Text {
+     Text::translate("deepbore_quarry.maxsize.set", vec![n.clone(), n])
+ }
+ 
+-pub(crate) fn command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>) -> Flow {
+-    if event.command.literals.first().map(String::as_str) != Some("deepbore") {
++fn run(host: &mut dyn ServerHost, _: &mod_api::CommandSource, command: &mod_api::CommandInvocation) -> Option<i32> {
++    matches!(self::command(host, command), Flow::Cancel).then_some(1)
++}
++
++pub(crate) fn command(host: &mut dyn ServerHost, command: &mod_api::CommandInvocation) -> Flow {
++    if command.literals.first().map(String::as_str) != Some("deepbore") {
+         return Flow::Continue;
+     }
+-    let size = match event.command.argument("size") {
++    let size = match command.argument("size") {
+         Some(CommandArgumentValue::String(size)) => Some(size),
+         _ => None,
+     };
+@@ -338,7 +342,7 @@ pub(crate) fn command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<
+         return Flow::Cancel;
+     };
+     let st = guard.as_mut().expect("opened");
+-    let reply = match (event.command.literals.get(1).map(String::as_str), size) {
++    let reply = match (command.literals.get(1).map(String::as_str), size) {
+         (Some("maxsize"), Some(arg)) => match rules::parse_max_side(&arg) {
+             Some(side) => {
+                 st.config.max_side = side;

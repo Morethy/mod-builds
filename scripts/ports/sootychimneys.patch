@@ -1,0 +1,43 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index cbf40dc..9509048 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -147,7 +147,7 @@ fn lock() -> std::sync::MutexGuard<'static, State> {
+ }
+ 
+ fn block_id(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> String {
+-    level.block(host, pos).map(|k| k.id(host)).unwrap_or_default()
++    level.block(host, pos).and_then(|k| k.id(host)).unwrap_or_default().to_owned()
+ }
+ 
+ /// The chimney block entity: its server tick.
+@@ -168,8 +168,9 @@ impl BlockEntityPart for Chimney {
+         }
+     }
+ 
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        let pos = event.pos;
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        let Some(pos) = event.subject.with_view(|view| view.position()) else { return };
++        let host = event.subject.host();
+         let dim = host.dimension();
+         let Some(level) = host.level(dim) else { return };
+         let block = block_id(&*host, level, pos);
+@@ -294,7 +295,7 @@ fn use_chimney(host: &mut dyn ServerHost, event: &RightClickBlockEvent<'_>) -> b
+             }
+             let pitch = 0.85 + lock().float() * 0.05;
+             let sound = if blocked { "minecraft:block.iron_trapdoor.open" } else { "minecraft:block.iron_trapdoor.close" };
+-            level.play_sound(host, sound, center, SoundSource::Blocks, 0.8, pitch);
++            level.play_sound(host, sound, center, SoundSource::Blocks, 0.8, pitch, None);
+             if let Some(player) = player {
+                 let key = if blocked { "message.sootychimneys.open" } else { "message.sootychimneys.blocked" };
+                 let _ = player.action_bar(host, Text::translate(key, vec![]));
+@@ -327,7 +328,7 @@ fn use_chimney(host: &mut dyn ServerHost, event: &RightClickBlockEvent<'_>) -> b
+                 LivingRef::new(player.entity()).hurt_and_break(host, slot, 1);
+                 let _ = player.trigger_item_used_on_block(host, at, &tool);
+             }
+-            level.play_sound(host, "minecraft:item.axe.scrape", center, SoundSource::Blocks, 1.0, 1.0);
++            level.play_sound(host, "minecraft:item.axe.scrape", center, SoundSource::Blocks, 1.0, 1.0, None);
+             true
+         }
+     }

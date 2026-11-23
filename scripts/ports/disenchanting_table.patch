@@ -1,0 +1,298 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 53229a4..6cb868d 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -17,8 +17,8 @@
+ use std::sync::Arc;
+ 
+ use mod_api::{
+-    self, Command, CommandSource, Flow, Hooks, RegisterCommandsEvent, Registrar,
+-    RegistrationContext, RunModCommandEvent, ServerHost, ServerTickEvent, ServerTickPhase, Text,
++    self, Command, CommandInvocation, CommandSource, Hooks, RegisterCommandsEvent, Registrar,
++    RegistrationContext, ServerHost, ServerTickEvent, ServerTickPhase, Text,
+ };
+ 
+ use crate::runtime::TABLE_MENU;
+@@ -55,7 +55,7 @@ impl Hooks for Mod {
+         registrar.block_container(&block, table::container());
+         let kind = table::declare(registrar);
+         if let Err(error) = registrar.block_entity_part(&kind, TablePart) {
+-            context.refuse(&error.to_string());
++            registrar.refuse(&error.to_string());
+         }
+         registrar.block_part(
+             block,
+@@ -64,6 +64,9 @@ impl Hooks for Mod {
+             },
+         );
+         registrar.menu_part(TABLE_MENU, MenuRulesPart);
++        if let Err(error) = registrar.register_menu_screen(TABLE_MENU, Arc::new(table::screen)) {
++            registrar.refuse(&error);
++        }
+     }
+ 
+     /// The end of a running tick: run the experience charges the clicks queued.
+@@ -81,34 +84,35 @@ impl Hooks for Mod {
+     /// `/disenchanting_table info <x> <y> <z>`: the harness readout. Upstream
+     /// has no command; the usage is the one the retired bundle registered.
+     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+-        event.commands.push(Command::op(INFO_USAGE, INFO_LEVEL));
++        event.commands
++            .push(Command::op(INFO_USAGE, INFO_LEVEL).executes(run_info));
+     }
++}
+ 
+-    /// The readout body: the dispatcher resolves `<pos>`, so this only reads the
+-    /// table and answers.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        let literals: Vec<&str> = event.command.literals.iter().map(String::as_str).collect();
+-        if literals.as_slice() != ["disenchanting_table", "info"] {
+-            return Flow::Continue;
+-        }
+-        let Some(pos) = table::block_pos(event.command.argument("pos")) else {
+-            let _ = host.commands().feedback(Text::literal(
+-                "usage: /disenchanting_table info <x> <y> <z>",
+-            ));
+-            return Flow::Cancel;
+-        };
+-        let player = match event.source {
+-            CommandSource::Player { player, .. } => Some(*player),
+-            _ => None,
+-        };
+-        let line = table::readout(host, pos, player);
+-        let _ = host.commands().feedback(Text::literal(line));
+-        Flow::Cancel
++/// The readout body: the dispatcher resolves `<pos>`, so this only reads the
++/// table and answers.
++fn run_info(
++    host: &mut dyn ServerHost,
++    source: &CommandSource,
++    command: &CommandInvocation,
++) -> Option<i32> {
++    let literals: Vec<&str> = command.literals.iter().map(String::as_str).collect();
++    if literals.as_slice() != ["disenchanting_table", "info"] {
++        return None;
+     }
++    let Some(pos) = table::block_pos(command.argument("pos")) else {
++        let _ = host.commands().feedback(Text::literal(
++            "usage: /disenchanting_table info <x> <y> <z>",
++        ));
++        return Some(1);
++    };
++    let player = match source {
++        CommandSource::Player { player, .. } => Some(*player),
++        _ => None,
++    };
++    let line = table::readout(host, pos, player);
++    let _ = host.commands().feedback(Text::literal(line));
++    Some(1)
+ }
+ 
+ #[cfg(test)]
+diff --git a/src/table.rs b/src/table.rs
+index 16bcb47..6ca5a64 100644
+--- a/src/table.rs
++++ b/src/table.rs
+@@ -13,7 +13,8 @@ use mod_api::{
+     BlockClick, BlockEntityEvent, BlockEntityPart, BlockEntityRef, BlockEntityTypeKey, BlockPart,
+     ClientHost, CommandArgumentValue, ComponentId, Compound, Host, HostTransaction, Identifier,
+     InteractionResult, ItemResource, ItemStack, LevelRef, LevelSide, MenuPart, MenuSlotRulesEvent,
+-    ModContainer, PlayerRef, Registrar, Screen, ScreenDrawEvent, ScreenEvent, ServerHost, Tag,
++    MenuScreen, MenuScreenLayout, MenuScreenOpen, ModContainer, PlayerRef, Registrar, ScreenSlot,
++    ServerHost, Tag,
+     Text, UseItemOnEvent, UseWithoutItemEvent,
+ };
+ 
+@@ -66,6 +67,7 @@ pub(crate) fn container() -> ModContainer {
+         inputs: vec![INPUT_SLOT, BOOK_SLOT],
+         outputs: vec![INPUT_SLOT, OUTPUT_SLOT],
+         menu: Some(TABLE_MENU.to_owned()),
++        insert_rules: Vec::new(),
+     }
+ }
+ 
+@@ -74,19 +76,39 @@ pub(crate) fn container() -> ModContainer {
+ ///
+ /// The jar's GUI texture is carried but not drawn: Horizon's plain panel and
+ /// slot frames are used (a gap, see `notes.md`).
+-pub(crate) fn menu() -> Screen {
+-    Screen {
++pub(crate) fn menu() -> MenuScreenLayout {
++    let slot = |position: [f32; 2]| {
++        Some(ScreenSlot {
++            position,
++            no_item_icon: None,
++        })
++    };
++    MenuScreenLayout {
+         width: 176.0,
+         height: 166.0,
+-        slots: vec![Some([27.0, 47.0]), Some([76.0, 47.0]), Some([134.0, 47.0])],
++        slots: vec![slot([27.0, 47.0]), slot([76.0, 47.0]), slot([134.0, 47.0])],
+         inventory_y: 84.0,
+         inventory_x: 8.0,
+         own_labels: false,
+         own_background: false,
+-        ..Screen::default()
++        ..MenuScreenLayout::default()
+     }
+ }
+ 
++/// The table's screen, one per opening of its menu: the three-slot layout and
++/// the cost under the book slot.
++pub(crate) fn screen(_host: &dyn ClientHost, _open: MenuScreenOpen<'_>) -> Option<MenuScreen> {
++    Some(MenuScreen::new(menu()).with_draw(|_host, frame, draw| {
++        let cost = match charge(DEFAULT_SETTINGS, false) {
++            Charge::Points(points) => format!("{points} XP"),
++            Charge::Levels(levels) => format!("{levels} levels"),
++            Charge::Nothing => "free".to_owned(),
++        };
++        let [x, y] = frame.origin;
++        draw.text(&cost, [x + 8.0, y + 68.0], 0xFF40_4040, false);
++    }))
++}
++
+ // ---------------------------------------------------------------------------
+ // Enchantments: reading a stack, writing a component
+ // ---------------------------------------------------------------------------
+@@ -107,7 +129,7 @@ fn enchantment_component(item: &str) -> &'static str {
+ /// default) and accepts the pre-1.21.5 `{levels: {…}}` wrapper the engine still
+ /// reads, so an item carried from an older world dis-enchants too.
+ fn levels_of(host: &dyn Host, stack: &ItemStack) -> Vec<(String, u32)> {
+-    let item = stack.item().id(host);
++    let item = stack.item().id(host).unwrap_or_default().to_owned();
+     let Some(component) = ComponentId::new(enchantment_component(&item)) else {
+         return Vec::new();
+     };
+@@ -231,7 +253,7 @@ impl InputIdentity {
+         let mut levels = levels_of(host, stack);
+         levels.sort();
+         Self {
+-            item: stack.item().id(host),
++            item: stack.item().id(host).unwrap_or_default().to_owned(),
+             levels,
+         }
+     }
+@@ -313,7 +335,7 @@ pub(crate) fn disenchant(
+     // The book slot must hold an actual book, not merely nothing: a hopper can
+     // put anything in, and the take spends whatever sits there.
+     let book = slots.book?;
+-    if !is_book(&book.item().id(&*host)) {
++    if !is_book(&book.item().id(&*host).unwrap_or_default().to_owned()) {
+         return None;
+     }
+     let input = slots.input?;
+@@ -322,7 +344,7 @@ pub(crate) fn disenchant(
+         .iter()
+         .map(|(id, level)| (id.as_str(), *level))
+         .collect();
+-    let plan = plan_take(&input.item().id(&*host), &view)?;
++    let plan = plan_take(&input.item().id(&*host).unwrap_or_default().to_owned(), &view)?;
+     // Bound now, so the charged tick can refuse if the slot changed in between.
+     let identity = InputIdentity::of(&*host, &input);
+     let moved = match &plan {
+@@ -344,7 +366,7 @@ pub(crate) fn disenchant(
+     match cost {
+         // Paid in points: charge first, next tick, then hand the result over.
+         Charge::Points(points) => {
+-            let name = player.name(&*host)?;
++            let name = player.name(&*host)?.to_owned();
+             charges.reserve(player.uuid(), points);
+             charges.queue(PendingTake {
+                 name,
+@@ -352,6 +374,7 @@ pub(crate) fn disenchant(
+                 dimension: level
+                     .dimension()
+                     .id(&*host)
++                    .map(str::to_owned)
+                     .unwrap_or_else(|| host.dimension().to_owned()),
+                 pos: click.pos,
+                 plan,
+@@ -396,7 +419,7 @@ fn finish(
+         let Some(block) = level.block(&*host, pos) else {
+             return Ok(false);
+         };
+-        if !crate::runtime::is_table(&block.id(&*host)) {
++        if !crate::runtime::is_table(&block.id(&*host).unwrap_or_default().to_owned()) {
+             return Ok(false);
+         }
+         let Some(entity) = host.block_entity(level, pos) else {
+@@ -421,11 +444,11 @@ fn finish(
+         // the tick between the click and the charge may have put something else
+         // there.
+         let Some(book) =
+-            book.filter(|stack| stack.count() > 0 && is_book(&stack.item().id(&*host)))
++            book.filter(|stack| stack.count() > 0 && is_book(&stack.item().id(&*host).unwrap_or_default().to_owned()))
+         else {
+             return Ok(false);
+         };
+-        let item = input.item().id(&*host);
++        let item = input.item().id(&*host).unwrap_or_default().to_owned();
+         // The deferred take is bound to what the click saw. A changed input would
+         // otherwise get the old item's enchantments on a book while the original
+         // stayed intact.
+@@ -512,7 +535,7 @@ pub(crate) fn readout(
+     };
+     let block = level
+         .block(&*host, pos)
+-        .map_or_else(|| "minecraft:air".to_owned(), |block| block.id(&*host));
++        .map_or_else(|| "minecraft:air".to_owned(), |block| block.id(&*host).unwrap_or_default().to_owned());
+     if !crate::runtime::is_table(&block) {
+         return format!("{block}: not a dis-enchanting table");
+     }
+@@ -543,14 +566,14 @@ pub(crate) fn readout(
+                 .iter()
+                 .map(|(id, level)| (id.as_str(), *level))
+                 .collect();
+-            crate::runtime::can_disenchant(&input.item().id(&*host), &view)
++            crate::runtime::can_disenchant(&input.item().id(&*host).unwrap_or_default().to_owned(), &view)
+         })
+         && slots
+             .book
+             .as_ref()
+-            .is_some_and(|book| is_book(&book.item().id(&*host)));
++            .is_some_and(|book| is_book(&book.item().id(&*host).unwrap_or_default().to_owned()));
+     let name = |stack: Option<&ItemStack>| {
+-        stack.map_or_else(|| "none".to_owned(), |stack| stack.item().id(&*host))
++        stack.map_or_else(|| "none".to_owned(), |stack| stack.item().id(&*host).unwrap_or_default().to_owned())
+     };
+     let enchantments = |stack: Option<&ItemStack>| {
+         stack.map_or_else(
+@@ -631,24 +654,6 @@ impl BlockEntityPart for TablePart {
+     ) -> Option<Compound> {
+         Some(Compound::new())
+     }
+-
+-    /// The table's three-slot layout on an open menu.
+-    fn screen(&self, _host: &dyn Host, _event: &mut ScreenEvent<'_>) -> Option<Screen> {
+-        Some(menu())
+-    }
+-
+-    /// The cost under the book slot.
+-    fn screen_draw(&self, _host: &dyn ClientHost, event: &mut ScreenDrawEvent<'_>) {
+-        let cost = match charge(DEFAULT_SETTINGS, false) {
+-            Charge::Points(points) => format!("{points} XP"),
+-            Charge::Levels(levels) => format!("{levels} levels"),
+-            Charge::Nothing => "free".to_owned(),
+-        };
+-        let [x, y] = event.origin;
+-        event
+-            .draw
+-            .text(&cost, [x + 8.0, y + 68.0], 0xFF40_4040, false);
+-    }
+ }
+ 
+ /// The click: a right click with a hand, either empty or full.
+@@ -684,7 +689,7 @@ pub(crate) struct MenuRulesPart;
+ #[mod_api::sunrise_part]
+ impl MenuPart for MenuRulesPart {
+     fn menu_slot_rules(&self, host: &dyn Host, event: &mut MenuSlotRulesEvent<'_>) {
+-        let item = event.stack.item().id(host);
++        let item = event.stack.item().id(host).unwrap_or_default().to_owned();
+         let levels = levels_of(host, event.stack);
+         let view: Vec<(&str, u32)> = levels
+             .iter()

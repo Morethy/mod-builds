@@ -1,0 +1,35 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 7efaed8..b15db65 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -250,7 +250,7 @@ struct Mod {
+ 
+ fn read_block(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> Block {
+     Block {
+-        name: level.block(host, pos).map(|k| k.id(host)).unwrap_or_default(),
++        name: level.block(host, pos).and_then(|k| k.id(host)).unwrap_or_default().to_owned(),
+         distance: level.block_property(host, pos, "distance").and_then(|d| d.parse().ok()),
+         persistent: level.block_property(host, pos, "persistent").as_deref() == Some("true"),
+     }
+@@ -271,8 +271,10 @@ impl Hooks for Mod {
+         if player.entity().is_shift_key_down(host) == Some(true) {
+             return Flow::Continue;
+         }
+-        let Some(held) = LivingRef::new(player.entity()).hand_item(host, Hand::Main) else { return Flow::Continue };
+-        let item = held.item().id(host);
++        let Some(held) = LivingRef::new(player.entity()).with_hand_item(host, Hand::Main, |held| held.item()) else {
++            return Flow::Continue;
++        };
++        let item = held.id(host).unwrap_or_default().to_owned();
+         if !is_axe(&item) {
+             return Flow::Continue;
+         }
+@@ -283,7 +285,7 @@ impl Hooks for Mod {
+         let Some(tree) = find_tree(event.pos, &read) else { return Flow::Continue };
+         let axe = matches!(mode, Some(GameMode::Survival)).then_some(item);
+         let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+-        queue.push(Felling { dimension: dim.to_string(), player: name, origin: event.pos, tree, axe });
++        queue.push(Felling { dimension: dim.to_string(), player: name.to_owned(), origin: event.pos, tree, axe });
+         Flow::Continue
+     }
+ 

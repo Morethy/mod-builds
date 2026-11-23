@@ -1,0 +1,56 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index a912108..0b5077b 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -30,7 +30,7 @@ use std::sync::OnceLock;
+ use mod_api::{
+     self, AttributeModifier, AttributeOperation, ConfigFileError, ConfigFiles, ConfigPath,
+     EquipmentSlot, Flow, Hand, Hooks, HostSide, Identifier, InteractionResult, ItemKey, ItemPart,
+-    LevelRandomHost, LivingIncomingDamageEvent, ModifierLifetime, PlayerLoggedOutEvent, PlayerRef,
++    HitHost, LivingIncomingDamageEvent, ModifierLifetime, PlayerLoggedOutEvent, PlayerRef,
+     PlayerTickPostEvent, Registrar, RegistrationContext, ServerAboutToStartEvent, ServerHost,
+     UseItemEvent,
+ };
+@@ -151,7 +151,7 @@ impl Hooks for Mod {
+     /// does here — no damage, hurt sound, knockback, cooldown or statistics.
+     fn living_incoming_damage(
+         &self,
+-        _level: &mut dyn LevelRandomHost,
++        _level: &mut dyn HitHost,
+         event: &mut LivingIncomingDamageEvent<'_>,
+     ) -> Flow {
+         if event.cancelled {
+@@ -195,7 +195,9 @@ impl ItemPart for ArtifactPart {
+         let artifact = ids.artifact(event.stack.item())?;
+         let player = host.player(event.player)?;
+         let living = host.living(player.entity())?;
+-        let off_hand_occupied = living.equipment(&*host, EquipmentSlot::OffHand).is_some();
++        let off_hand_occupied = living
++            .with_equipment(&*host, EquipmentSlot::OffHand, |_| ())
++            .is_some();
+         if !runtime::equips_from_use(artifact.item_id(), off_hand_occupied) {
+             return None;
+         }
+@@ -238,13 +240,15 @@ fn load_config(files: &dyn ConfigFiles) -> runtime::ServerConfig {
+ /// The artifacts one server player wears: the off hand only, so the same artifact carried in
+ /// the main inventory or worn in an armour slot grants nothing (`runtime::is_worn_slot`).
+ fn worn(host: &mut dyn ServerHost, ids: &Ids, player: PlayerRef) -> runtime::Loadout {
+-    let Some(slots) = player.inventory_slots(host) else {
+-        return runtime::Loadout::new();
+-    };
+-    runtime::worn_from_slots(slots.into_iter().filter_map(|(slot, stack)| {
+-        ids.artifact(stack.item())
+-            .map(|artifact| (slot, artifact, stack.count()))
+-    }))
++    let host: &dyn ServerHost = host;
++    player
++        .with_inventory(host, |view| {
++            runtime::worn_from_slots(view.iter().filter_map(|(slot, stack)| {
++                ids.artifact(stack.item())
++                    .map(|artifact| (slot, artifact, stack.count()))
++            }))
++        })
++        .unwrap_or_else(runtime::Loadout::new)
+ }
+ 
+ /// Set or remove each artifact's attribute modifier. The pin's modifiers are transient and

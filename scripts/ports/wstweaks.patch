@@ -1,0 +1,50 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index d98506f..22f7031 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -25,7 +25,7 @@ use std::sync::OnceLock;
+ 
+ use mod_api::{
+     self, ConfigKind, ConfigLoadingEvent, EntityRef, EntityTypeKey, EquipmentSlot, Hooks, Host,
+-    HostSide, HurtEnemyEvent, ItemKey, ItemPart, ItemStack, LootDropsEvent, MobSpawnedEvent,
++    HurtEnemyEvent, ItemKey, ItemPart, ItemStack, LootDropsEvent, MobSpawnedEvent,
+     RandomSource, RegisterConfigsEvent, Registrar, RegistrationContext, ServerHost, SpawnReason,
+ };
+ 
+@@ -97,7 +97,7 @@ impl Hooks for Mod {
+ 
+     /// Register `config/wstweaks.toml` as this mod's server config: the game writes
+     /// `default` there when the file is missing (NeoForge's `registerConfig`), once per world.
+-    fn register_configs(&self, _host: HostSide, event: &mut RegisterConfigsEvent<'_>) {
++    fn register_configs(&self, _host: &dyn mod_api::ConfigContext, event: &mut RegisterConfigsEvent<'_>) {
+         let default = runtime::format_config(&runtime::Config::default());
+         event.configs.push(
+             mod_api::Config::new(MOD_ID, ConfigKind::Server, &default).file(config::CONFIG_FILE),
+@@ -106,7 +106,7 @@ impl Hooks for Mod {
+ 
+     /// The game read a config: ours it is `wstweaks`, parse it. Every mod hears every config,
+     /// so the id is checked; `Client` and `Common` load once, `Server` before each world.
+-    fn config_loading(&self, _host: HostSide, event: &mut ConfigLoadingEvent<'_>) {
++    fn config_loading(&self, _host: &dyn mod_api::ConfigContext, event: &mut ConfigLoadingEvent<'_>) {
+         if event.config.mod_id == MOD_ID {
+             config::loaded(&event.config.text);
+         }
+@@ -129,9 +129,16 @@ impl Hooks for Mod {
+         let pos = event.pos;
+         let min = [pos[0] - 1.0, pos[1] - 1.0, pos[2] - 1.0];
+         let max = [pos[0] + 1.0, pos[1] + 1.0, pos[2] + 1.0];
+-        let Some(candidates) = level.entities_in(host, min, max) else {
++        let mut candidates = Vec::new();
++        if level
++            .visit_entities_in(host, min, max, &mut |entity| {
++                candidates.push(entity);
++                std::ops::ControlFlow::Continue(())
++            })
++            .is_err()
++        {
+             return;
+-        };
++        }
+         let Some(spawned) = nearest(candidates, ids, host, pos) else {
+             return;
+         };

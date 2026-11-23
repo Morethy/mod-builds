@@ -1,0 +1,251 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index d63b286..dc4b53c 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -28,8 +28,8 @@ mod support;
+ use std::sync::{Arc, Mutex};
+ 
+ use mod_api::{
+-    self, Flow, Hooks, HostSide, LevelTickPostEvent, RegisterCommandsEvent, Registrar,
+-    RegistrationContext, RunModCommandEvent, ServerHost,
++    self, Hooks, HostSide, LevelTickPostEvent, RegisterCommandsEvent, Registrar,
++    RegistrationContext, ServerHost,
+ };
+ 
+ use crate::support::{CONDUIT, ConduitPart, Queue};
+@@ -87,13 +87,4 @@ impl Hooks for Mod {
+     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+         support::declare_commands(event.commands);
+     }
+-
+-    /// Run the two usages [`Hooks::register_commands`] declares.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        support::run_command(host, event)
+-    }
+ }
+diff --git a/src/support.rs b/src/support.rs
+index 404ada0..8204aba 100644
+--- a/src/support.rs
++++ b/src/support.rs
+@@ -17,10 +17,10 @@
+ use std::collections::BTreeSet;
+ 
+ use mod_api::{
+-    BlockEntityPart, BlockEntityRef, BlockEntityTickEvent, BlockEntityTickReply,
++    BlockEntityPart, BlockEntityRef, BlockEntityTickEvent,
+     BlockEntityTicksEvent, BlockKey, BlockPart, BlockUpdateFlags, Capability, Command,
+-    CommandArgumentValue, Compound, Direction, Flow, Host, HostTransaction, ITEMS, ItemResource,
+-    LevelRef, ResourceHandler, RunModCommandEvent, ServerHost, Tag, Text, move_resources,
++    CommandArgumentValue, CommandInvocation, Compound, Direction, Host, HostTransaction, ITEMS, ItemResource,
++    LevelRef, ResourceHandler, ServerHost, Tag, Text, resource_util::move_resources,
+ };
+ 
+ use crate::runtime::{
+@@ -257,10 +257,13 @@ impl BlockEntityPart for ConduitPart {
+     }
+ 
+     /// One conduit tick: queue it for the level tick's end. A tick that reads the world and
+-    /// writes only block properties changes none of its own saved data, so it answers
+-    /// [`BlockEntityTickReply::Unchanged`] and does not dirty the chunk every tick.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        let Some(level) = in_place_level(host) else {
++    /// writes only block properties changes none of its own saved data, so it never marks
++    /// the chunk changed and does not dirty it every tick.
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        let Some(pos) = event.subject.with_view(|view| view.position()) else {
++            return;
++        };
++        let Some(level) = in_place_level(event.subject.host()) else {
+             return;
+         };
+         // Only this expression runs under the lock: one insert on the port's own state, which
+@@ -268,8 +271,7 @@ impl BlockEntityPart for ConduitPart {
+         self.queue
+             .lock()
+             .expect("the conduit queue lock is held for one insert")
+-            .push(level, event.pos);
+-        *event.reply = BlockEntityTickReply::Unchanged;
++            .push(level, pos);
+     }
+ }
+ 
+@@ -486,7 +488,7 @@ fn tick_network(
+             // The capability's own move, in a transaction: an item the target refuses stays in
+             // its slot and the next destination gets what is left of the cycle's budget.
+             let went = host
+-                .transaction(|host, tx| move_resources(host, &from, &to, |_| true, budget, tx))
++                .transaction(|host, tx| move_resources(host, &from, &to, |_| true, budget, Some(tx)))
+                 .unwrap_or(0);
+             budget -= went.min(budget);
+         }
+@@ -539,34 +541,39 @@ fn feedback(host: &mut dyn ServerHost, line: &str) {
+ /// level-0 registration let any player redirect another player's item transfers from any
+ /// distance. Upstream's own controls are its conduit screen and probe, which are not ported,
+ /// so both commands are operator diagnostics.
+-pub(crate) fn declare_commands(commands: &mut Vec<Command>) {
+-    commands.push(Command::op(
+-        "enderio config <pos:block_pos> <side:word> <option:word> <value:word>",
+-        2,
+-    ));
+-    commands.push(Command::op("enderio info <pos:block_pos>", 2));
++pub(crate) fn declare_commands(commands: &mut Vec<mod_api::CommandRegistration>) {
++    commands.push(
++        Command::op(
++            "enderio config <pos:block_pos> <side:word> <option:word> <value:word>",
++            2,
++        )
++        .executes(|host, _source, command| run_command(host, command)),
++    );
++    commands.push(
++        Command::op("enderio info <pos:block_pos>", 2)
++            .executes(|host, _source, command| run_command(host, command)),
++    );
+ }
+ 
+ /// The level a command runs in, after `execute in`.
+-fn command_level(host: &dyn ServerHost, event: &RunModCommandEvent<'_>) -> Option<LevelRef> {
++fn command_level(host: &dyn ServerHost, command: &CommandInvocation) -> Option<LevelRef> {
+     host.levels()
+         .list_levels()
+         .into_iter()
+-        .find(|level| level.dimension() == event.command.dimension)
++        .find(|level| level.dimension() == command.dimension)
+ }
+ 
+ /// Run the `/enderio` commands a player types.
+-pub(crate) fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>) -> Flow {
+-    let invocation = event.command;
++pub(crate) fn run_command(host: &mut dyn ServerHost, invocation: &CommandInvocation) -> Option<i32> {
+     let words: Vec<&str> = invocation.literals.iter().map(String::as_str).collect();
+     if words.first() != Some(&"enderio") {
+-        return Flow::Continue;
++        return None;
+     }
+     let Some(action) = words.get(1).copied() else {
+-        return Flow::Continue;
++        return None;
+     };
+     if !matches!(action, "info" | "config") {
+-        return Flow::Continue;
++        return None;
+     }
+     let usage = if action == "info" {
+         USAGE_INFO
+@@ -575,25 +582,25 @@ pub(crate) fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEv
+     };
+     let Some(CommandArgumentValue::BlockPos(pos)) = invocation.argument("pos") else {
+         feedback(host, usage);
+-        return Flow::Cancel;
++        return Some(1);
+     };
+     let pos = *pos;
+-    let Some(level) = command_level(host, event) else {
++    let Some(level) = command_level(host, invocation) else {
+         feedback(host, NO_CONDUIT);
+-        return Flow::Cancel;
++        return Some(1);
+     };
+     let Some(conduit) = host.block_key(CONDUIT) else {
+         feedback(host, NO_CONDUIT);
+-        return Flow::Cancel;
++        return Some(1);
+     };
+     if action == "info" {
+         let Some(entity) = conduit_at(host, level, pos, conduit) else {
+             feedback(host, NO_CONDUIT);
+-            return Flow::Cancel;
++            return Some(1);
+         };
+         let Some(data) = entity.data(host) else {
+             feedback(host, NO_CONDUIT);
+-            return Flow::Cancel;
++            return Some(1);
+         };
+         let config = read_config(&data);
+         let connected = face_list(|face| {
+@@ -609,33 +616,33 @@ pub(crate) fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEv
+             ),
+         );
+         feedback(host, &redstone_line(&config));
+-        return Flow::Cancel;
++        return Some(1);
+     }
+     let Some(CommandArgumentValue::String(side)) = invocation.argument("side") else {
+         feedback(host, USAGE_CONFIG);
+-        return Flow::Cancel;
++        return Some(1);
+     };
+     let Some(CommandArgumentValue::String(option)) = invocation.argument("option") else {
+         feedback(host, USAGE_CONFIG);
+-        return Flow::Cancel;
++        return Some(1);
+     };
+     let Some(CommandArgumentValue::String(value)) = invocation.argument("value") else {
+         feedback(host, USAGE_CONFIG);
+-        return Flow::Cancel;
++        return Some(1);
+     };
+     let Some(face) = face_named(&side.to_lowercase()) else {
+         feedback(
+             host,
+             &format!("Unknown side '{side}': down, up, north, south, west or east."),
+         );
+-        return Flow::Cancel;
++        return Some(1);
+     };
+     let option = option.to_lowercase();
+     let setting = match option.as_str() {
+         "insert" | "extract" | "round" | "round_robin" => {
+             let Some(on) = on_off(value) else {
+                 feedback(host, &format!("'{value}' is not on or off."));
+-                return Flow::Cancel;
++                return Some(1);
+             };
+             match option.as_str() {
+                 "insert" => Setting::Insert(on),
+@@ -652,7 +659,7 @@ pub(crate) fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEv
+                          active_without_signal or never_active."
+                     ),
+                 );
+-                return Flow::Cancel;
++                return Some(1);
+             };
+             Setting::Redstone(control)
+         }
+@@ -661,16 +668,16 @@ pub(crate) fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEv
+                 host,
+                 &format!("Unknown option '{other}': insert, extract, round or redstone."),
+             );
+-            return Flow::Cancel;
++            return Some(1);
+         }
+     };
+     let Some(entity) = conduit_at(host, level, pos, conduit) else {
+         feedback(host, NO_CONDUIT);
+-        return Flow::Cancel;
++        return Some(1);
+     };
+     let Some(mut data) = entity.data(host) else {
+         feedback(host, NO_CONDUIT);
+-        return Flow::Cancel;
++        return Some(1);
+     };
+     let config = setting.apply(read_config(&data), face);
+     write_config(&mut data, &config);
+@@ -678,10 +685,10 @@ pub(crate) fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEv
+     // path: the chunk is marked changed and clients get the block update.
+     if entity.replace_data(host, data).is_err() {
+         feedback(host, NO_CONDUIT);
+-        return Flow::Cancel;
++        return Some(1);
+     }
+     feedback(host, &set_line(face, &option, setting.value_text()));
+-    Flow::Cancel
++    Some(1)
+ }
+ 
+ #[cfg(test)]

@@ -1,0 +1,267 @@
+diff --git a/src/heat_generator.rs b/src/heat_generator.rs
+index d92119e..d2608bd 100644
+--- a/src/heat_generator.rs
++++ b/src/heat_generator.rs
+@@ -8,7 +8,7 @@
+ //! fuel slot, an output-only buffer), that the state written to the saved
+ //! compound reads back, and the exact line `/mekanismgenerators info` prints.
+ use mod_api::{
+-    self, BlockEntityEvent, BlockEntityPart, BlockEntityTickEvent, BlockEntityTickReply,
++    self, BlockEntityEvent, BlockEntityPart, BlockEntityTickEvent,
+     BlockEntityTicksEvent, BlockPart, Compound, Direction, ENERGY, Host, HostTransaction,
+     ItemStack, LevelRef, LevelSide, ModContainer, ModEnergyBuffer, ServerHost, Tag,
+ };
+@@ -57,6 +57,7 @@ pub(crate) fn container() -> ModContainer {
+         inputs: vec![FUEL_SLOT],
+         outputs: vec![FUEL_SLOT],
+         menu: None,
++        insert_rules: Vec::new(),
+     }
+ }
+ 
+@@ -159,7 +160,7 @@ impl Sight {
+ /// chest at that position is "No block entity there.", not a generator at 0 FE.
+ pub(crate) fn info_line(host: &mut dyn ServerHost, pos: [i32; 3]) -> Option<String> {
+     let level = host.level(host.dimension())?;
+-    let id = level.block(&*host, pos)?.id(&*host);
++    let id = level.block(&*host, pos)?.id(&*host).unwrap_or_default().to_owned();
+     if id != GENERATOR {
+         return None;
+     }
+@@ -169,7 +170,7 @@ pub(crate) fn info_line(host: &mut dyn ServerHost, pos: [i32; 3]) -> Option<Stri
+         .item_slot(&*host, FUEL_SLOT as u32)
+         .ok()
+         .flatten()
+-        .map(|stack| (stack.item().id(&*host), stack.count()));
++        .map(|stack| (stack.item().id(&*host).unwrap_or_default().to_owned(), stack.count()));
+     let sight = Sight {
+         id,
+         pos,
+@@ -191,7 +192,7 @@ pub(crate) fn info_line(host: &mut dyn ServerHost, pos: [i32; 3]) -> Option<Stri
+ /// foreign key in someone else's compound).
+ pub(crate) fn set_energy(host: &mut dyn ServerHost, pos: [i32; 3], amount: i32) -> Option<i32> {
+     let level = host.level(host.dimension())?;
+-    if level.block(&*host, pos)?.id(&*host) != GENERATOR {
++    if level.block(&*host, pos)?.id(&*host) != Some(GENERATOR) {
+         return None;
+     }
+     let entity = host.block_entity(level, pos)?;
+@@ -336,34 +337,54 @@ impl BlockEntityPart for HeatGeneratorPart {
+     /// run the generator's tick. The payload is left `Changed` only when
+     /// something moved, so an idle generator does not dirty its chunk every tick
+     /// (the retired bundle's `mark_modified` condition).
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        let pos = event.pos;
+-        let resized = event.entity.items.len() != SLOTS;
+-        if resized {
+-            event.entity.items.resize(SLOTS, None);
+-        }
+-        let mut saved = Tag::Compound(std::mem::take(&mut event.entity.nbt));
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        let Some((pos, handle, old_nbt, fuel)) = event.subject.with_view(|view| {
++            (
++                view.position(),
++                view.handle(),
++                view.nbt().clone(),
++                view.item_slot(FUEL_SLOT as u32)
++                    .and_then(|stack| stack.to_owned()),
++            )
++        }) else {
++            return;
++        };
++        let mut saved = Tag::Compound(old_nbt.clone());
+         let before = read(&saved);
+         let mut state = before;
+-        let mut fuel_used = false;
+-        if let Some(stack) = event.entity.items[FUEL_SLOT].clone()
+-            && state.accept_fuel(burn_time(host, &stack))
++        let mut fuel_after = None;
+         {
+-            event.entity.items[FUEL_SLOT] = consume(host, &stack);
+-            fuel_used = true;
+-        }
+-        let level = host.level(host.dimension());
+-        let tick = state.tick(environment(host, level, pos));
+-        // Upstream emits after the generator's own update, into the front side.
+-        if let Some(level) = level {
+-            emit_front(host, level, pos, &mut state);
+-        }
+-        write(&mut saved, &state, tick.produced, tick.burned_lava);
+-        if let Tag::Compound(nbt) = saved {
+-            event.entity.nbt = nbt;
++            let host = event.subject.host();
++            if let Some(stack) = fuel
++                && state.accept_fuel(burn_time(host, &stack))
++            {
++                fuel_after = Some(consume(host, &stack));
++            }
++            let level = host.level(host.dimension());
++            let tick = state.tick(environment(host, level, pos));
++            // Upstream emits after the generator's own update, into the front side.
++            if let Some(level) = level {
++                emit_front(host, level, pos, &mut state);
++            }
++            write(&mut saved, &state, tick.produced, tick.burned_lava);
+         }
+-        if !resized && !fuel_used && state == before {
+-            *event.reply = BlockEntityTickReply::Unchanged;
++        let fuel_used = fuel_after.is_some();
++        // The tick no longer commits a payload it was lent: write the fuel slot and the fields
++        // that moved back through the view, and mark the chunk unsaved as the reply did.
++        event.subject.with_view(|mut view| {
++            if let Some(stack) = fuel_after {
++                let _ = view.set_item_slot(FUEL_SLOT as u32, stack);
++            }
++            if let Tag::Compound(nbt) = saved {
++                for (key, value) in nbt.iter() {
++                    if old_nbt.get(key) != Some(value) {
++                        view.set_nbt(key.clone(), Some(value.clone()));
++                    }
++                }
++            }
++        });
++        if fuel_used || state != before {
++            let _ = handle.set_changed(event.subject.host());
+         }
+     }
+ }
+diff --git a/src/lib.rs b/src/lib.rs
+index 935b45b..ea6b48e 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -14,8 +14,8 @@
+ //! embedded-content helper has no successor: one `.hmod` carries the content and
+ //! the code, which is what that helper existed to work around.
+ use mod_api::{
+-    self, Command, CommandArgumentValue, CommandSource, Flow, Hooks, LevelRef,
+-    RegisterCommandsEvent, Registrar, RegistrationContext, RunModCommandEvent, ServerHost, Text,
++    self, Command, CommandArgumentValue, CommandInvocation, CommandSource, Flow, Hooks, LevelRef,
++    RegisterCommandsEvent, Registrar, RegistrationContext, ServerHost, Text,
+ };
+ 
+ mod heat_generator;
+@@ -65,13 +65,13 @@ impl Hooks for Mod {
+     /// shared output and had to be careful to leave a foreign block's entry
+     /// alone (the PR #674 review's [P1]). A declaration is keyed by the block, so
+     /// that hazard cannot recur: another mod's block is another key.
+-    fn register(&self, registrar: &mut dyn Registrar, context: &RegistrationContext) {
++    fn register(&self, registrar: &mut dyn Registrar, _context: &RegistrationContext) {
+         let block = registrar.block_key(heat_generator::GENERATOR);
+         registrar.block_container(&block, heat_generator::container());
+         registrar.block_energy(&block, heat_generator::battery());
+         let kind = heat_generator::declare(registrar);
+         if let Err(error) = registrar.block_entity_part(&kind, heat_generator::HeatGeneratorPart) {
+-            context.refuse(&error.to_string());
++            registrar.refuse(&error.to_string());
+         }
+     }
+ 
+@@ -80,54 +80,65 @@ impl Hooks for Mod {
+     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+         event
+             .commands
+-            .push(Command::new("mekanismgenerators info <pos:block_pos>"));
++            .push(Command::new("mekanismgenerators info <pos:block_pos>").executes(run_command));
+         event.commands.push(Command::op(
+             "mekanismgenerators energy <amount:integer> <pos:block_pos>",
+             2,
+-        ));
++        ).executes(run_command));
+     }
++}
++
++/// The command bodies. `info` prints the generator, `energy` sets its stored
++/// FE; the arguments are parsed and resolved by the server's dispatcher, so
++/// this only reads the block entity and answers.
++fn run_command(
++    host: &mut dyn ServerHost,
++    source: &CommandSource,
++    command: &CommandInvocation,
++) -> Option<i32> {
++    match run_mod_command(host, source, command) {
++        Flow::Cancel => Some(1),
++        _ => None,
++    }
++}
+ 
+-    /// The command bodies. `info` prints the generator, `energy` sets its stored
+-    /// FE; the arguments are parsed and resolved by the server's dispatcher, so
+-    /// this only reads the block entity and answers.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        let literals: Vec<&str> = event.command.literals.iter().map(String::as_str).collect();
+-        let Some(CommandArgumentValue::BlockPos(pos)) = event.command.argument("pos") else {
+-            return Flow::Continue;
+-        };
+-        let line = match literals.as_slice() {
+-            ["mekanismgenerators", "info"] => {
+-                let Some(level) = host.level(host.dimension()) else {
+-                    return Flow::Continue;
+-                };
+-                if !may_read(&*host, event.source, level, *pos) {
+-                    let line = format!(
+-                        "You must be an operator or within {:.0} blocks of the generator.",
+-                        runtime::INSPECT_RANGE
+-                    );
+-                    let _ = host.commands().feedback(Text::literal(line));
+-                    return Flow::Cancel;
+-                }
+-                heat_generator::info_line(host, *pos)
+-                    .unwrap_or_else(|| "No block entity there.".to_owned())
++fn run_mod_command(
++    host: &mut dyn ServerHost,
++    source: &CommandSource,
++    command: &CommandInvocation,
++) -> Flow {
++    let literals: Vec<&str> = command.literals.iter().map(String::as_str).collect();
++    let Some(CommandArgumentValue::BlockPos(pos)) = command.argument("pos") else {
++        return Flow::Continue;
++    };
++    let line = match literals.as_slice() {
++        ["mekanismgenerators", "info"] => {
++            let Some(level) = host.level(host.dimension()) else {
++                return Flow::Continue;
++            };
++            if !may_read(&*host, source, level, *pos) {
++                let line = format!(
++                    "You must be an operator or within {:.0} blocks of the generator.",
++                    runtime::INSPECT_RANGE
++                );
++                let _ = host.commands().feedback(Text::literal(line));
++                return Flow::Cancel;
+             }
+-            ["mekanismgenerators", "energy"] => {
+-                let Some(CommandArgumentValue::Integer(amount)) = event.command.argument("amount")
+-                else {
+-                    return Flow::Continue;
+-                };
+-                match heat_generator::set_energy(host, *pos, *amount) {
+-                    Some(after) => format!("Energy set to {after} FE."),
+-                    None => "No block entity there.".to_owned(),
+-                }
++            heat_generator::info_line(host, *pos)
++                .unwrap_or_else(|| "No block entity there.".to_owned())
++        }
++        ["mekanismgenerators", "energy"] => {
++            let Some(CommandArgumentValue::Integer(amount)) = command.argument("amount")
++            else {
++                return Flow::Continue;
++            };
++            match heat_generator::set_energy(host, *pos, *amount) {
++                Some(after) => format!("Energy set to {after} FE."),
++                None => "No block entity there.".to_owned(),
+             }
+-            _ => return Flow::Continue,
+-        };
+-        let _ = host.commands().feedback(Text::literal(line));
+-        Flow::Cancel
+-    }
++        }
++        _ => return Flow::Continue,
++    };
++    let _ = host.commands().feedback(Text::literal(line));
++    Flow::Cancel
+ }

@@ -1,0 +1,401 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 25f1297..6267fe8 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -28,7 +28,7 @@ pub mod support;
+ 
+ use mod_api::{
+     self, ComponentTypesEvent, Flow, Hooks, RegisterCommandsEvent, Registrar, RegistrationContext,
+-    RunModCommandEvent, ServerHost,
++    ServerHost,
+ };
+ 
+ #[derive(Default)]
+@@ -52,13 +52,4 @@ impl Hooks for Mod {
+     fn component_types(&self, _context: &RegistrationContext, event: &mut ComponentTypesEvent<'_>) {
+         support::declare_component_types(event);
+     }
+-
+-    /// The command body: the parsed position, then one line about the machine there.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        support::run_command(host, event)
+-    }
+ }
+diff --git a/src/support.rs b/src/support.rs
+index ddd1687..1887526 100644
+--- a/src/support.rs
++++ b/src/support.rs
+@@ -10,11 +10,11 @@ use std::array;
+ 
+ use mod_api::{
+     self, BlockEntityEvent, BlockEntityPart, BlockEntityRef, BlockEntityTickEvent,
+-    BlockEntityTickReply, BlockEntityTicksEvent, BlockPart, Command, CommandArgumentValue,
++    BlockEntityTicksEvent, BlockPart, Command, CommandArgumentValue,
+     CommandInvocation, ComponentTypesEvent, Compound, Direction, ENERGY, FLUIDS, Flow,
+     FluidIdentity, FluidResource, FluidStack, Host, HostTransaction, Identifier, InteractionResult,
+     ItemKey, ItemStack, LevelSide, ModContainer, ModEnergyBuffer, ModFluidTanks,
+-    RegisterCommandsEvent, Registrar, RegistrationContext, RunModCommandEvent, ServerHost, Tag,
++    RegisterCommandsEvent, Registrar, RegistrationContext, ServerHost, Tag,
+     Text, UseItemOnEvent,
+ };
+ 
+@@ -96,9 +96,9 @@ fn declare_panel(r: &mut dyn Registrar, spec: &PanelSpec) {
+ /// Register the two data component types the cells carry, before the content root reads its item
+ /// declarations (`component_types`, NeoForge's `RegisterEvent`).
+ pub(crate) fn declare_component_types(event: &mut ComponentTypesEvent<'_>) {
+-    event
+-        .types
+-        .extend(component_type_ids().into_iter().map(str::to_owned));
++    for id in component_type_ids() {
++        event.register(id.to_owned());
++    }
+ }
+ 
+ /// The component types this package registers, in the order it registers them.
+@@ -111,59 +111,68 @@ pub(crate) fn component_type_ids() -> [&'static str; 2] {
+ pub(crate) fn declare_commands(event: &mut RegisterCommandsEvent<'_>) {
+     event.commands.push(Command::new(
+         "extended_industrialization info <pos:block_pos>",
+-    ));
++    ).executes(execute));
+     event.commands.push(Command::op(
+         "extended_industrialization energy <amount:integer> <pos:block_pos>",
+         2,
+-    ));
++    ).executes(execute));
+     event.commands.push(Command::op(
+         "extended_industrialization fluid <amount:integer> <pos:block_pos>",
+         2,
+-    ));
++    ).executes(execute));
+     event.commands.push(Command::op(
+         "extended_industrialization drain <amount:integer> <pos:block_pos> <face:word>",
+         2,
+-    ));
++    ).executes(execute));
+     event.commands.push(Command::op(
+         "extended_industrialization fluiddrain <amount:integer> <pos:block_pos> <face:word>",
+         2,
+-    ));
++    ).executes(execute));
+     event.commands.push(Command::op(
+         "extended_industrialization calcify <ticks:integer> <pos:block_pos>",
+         2,
+-    ));
++    ).executes(execute));
+ }
+ 
+ /// The `/extended_industrialization` command bodies (upstream registers no command of its own;
+ /// these are the readout and two harness controls, as `/modern_industrialization` has).
+-pub(crate) fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>) -> Flow {
+-    let literals = &event.command.literals;
++/// Every usage's executor: the old `run_mod_command` answer as the command's result.
++fn execute(
++    host: &mut dyn ServerHost,
++    _source: &mod_api::CommandSource,
++    command: &CommandInvocation,
++) -> Option<i32> {
++    matches!(run_command(host, command), Flow::Cancel).then_some(1)
++}
++
++pub(crate) fn run_command(host: &mut dyn ServerHost, command: &CommandInvocation) -> Flow {
++    let literals = &command.literals;
+     if literals.first().map(String::as_str) != Some("extended_industrialization") {
+         return Flow::Continue;
+     }
+     match literals.get(1).map(String::as_str) {
+         Some("info") => {
+-            report(host, event.command);
++            report(host, command);
+             Flow::Cancel
+         }
+         Some("energy") => {
+-            set_energy(host, event.command);
++            set_energy(host, command);
+             Flow::Cancel
+         }
+         Some("fluid") => {
+-            fill_water(host, event.command);
++            fill_water(host, command);
+             Flow::Cancel
+         }
+         Some("drain") => {
+-            drain_energy(host, event.command);
++            drain_energy(host, command);
+             Flow::Cancel
+         }
+         Some("fluiddrain") => {
+-            drain_fluid(host, event.command);
++            drain_fluid(host, command);
+             Flow::Cancel
+         }
+         Some("calcify") => {
+-            set_calcification(host, event.command);
++            set_calcification(host, command);
+             Flow::Cancel
+         }
+         _ => Flow::Continue,
+@@ -183,6 +192,7 @@ pub(crate) fn container() -> ModContainer {
+         inputs,
+         outputs,
+         menu: None,
++        insert_rules: Vec::new(),
+     }
+ }
+ 
+@@ -219,6 +229,7 @@ pub(crate) fn panel_container() -> ModContainer {
+         inputs: vec![0],
+         outputs: Vec::new(),
+         menu: None,
++        insert_rules: Vec::new(),
+     }
+ }
+ 
+@@ -274,8 +285,8 @@ impl BlockEntityPart for Machine {
+ 
+     /// One tick of the machine: start a run if the buffer can pay for it, take its inputs, feed it,
+     /// and finish it into the output slots and the output tank.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        let fields = &mut *event.entity;
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        with_lent(event, |host, _pos, fields| {
+         if fields.items.len() < SLOTS {
+             fields.items.resize(SLOTS, None);
+         }
+@@ -304,11 +315,13 @@ impl BlockEntityPart for Machine {
+         if after != before || tanks != before_tanks {
+             store(&mut fields.nbt, &after);
+             write_tanks(&mut fields.nbt, &tanks);
+-        } else if slots_ready {
++            true
++        } else {
+             // Nothing ran and nothing moved, and the slots are already there: no chunk dirty and
+             // the original payload is kept.
+-            *event.reply = BlockEntityTickReply::Unchanged;
++            !slots_ready
+         }
++        });
+     }
+ }
+ 
+@@ -343,10 +356,9 @@ impl BlockEntityPart for PanelPart {
+ 
+     /// One tick: only in usable light, advance the phase, use the cell of this tier, generate its
+     /// rate into the buffer and wear the cell.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
+         let tier = self.tier;
+-        let pos = event.pos;
+-        let fields = &mut *event.entity;
++        with_lent(event, |host, pos, fields| {
+         if fields.items.is_empty() {
+             fields.items.resize(1, None);
+         }
+@@ -365,11 +377,7 @@ impl BlockEntityPart for PanelPart {
+         let Some(level) = in_place_level(host) else {
+             // No level in place: nothing to read the sky from. A tick that answers `Changed` is
+             // still needed while the slots are being sized.
+-            if !slots_ready {
+-                return;
+-            }
+-            *event.reply = BlockEntityTickReply::Unchanged;
+-            return;
++            return !slots_ready;
+         };
+         let sun = sun_at(base, level, pos);
+         let cell = fields
+@@ -406,10 +414,66 @@ impl BlockEntityPart for PanelPart {
+         {
+             changed = true;
+         }
+-        if !changed {
+-            *event.reply = BlockEntityTickReply::Unchanged;
+-        }
++        changed
++        });
++    }
++}
++
++/// What a tick works on: the block entity's item slots, menu data and saved compound, as the old
++/// tick event lent them.
++struct Lent {
++    items: Vec<Option<ItemStack>>,
++    data: Vec<i32>,
++    nbt: Compound,
++}
++
++/// Run one tick on a copy of the resident block entity's fields. `tick` answers what the reply
++/// used to say: `true` (`Changed`) writes the fields that differ back and marks the chunk
++/// unsaved, `false` (`Unchanged`) discards them.
++fn with_lent(
++    event: &mut BlockEntityTickEvent<'_>,
++    tick: impl FnOnce(&mut dyn ServerHost, [i32; 3], &mut Lent) -> bool,
++) {
++    let Some((pos, handle, mut fields)) = event.subject.with_view(|view| {
++        let items = (0..view.item_slots() as u32)
++            .map(|slot| view.item_slot(slot).and_then(|stack| stack.to_owned()))
++            .collect();
++        (
++            view.position(),
++            view.handle(),
++            Lent {
++                items,
++                data: view.data_slots().to_vec(),
++                nbt: view.nbt().clone(),
++            },
++        )
++    }) else {
++        return;
++    };
++    let items = fields.items.clone();
++    let nbt = fields.nbt.clone();
++    if !tick(event.subject.host(), pos, &mut fields) {
++        return;
+     }
++    event.subject.with_view(|mut view| {
++        for (slot, stack) in fields.items.iter().enumerate() {
++            if items.get(slot) != Some(stack) {
++                let _ = view.set_item_slot(slot as u32, stack.clone());
++            }
++        }
++        view.set_data_slots(&fields.data);
++        for (key, value) in fields.nbt.iter() {
++            if nbt.get(key) != Some(value) {
++                view.set_nbt(key.clone(), Some(value.clone()));
++            }
++        }
++        for (key, _) in nbt.iter() {
++            if fields.nbt.get(key).is_none() {
++                view.set_nbt(key.clone(), None);
++            }
++        }
++    });
++    let _ = handle.set_changed(event.subject.host());
+ }
+ 
+ /// The level being ticked: the one in place (`LevelRef::in_place`), as `actuallyadditions` reads it
+@@ -686,17 +750,15 @@ impl BlockEntityPart for BoilerPart {
+ 
+     /// One tick: in usable sunlight with water, make the day's and the calcification's rate into
+     /// the output tank, spend the water, and calcify on plain water.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
+         let tier = self.tier;
+-        let pos = event.pos;
+-        let fields = &mut *event.entity;
++        with_lent(event, |host, pos, fields| {
+         let capacity = tier.tank_capacity_mb();
+         let before_tanks = read_tanks_capped(&fields.nbt, capacity);
+         let before = read_boiler_state(&fields.nbt);
+         let base: &dyn Host = host;
+         let Some(level) = in_place_level(host) else {
+-            *event.reply = BlockEntityTickReply::Unchanged;
+-            return;
++            return false;
+         };
+         let sun = sun_at(base, level, pos);
+         let mut after = before;
+@@ -714,9 +776,11 @@ impl BlockEntityPart for BoilerPart {
+             );
+             set_be_steam_buffer(&mut fields.nbt, after.steam_buffer);
+             write_tanks_capped(&mut fields.nbt, &tanks, capacity);
++            true
+         } else {
+-            *event.reply = BlockEntityTickReply::Unchanged;
++            false
+         }
++        });
+     }
+ }
+ 
+@@ -744,9 +808,9 @@ fn boiler_at(
+     command: &CommandInvocation,
+     pos: [i32; 3],
+ ) -> Option<(&'static BoilerSpec, BlockEntityRef)> {
+-    let dimension = command.dimension.id(host)?;
++    let dimension = command.dimension.id(host)?.to_owned();
+     let level = host.level(&dimension)?;
+-    let id = level.block(host, pos)?.id(host);
++    let id = level.block(host, pos)?.id(host).unwrap_or_default().to_owned();
+     let spec = boiler(&id)?;
+     let entity = host.block_entity(level, pos)?;
+     Some((spec, entity))
+@@ -907,7 +971,7 @@ fn potion_of(stack: &ItemStack) -> Option<String> {
+ 
+ /// Whether `stack` is `item`: its id, and the potion its component must name.
+ fn is_item(host: &dyn Host, stack: &ItemStack, item: &ItemSpec) -> bool {
+-    item.is(&stack.item().id(host), potion_of(stack).as_deref())
++    item.is(stack.item().id(host).unwrap_or_default(), potion_of(stack).as_deref())
+ }
+ 
+ /// The key of an item id, or `None` for an id this world does not have.
+@@ -939,7 +1003,7 @@ fn stack_of(host: &dyn Host, item: &ItemSpec, count: u32) -> Option<ItemStack> {
+ /// One slot of the machine, as the info line names it: the item, its potion (if it carries one)
+ /// and its count, or `empty`.
+ fn slot_text(host: &dyn Host, stack: &ItemStack) -> String {
+-    let id = stack.item().id(host);
++    let id = stack.item().id(host).unwrap_or_default();
+     match potion_of(stack) {
+         Some(potion) => format!("{id}({potion}) x{}", stack.count()),
+         None => format!("{id} x{}", stack.count()),
+@@ -1248,7 +1312,7 @@ fn machine_at(
+     command: &CommandInvocation,
+     pos: [i32; 3],
+ ) -> Option<BlockEntityRef> {
+-    let dimension = command.dimension.id(host)?;
++    let dimension = command.dimension.id(host)?.to_owned();
+     let level = host.level(&dimension)?;
+     let block = host.block_key(MACHINE_ID)?;
+     if level.block(host, pos) != Some(block) {
+@@ -1404,7 +1468,7 @@ fn fill_water(host: &mut dyn ServerHost, command: &CommandInvocation) {
+     };
+     let resource = FluidResource::of(&FluidStack::new(key, 1));
+     let inserted = host
+-        .transaction(|host, tx| Ok::<u32, ()>(tanks.insert(host, tx, INPUT_TANK, &resource, want)))
++        .transaction(|host, tx| Ok::<u32, ()>(tanks.insert_at(host, tx, INPUT_TANK, &resource, want)))
+         .unwrap_or(0);
+     say(
+         host,
+@@ -1440,9 +1504,9 @@ fn panel_at(
+     command: &CommandInvocation,
+     pos: [i32; 3],
+ ) -> Option<(&'static PanelSpec, BlockEntityRef)> {
+-    let dimension = command.dimension.id(host)?;
++    let dimension = command.dimension.id(host)?.to_owned();
+     let level = host.level(&dimension)?;
+-    let id = level.block(host, pos)?.id(host);
++    let id = level.block(host, pos)?.id(host).unwrap_or_default().to_owned();
+     let spec = panel(&id)?;
+     let entity = host.block_entity(level, pos)?;
+     Some((spec, entity))
+@@ -1462,7 +1526,7 @@ fn panel_line(
+     let water = panel_water(&tank);
+     let stack = entity.item_slot(host, 0).ok().flatten();
+     let cell = stack.as_ref().and_then(|stack| cell_in_slot(host, stack));
+-    let cell_id = stack.as_ref().map(|stack| stack.item().id(host));
++    let cell_id = stack.as_ref().map(|stack| stack.item().id(host).unwrap_or_default());
+     let level = entity.level(host);
+     let sun = level.map_or_else(|| Sun::at(0).blocked(), |level| sun_at(host, level, pos));
+     let now = level.and_then(|level| level.game_time(host)).unwrap_or(0);
+@@ -1630,7 +1694,7 @@ fn drain_fluid(host: &mut dyn ServerHost, command: &CommandInvocation) {
+     let asked = want.min(available);
+     let got = host
+         .transaction(|host, tx| {
+-            Ok::<u32, ()>(tanks.extract(host, tx, OUTPUT_TANK, &resource, asked))
++            Ok::<u32, ()>(tanks.extract_at(host, tx, OUTPUT_TANK, &resource, asked))
+         })
+         .unwrap_or(0);
+     say(
+@@ -1642,7 +1706,7 @@ fn drain_fluid(host: &mut dyn ServerHost, command: &CommandInvocation) {
+ /// The fluid a capability resource names, for the reply.
+ fn fluid_name(host: &dyn Host, resource: &FluidResource) -> String {
+     match *resource.fluid() {
+-        FluidIdentity::Resolved(key) => key.id(host),
++        FluidIdentity::Resolved(key) => key.id(host).unwrap_or_default().to_owned(),
+         FluidIdentity::Unresolved(unresolved) => unresolved.id(host),
+         _ => "unknown fluid".to_owned(),
+     }

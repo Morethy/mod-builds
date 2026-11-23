@@ -1,0 +1,402 @@
+diff --git a/src/combat.rs b/src/combat.rs
+index 02c9c69..370b89b 100644
+--- a/src/combat.rs
++++ b/src/combat.rs
+@@ -247,7 +247,7 @@ fn refresh(host: &mut dyn ServerHost) {
+         let stats = APOTHIC.iter().map(|&(a, b)| (a, living.attribute_value(&*host, a).unwrap_or(b))).collect();
+         let worn = [EquipmentSlot::Head, EquipmentSlot::Chest, EquipmentSlot::Legs, EquipmentSlot::Feet]
+             .into_iter()
+-            .flat_map(|s| stack_effects(living.equipment(&*host, s).as_ref()))
++            .flat_map(|s| living.with_equipment(&*host, s, |stack| stack_effects(stack.project().as_ref())).unwrap_or_default())
+             .collect();
+         let previous = old.iter().find(|f| f.uuid == uuid && f.entity == entity.id());
+         let bow = previous.map(|f| f.bow.clone()).unwrap_or_default();
+@@ -342,12 +342,15 @@ fn monsters_near(host: &dyn mod_api::Host, center: EntityRef, at: [f64; 3], radi
+     let Some(level) = center.level(host) else { return Vec::new() };
+     let min = [at[0] - radius, at[1] - radius, at[2] - radius];
+     let max = [at[0] + radius, at[1] + radius, at[2] + radius];
+-    level
+-        .entities_in(host, min, max)
+-        .unwrap_or_default()
++    let mut found = Vec::new();
++    let _ = level.visit_entities_in(host, min, max, &mut |e| {
++        found.push(e);
++        std::ops::ControlFlow::Continue(())
++    });
++    found
+         .into_iter()
+         .filter(|e| e.id() != center.id())
+-        .filter(|e| e.kind(host).is_some_and(|k| is_monster(&k.id(host))))
++        .filter(|e| e.kind(host).and_then(|k| k.id(host)).is_some_and(|id| is_monster(&id)))
+         .filter(|e| e.distance_to_sqr(host, at).is_some_and(|d| d <= radius * radius))
+         .map(|e| e.id())
+         .collect()
+@@ -361,7 +364,7 @@ pub fn attack(host: &mut dyn ServerHost, target: i32) {
+     let Some(entity) = host.entity(target as u32) else { return };
+     let Some(living) = host.living(entity) else { return };
+     let host: &dyn mod_api::Host = &*host;
+-    let weapon = host.living(attacker).and_then(|l| l.hand_item(host, Hand::Main));
++    let weapon = host.living(attacker).and_then(|l| l.with_hand_item(host, Hand::Main, |s| s.project()).flatten());
+     let at = entity.position(host).unwrap_or_default();
+     let effects = stack_effects(weapon.as_ref());
+     let wants_near = effects.iter().any(|e| matches!(e, Effect::Thunderstruck { .. } | Effect::Cleaving { .. }));
+@@ -530,7 +533,10 @@ pub fn projectile(host: &mut dyn ServerHost, projectile: u32, kind: &str, owner:
+     if effects.is_empty() {
+         let held = host.entity(owner).and_then(|e| host.living(e)).and_then(|l| {
+             let is_bow = |s: &ItemStack| loot::category(&nbt::stack_id(s)) == Some("bow");
+-            l.hand_item(&*host, Hand::Main).filter(is_bow).or_else(|| l.hand_item(&*host, Hand::Off).filter(is_bow))
++            l.with_hand_item(&*host, Hand::Main, |s| s.project())
++                .flatten()
++                .filter(is_bow)
++                .or_else(|| l.with_hand_item(&*host, Hand::Off, |s| s.project()).flatten().filter(is_bow))
+         });
+         effects = stack_effects(held.as_ref());
+     }
+@@ -571,7 +577,7 @@ pub fn destroyed_block(host: &mut dyn ServerHost, pos: [i32; 3]) {
+     }
+     let Some(player) = host.players().acting_player() else { return };
+     let entity = player.entity();
+-    let tool = host.living(entity).and_then(|l| l.hand_item(&*host, Hand::Main));
++    let tool = host.living(entity).and_then(|l| l.with_hand_item(&*host, Hand::Main, |s| s.project()).flatten());
+     let effects = stack_effects(tool.as_ref());
+     let telepathic = effects.iter().any(|e| matches!(e, Effect::Telepathic));
+     for effect in &effects {
+@@ -607,7 +613,7 @@ pub fn destroyed_block(host: &mut dyn ServerHost, pos: [i32; 3]) {
+ pub fn loot_drops(host: &mut dyn ServerHost, context: &LootDrops<'_>, drops: &mut Vec<ItemStack>) {
+     let Some(uuid) = context.player else { return };
+     let Some(player) = host.player(uuid) else { return };
+-    let held = host.living(player.entity()).and_then(|l| l.hand_item(&*host, Hand::Main));
++    let held = host.living(player.entity()).and_then(|l| l.with_hand_item(&*host, Hand::Main, |s| s.project()).flatten());
+     let tool = if context.block.is_some() { context.tool.cloned() } else { context.weapon.cloned().or(held) };
+     let effects = stack_effects(tool.as_ref());
+     if effects.is_empty() {
+diff --git a/src/lib.rs b/src/lib.rs
+index 2aa3944..29d8a83 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -23,11 +23,11 @@ use mod_api::{
+     AttributeModifier, AttributeOperation, AttributeTooltip, BlockDropsEvent, CanGrindstoneRepairEvent, ClientHost,
+     ClientSetupEvent, DataLoadContext, EntityJoinLevelEvent, EquipmentSlotGroup, FinalizeSpawnEvent, Flow,
+     GetEnchantmentLevelEvent, GrindstonePlaceEvent, HearsProjectileImpactsEvent, Host, HostSide, Hooks, Identifier,
+-    ItemAttributeModifierEvent, ItemPart, ItemTooltipEvent, LevelHost, LevelRandomHost, LivingDamagePostEvent,
+-    LivingDeathEvent, LivingEquipmentChangeEvent, LivingHealEvent, LevelTickPreEvent, LivingIncomingDamageEvent, LootConditionEvent, LootDropsEvent, LootFunctionEvent,
++    ItemAttributeModifierEvent, ItemPart, ItemTooltipEvent, LevelHost, HitHost, LivingDamagePostEvent,
++    LivingDeathEvent, LivingEquipmentChangeEvent, LivingHealEvent, LevelTickPreEvent, LivingIncomingDamageEvent, LootDropsEvent,
+     LootTableLoadEvent, LoopContext, ModifyDefaultComponentsEvent, PlayerDestroyedBlockEvent, PlayerLoggedInEvent,
+     PlayerLoggedOutEvent, ProjectileImpactEvent, Registrar, RegisterCommandsEvent, RegistrationContext,
+-    RunModCommandEvent, Sentiment, ServerAboutToStartEvent, ServerHost, ServerStartedEvent, ServerStoppedEvent,
++    Sentiment, ServerAboutToStartEvent, ServerHost, ServerStartedEvent, ServerStoppedEvent,
+     ServerTickEvent, ServerTickPhase, Text,
+ };
+ 
+@@ -66,12 +66,22 @@ impl Hooks for VastAdventures {
+             let key = r.item_key(&item);
+             r.item_part(key, GemPart);
+         }
++        for kind in loot::CONDITIONS {
++            if let Ok(id) = Identifier::parse(kind) {
++                r.register_loot_condition_type(&id, LootCondition(kind));
++            }
++        }
++        for kind in loot::FUNCTIONS {
++            if let Ok(id) = Identifier::parse(kind) {
++                r.register_loot_function_type(&id, LootFunction(kind));
++            }
++        }
+     }
+ 
+     // ---- item ids ----
+ 
+-    fn client_setup(&self, host: &mut dyn ClientHost, _: &mut ClientSetupEvent) {
+-        nbt::learn_items(&*host);
++    fn client_setup(&self, host: &mut dyn mod_api::ClientSetupContext, _: &mut ClientSetupEvent) {
++        nbt::learn_items_at_setup(&*host);
+     }
+ 
+     fn server_about_to_start(&self, host: &mut dyn ServerHost, _: &mut ServerAboutToStartEvent) {
+@@ -89,19 +99,6 @@ impl Hooks for VastAdventures {
+         loot::table_load(event.id, event.table);
+     }
+ 
+-    fn loot_condition(&self, event: &mut LootConditionEvent<'_>) {
+-        let entity = event.ctx.entity.as_ref().map(|e| e.kind.as_str());
+-        if let Some(holds) = loot::loot_condition(event.kind, has_player(event.ctx), entity) {
+-            event.holds = holds;
+-        }
+-    }
+-
+-    fn loot_function(&self, event: &mut LootFunctionEvent<'_>) {
+-        if event.kind.starts_with("vastadventures:") {
+-            loot_function(event);
+-        }
+-    }
+-
+     // ---- what stacks give ----
+ 
+     fn item_attribute_modifier(&self, event: &mut ItemAttributeModifierEvent<'_>) {
+@@ -148,30 +145,31 @@ impl Hooks for VastAdventures {
+     }
+ 
+     fn item_tooltip(&self, _host: &dyn ClientHost, event: &mut ItemTooltipEvent<'_>) {
+-        let Some(custom) = nbt::custom_data(event.stack) else { return };
+-        let item = nbt::stack_id(event.stack);
++        let Some(stack) = event.stack.project() else { return };
++        let Some(custom) = nbt::custom_data(&stack) else { return };
++        let item = nbt::stack_id(&stack);
+         for effect in effects::effects(&item, &custom) {
+             let mut line = Text::literal("");
+             line.style.color = Some("green".into());
+             for part in effects::describe(&effect) {
+                 line = line.append(nbt::text(&part));
+             }
+-            event.lines.push((line, u32::MAX));
++            let _ = event.lines.push(line, u32::MAX);
+         }
+     }
+ 
+     // ---- stations ----
+ 
+     fn anvil_update(&self, _host: HostSide, event: &mut AnvilUpdateEvent<'_>) -> Flow {
+-        stations::anvil_update(event.update)
++        stations::anvil_update(event.inputs, event.edits)
+     }
+ 
+     fn anvil_craft_post(&self, host: &mut dyn ServerHost, event: &mut AnvilCraftPostEvent<'_>) {
+-        stations::anvil_taken(host, event.player, event.pos, event.craft);
++        stations::anvil_taken(host, event.player, event.pos, event.inputs);
+     }
+ 
+     fn grindstone_place(&self, _host: &mut dyn ServerHost, event: &mut GrindstonePlaceEvent<'_>) -> Flow {
+-        stations::grindstone_place(event.place)
++        stations::grindstone_place(event.inputs, event.edits)
+     }
+ 
+     // ---- bosses, elites and the world tier ----
+@@ -202,10 +200,6 @@ impl Hooks for VastAdventures {
+         spawns::register_commands(event.commands);
+     }
+ 
+-    fn run_mod_command(&self, host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>) -> Flow {
+-        spawns::run_command(host, event.source, event.command)
+-    }
+-
+     fn server_tick(&self, _host: &mut dyn ServerHost, event: &mut ServerTickEvent<'_>) {
+         if matches!(event.phase, ServerTickPhase::ServerTickStart { .. }) {
+             spawns::tick_start();
+@@ -252,11 +246,11 @@ impl Hooks for VastAdventures {
+         Flow::Continue
+     }
+ 
+-    fn living_incoming_damage(&self, _level: &mut dyn LevelRandomHost, event: &mut LivingIncomingDamageEvent<'_>) -> Flow {
++    fn living_incoming_damage(&self, _level: &mut dyn HitHost, event: &mut LivingIncomingDamageEvent<'_>) -> Flow {
+         combat::incoming(event)
+     }
+ 
+-    fn living_damage_post(&self, _level: &mut dyn LevelRandomHost, event: &mut LivingDamagePostEvent<'_>) {
++    fn living_damage_post(&self, _level: &mut dyn HitHost, event: &mut LivingDamagePostEvent<'_>) {
+         combat::damage_dealt(event);
+     }
+ 
+@@ -301,11 +295,46 @@ fn has_player(ctx: &mod_api::LootContext) -> bool {
+     ctx.player.is_some() || ctx.entity.as_ref().is_none_or(|e| e.kind == "minecraft:player")
+ }
+ 
++/// One of this mod's loot conditions, registered under its id.
++struct LootCondition(&'static str);
++
++impl mod_api::ModLootCondition for LootCondition {
++    fn validate(&self, _: &mod_api::LootEntryData) -> Result<(), String> {
++        Ok(())
++    }
++
++    fn test(&self, _: &mod_api::LootEntryData, context: &mut dyn mod_api::LootTypeContext) -> Result<bool, String> {
++        let ctx = context.snapshot();
++        let entity = ctx.entity.as_ref().map(|e| e.kind.as_str());
++        loot::loot_condition(self.0, has_player(&ctx), entity).ok_or_else(|| format!("{}: not a condition", self.0))
++    }
++}
++
++/// One of this mod's loot functions, registered under its id.
++struct LootFunction(&'static str);
++
++impl mod_api::ModLootFunction for LootFunction {
++    fn validate(&self, _: &mod_api::LootEntryData) -> Result<(), String> {
++        Ok(())
++    }
++
++    fn apply(
++        &self,
++        data: &mod_api::LootEntryData,
++        mut stack: mod_api::LootStack,
++        context: &mut dyn mod_api::LootTypeContext,
++    ) -> Result<mod_api::LootStack, String> {
++        let ctx = context.snapshot();
++        // The roll's own random gives the seed the context no longer carries.
++        let seed = context.random().next_long();
++        loot_function(self.0, data.value(), &ctx, seed, &mut stack);
++        Ok(stack)
++    }
++}
++
+ /// This mod's loot functions, on the pure logic's view of the stack (JSON components).
+-fn loot_function(event: &mut LootFunctionEvent<'_>) {
+-    let ctx = event.ctx;
+-    loot::note_context(event.kind, ctx.player.is_some(), ctx.entity.as_ref().map(|e| e.kind.as_str()));
+-    let stack = &mut *event.stack;
++fn loot_function(kind: &str, data: &Value, ctx: &mod_api::LootContext, seed: i64, stack: &mut mod_api::LootStack) {
++    loot::note_context(kind, ctx.player.is_some(), ctx.entity.as_ref().map(|e| e.kind.as_str()));
+     let mut item = nbt::item_id(stack.item);
+     if item.is_empty() {
+         return;
+@@ -318,7 +347,7 @@ fn loot_function(event: &mut LootFunctionEvent<'_>) {
+     let mut components = before.clone();
+     let dimension = ctx.place.as_ref().and_then(|p| p.level.as_ref()).map(|l| l.dimension.as_str());
+     let mut view = loot::Stack { item: &mut item, count: &mut count, names: &mut names, components: &mut components };
+-    loot::loot_function(event.kind, event.data, has_player(ctx), ctx.luck, ctx.seed, dimension, &mut view);
++    loot::loot_function(kind, data, has_player(ctx), ctx.luck, seed, dimension, &mut view);
+     stack.count = count;
+     if item != before_item {
+         match nbt::item_key(&item) {
+diff --git a/src/loot.rs b/src/loot.rs
+index 425ebb9..0c98dbc 100644
+--- a/src/loot.rs
++++ b/src/loot.rs
+@@ -704,6 +704,13 @@ pub fn table_load(id: &str, table: &mut Value) {
+ }
+ 
+ /// `native_loot_condition` for this mod's kinds: None for a kind that isn't its own.
++/// The ids [`loot_condition`] answers.
++pub const CONDITIONS: [&str; 2] = ["vastadventures:has_player", "vastadventures:is_monster"];
++
++/// The ids [`loot_function`] answers.
++pub const FUNCTIONS: [&str; 3] =
++    ["vastadventures:affix_loot", "vastadventures:affix_conversion", "vastadventures:random_gem"];
++
+ pub fn loot_condition(kind: &str, has_player: bool, entity: Option<&str>) -> Option<bool> {
+     match kind {
+         "vastadventures:has_player" => Some(has_player),
+diff --git a/src/nbt.rs b/src/nbt.rs
+index c2bc432..0d2765d 100644
+--- a/src/nbt.rs
++++ b/src/nbt.rs
+@@ -123,16 +123,25 @@ static ITEMS: RwLock<Option<Items>> = RwLock::new(None);
+ /// Learns every item's id, once a host can tell them (`client_setup`, `server_about_to_start`, then each level tick
+ /// until it has): the loot, attribute and enchantment hooks have only the key.
+ pub fn learn_items(host: &dyn Host) {
++    learn_items_with(|| host.item_keys(), |k| k.id(host).unwrap_or_default().to_owned());
++}
++
++/// [`learn_items`] at client setup, whose context reads the registry but is not a `Host`.
++pub fn learn_items_at_setup(host: &dyn mod_api::ClientSetupContext) {
++    learn_items_with(|| host.item_keys(), |k| host.item_key_id(k).unwrap_or_default().to_owned());
++}
++
++fn learn_items_with(keys: impl FnOnce() -> Vec<ItemKey>, id_of: impl Fn(ItemKey) -> String) {
+     if ITEMS.read().is_ok_and(|i| i.is_some()) {
+         return;
+     }
+-    let keys = host.item_keys();
++    let keys = keys();
+     if keys.is_empty() {
+         return;
+     }
+     let mut items = Items::default();
+     for k in keys {
+-        let id = k.id(host);
++        let id = id_of(k);
+         if !id.is_empty() {
+             items.keys.insert(id.clone(), k);
+             items.ids.insert(k, id);
+diff --git a/src/spawns.rs b/src/spawns.rs
+index ec7110c..daabc98 100644
+--- a/src/spawns.rs
++++ b/src/spawns.rs
+@@ -55,8 +55,8 @@ pub fn finalize_spawn(_host: &dyn Host, event: &mut FinalizeSpawnEvent<'_>) {
+ /// A mob joined a level (not loaded from disk): a marked one is looked at in its level's next tick.
+ pub fn joined(host: &mut dyn ServerHost, entity: u32, dimension: &str, kind: &str, pos: [f64; 3]) {
+     let Some(tags) = host.entity(entity).and_then(|e| e.tags(&*host)) else { return };
+-    let spawner = tags.iter().any(|t| t == BOSS_SPAWNER_TAG);
+-    if (spawner || tags.iter().any(|t| t == NATURAL_TAG))
++    let spawner = tags.contains(BOSS_SPAWNER_TAG);
++    if (spawner || tags.contains(NATURAL_TAG))
+         && let Ok(mut joined) = JOINED.lock()
+     {
+         joined.push(Joined { entity, dimension: dimension.to_owned(), kind: kind.to_owned(), pos, spawner, age: 0 });
+@@ -231,10 +231,13 @@ const OPERATOR: PermissionLevel = PermissionLevel::Gamemasters;
+ 
+ /// `/vastadventures tier` shows the world tier (anyone); `/vastadventures tier <tier>` sets it and
+ /// `/vastadventures boss` summons a boss (operators).
+-pub fn register_commands(commands: &mut Vec<Command>) {
+-    commands.push(Command::new("vastadventures tier"));
+-    commands.push(Command::op("vastadventures tier <tier:word>", OPERATOR.level()));
+-    commands.push(Command::op("vastadventures boss", OPERATOR.level()));
++pub fn register_commands(commands: &mut Vec<mod_api::CommandRegistration>) {
++    fn run(host: &mut dyn ServerHost, source: &CommandSource, command: &CommandInvocation) -> Option<i32> {
++        matches!(run_command(host, source, command), Flow::Cancel).then_some(1)
++    }
++    commands.push(Command::new("vastadventures tier").executes(run));
++    commands.push(Command::op("vastadventures tier <tier:word>", OPERATOR.level()).executes(run));
++    commands.push(Command::op("vastadventures boss", OPERATOR.level()).executes(run));
+ }
+ 
+ /// Whether `source` may change the world: the dispatcher checks the level each usage registered with, and the
+diff --git a/src/stations.rs b/src/stations.rs
+index 6fb22b6..fcfab07 100644
+--- a/src/stations.rs
++++ b/src/stations.rs
+@@ -3,7 +3,9 @@
+ 
+ use crate::gems::{self, MadeGem};
+ use crate::nbt;
+-use mod_api::item::menu::{AnvilCraft, AnvilUpdate, GrindstonePlace};
++use mod_api::item::menu::{
++    AnvilCraftInputs, AnvilUpdateEdits, AnvilUpdateInputs, GrindstonePlaceEdits, GrindstonePlaceInputs, StackResult,
++};
+ use mod_api::serde_json::{Value, json};
+ use mod_api::{Flow, ItemStack, ServerHost};
+ 
+@@ -29,10 +31,10 @@ fn changed(stack: &ItemStack, components: &[(&str, &Value)]) -> ItemStack {
+ 
+ /// The anvil with an item on the left and one of this mod's on the right: a gem goes into a free socket, a seal
+ /// does its work, a rarity's material reforges and gem dust cuts a gem. A pairing that does nothing has no result.
+-pub fn anvil_update(update: &mut AnvilUpdate) -> Flow {
+-    let Some(right) = update.right.clone() else { return Flow::Continue };
++pub fn anvil_update(inputs: &AnvilUpdateInputs<'_>, update: &mut AnvilUpdateEdits) -> Flow {
++    let Some(right) = inputs.right.cloned() else { return Flow::Continue };
+     let right_id = nbt::stack_id(&right);
+-    let left = update.left.clone();
++    let left = inputs.left.clone();
+     let left_id = nbt::stack_id(&left);
+     if right_id.is_empty() || left_id.is_empty() {
+         return Flow::Continue;
+@@ -67,7 +69,7 @@ pub fn anvil_update(update: &mut AnvilUpdate) -> Flow {
+     };
+     match made {
+         Some((output, xp_cost, material_cost)) => {
+-            update.output = Some(output);
++            update.output = StackResult::Set(Some(output));
+             update.xp_cost = xp_cost;
+             update.material_cost = material_cost;
+             Flow::Continue
+@@ -77,8 +79,8 @@ pub fn anvil_update(update: &mut AnvilUpdate) -> Flow {
+ }
+ 
+ /// An anvil's result was taken: a Seal of Extraction's gems go to the player, or drop on the anvil.
+-pub fn anvil_taken(host: &mut dyn ServerHost, player: u128, pos: [i32; 3], craft: &AnvilCraft) {
+-    let (Some(left), Some(right)) = (&craft.left, &craft.right) else { return };
++pub fn anvil_taken(host: &mut dyn ServerHost, player: u128, pos: [i32; 3], craft: &AnvilCraftInputs<'_>) {
++    let (Some(left), Some(right)) = (craft.left, craft.right) else { return };
+     if nbt::stack_id(right) != gems::SEAL_OF_EXTRACTION {
+         return;
+     }
+@@ -96,8 +98,8 @@ pub fn anvil_taken(host: &mut dyn ServerHost, player: u128, pos: [i32; 3], craft
+ }
+ 
+ /// Salvaging: an affix item or a gem alone in the grindstone gives its rarity's material or gem dust.
+-pub fn grindstone_place(place: &mut GrindstonePlace) -> Flow {
+-    let stack = match (&place.top, &place.bottom) {
++pub fn grindstone_place(inputs: &GrindstonePlaceInputs<'_>, place: &mut GrindstonePlaceEdits) -> Flow {
++    let stack = match (inputs.top, inputs.bottom) {
+         (Some(s), None) | (None, Some(s)) => s.clone(),
+         (Some(a), Some(b)) => {
+             // Two gems would take the grindstone's repair branch: no result.

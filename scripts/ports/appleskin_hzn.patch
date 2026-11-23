@@ -1,0 +1,25 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 65d4034..aa045b1 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -78,7 +78,10 @@ impl Hooks for Mod {
+         let Some(food_id) = ComponentId::new("minecraft:food") else {
+             return;
+         };
+-        let resource = ItemResource::of(event.stack);
++        let Some(stack) = event.stack.project() else {
++            return;
++        };
++        let resource = ItemResource::of(&stack);
+         let Some(tag) = resource.value(host, &food_id) else {
+             return;
+         };
+@@ -90,7 +93,7 @@ impl Hooks for Mod {
+             text.style.color = Some(format!("#{:06X}", rgb & 0x00FF_FFFF));
+             // Trailing u32 is RGBA: a bare 0xRRGGBB has alpha 0 and hides the
+             // line. u32::MAX keeps the colour set on the Text above.
+-            event.lines.push((text, u32::MAX));
++            let _ = event.lines.push(text, u32::MAX);
+         }
+     }
+ }

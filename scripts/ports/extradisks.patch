@@ -1,0 +1,193 @@
+diff --git a/src/commands.rs b/src/commands.rs
+index 0c025bc..1c50f3e 100644
+--- a/src/commands.rs
++++ b/src/commands.rs
+@@ -19,21 +19,23 @@ use crate::format::grouped;
+ use crate::storage_block;
+ 
+ /// The commands the mod adds, as one usage each.
+-pub fn register(commands: &mut Vec<Command>) {
+-    commands.push(Command::new("extradisks info <pos:block_pos>"));
+-    commands.push(Command::new(
+-        "extradisks insert <pos:block_pos> <item:item> <count:integer>",
+-    ));
+-    commands.push(Command::new(
+-        "extradisks extract <pos:block_pos> <item:item> <count:integer>",
+-    ));
+-    commands.push(Command::new("extradisks disk info"));
+-    commands.push(Command::new(
+-        "extradisks disk insert <item:item> <count:integer>",
+-    ));
+-    commands.push(Command::new(
+-        "extradisks disk extract <item:item> <count:integer>",
+-    ));
++pub fn register(commands: &mut Vec<mod_api::CommandRegistration>) {
++    commands.push(Command::new("extradisks info <pos:block_pos>").executes(executor));
++    commands.push(Command::new("extradisks insert <pos:block_pos> <item:item> <count:integer>").executes(executor));
++    commands.push(Command::new("extradisks extract <pos:block_pos> <item:item> <count:integer>").executes(executor));
++    commands.push(Command::new("extradisks disk info").executes(executor));
++    commands.push(Command::new("extradisks disk insert <item:item> <count:integer>").executes(executor));
++    commands.push(Command::new("extradisks disk extract <item:item> <count:integer>").executes(executor));
++}
++
++/// The executor of every usage: the bodies of those commands; one that is not ours is left to
++/// the game.
++fn executor(
++    host: &mut dyn ServerHost,
++    _source: &mod_api::CommandSource,
++    command: &CommandInvocation,
++) -> Option<i32> {
++    run(host, command).then_some(1)
+ }
+ 
+ /// Run one of the mod's parsed commands; answers whether it was ours.
+@@ -60,7 +62,7 @@ fn usage(host: &mut dyn ServerHost, usage: &str) {
+ /// The execution level of a command, after `execute in`.
+ fn level_of(host: &dyn Host, command: &CommandInvocation) -> Option<LevelRef> {
+     let id = command.dimension.id(host)?;
+-    host.level(&id)
++    host.level(id)
+ }
+ 
+ /// The player a command acts for: told by the game as the hook's acting player.
+@@ -118,7 +120,7 @@ fn insert(host: &mut dyn ServerHost, command: &CommandInvocation) {
+     let mut storage = storage_block::read(host, level, pos);
+     let took = storage.insert(resource, count);
+     storage_block::write(host, level, pos, &storage);
+-    let name = stack.item().id(host);
++    let name = stack.item().id(host).unwrap_or_default().to_owned();
+     let line = if took == 0 {
+         format!("Refused: {name} does not fit (the storage takes no more).")
+     } else {
+@@ -162,7 +164,7 @@ fn extract(host: &mut dyn ServerHost, command: &CommandInvocation) {
+         storage.insert(resource.clone(), took - given);
+     }
+     storage_block::write(host, level, pos, &storage);
+-    let name = stack.item().id(host);
++    let name = stack.item().id(host).unwrap_or_default().to_owned();
+     say(
+         host,
+         format!(
+@@ -179,9 +181,8 @@ fn extract(host: &mut dyn ServerHost, command: &CommandInvocation) {
+ fn held(host: &dyn Host, player: PlayerRef) -> Option<(u32, ItemStack)> {
+     let slot = u32::try_from(player.selected_slot(host)?).ok()?;
+     player
+-        .inventory_slots(host)?
+-        .into_iter()
+-        .find(|(index, _)| *index == slot)
++        .with_inventory(host, |view| Some((slot, view.get(slot)?.project()?)))
++        .flatten()
+ }
+ 
+ /// `/extradisks disk …`: the held 1024k storage disk.
+@@ -193,7 +194,7 @@ fn disk_command(host: &mut dyn ServerHost, command: &CommandInvocation, words: &
+         return say(host, "Hold a 1024k storage disk first.".to_owned());
+     };
+     if !disk::is_disk(host, &held) {
+-        let name = held.item().id(host);
++        let name = held.item().id(host).unwrap_or_default().to_owned();
+         return say(
+             host,
+             format!("Hold a 1024k storage disk first (this is {name})."),
+@@ -211,7 +212,7 @@ fn disk_command(host: &mut dyn ServerHost, command: &CommandInvocation, words: &
+             let mut updated = held.clone();
+             disk::write(&mut updated, &storage);
+             let _ = player.set_inventory_slot(host, slot, Some(updated));
+-            let name = stack.item().id(host);
++            let name = stack.item().id(host).unwrap_or_default().to_owned();
+             if took == 0 {
+                 say(
+                     host,
+@@ -245,7 +246,7 @@ fn disk_command(host: &mut dyn ServerHost, command: &CommandInvocation, words: &
+             disk::write(&mut updated, &storage);
+             let shown = disk::read(&updated);
+             let _ = player.set_inventory_slot(host, slot, Some(updated));
+-            let name = stack.item().id(host);
++            let name = stack.item().id(host).unwrap_or_default().to_owned();
+             let line = if given < took {
+                 format!(
+                     "Extracted {given} x {name}; the inventory held no more ({} stayed on the disk).",
+diff --git a/src/disk.rs b/src/disk.rs
+index 4ded434..672851b 100644
+--- a/src/disk.rs
++++ b/src/disk.rs
+@@ -60,7 +60,7 @@ pub fn write(stack: &mut ItemStack, storage: &Storage) {
+ 
+ /// Whether `stack` is this slice's disk.
+ pub fn is_disk(host: &dyn Host, stack: &ItemStack) -> bool {
+-    Variant::from_disk_id(&stack.item().id(host)) == Some(Variant::K1024)
++    Variant::from_disk_id(stack.item().id(host).unwrap_or_default()) == Some(Variant::K1024)
+ }
+ 
+ /// One line about the held disk, at `storage`.
+diff --git a/src/lib.rs b/src/lib.rs
+index 96bc7cf..daa553a 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -24,7 +24,7 @@ pub mod storage_block;
+ use mod_api::{
+     self, BreakBlockEvent, ComponentTypesEvent, Flow, Hooks, HostSide, InteractionResult,
+     LogicalSide, RegisterCommandsEvent, Registrar, RegistrationContext, RightClickBlockEvent,
+-    RunModCommandEvent, ServerHost,
++    ServerHost,
+ };
+ 
+ /// The mod has no session state: every storage's state is its own saved
+@@ -50,7 +50,7 @@ impl Hooks for Mod {
+     /// Before content loads: register `extradisks:storage`, the component that
+     /// carries a disk's contents in the item.
+     fn component_types(&self, _cx: &RegistrationContext, event: &mut ComponentTypesEvent<'_>) {
+-        event.types.push(disk::COMPONENT.to_owned());
++        event.register(disk::COMPONENT.to_owned());
+     }
+ 
+     /// A held stack onto the storage block goes in (what fits of it); an empty
+@@ -89,17 +89,4 @@ impl Hooks for Mod {
+     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+         commands::register(event.commands);
+     }
+-
+-    /// The bodies of those commands; one that is not ours is left to the game.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        if commands::run(host, event.command) {
+-            Flow::Cancel
+-        } else {
+-            Flow::Continue
+-        }
+-    }
+ }
+diff --git a/src/storage_block.rs b/src/storage_block.rs
+index be827dc..e81e022 100644
+--- a/src/storage_block.rs
++++ b/src/storage_block.rs
+@@ -32,7 +32,7 @@ pub fn block_id_at(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> Option<St
+         return None;
+     }
+     let block: BlockKey = level.block(host, pos)?;
+-    Some(block.id(host))
++    block.id(host).map(str::to_owned)
+ }
+ 
+ /// The rung of the storage block at `pos`, none for any other block.
+@@ -75,7 +75,7 @@ pub fn write(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3], storage:
+ /// Upstream's `ItemResource` is the same pair, which is why two named diamonds
+ /// are two resources.
+ pub fn resource_of(host: &dyn Host, stack: &ItemStack) -> Resource {
+-    let id = stack.item().id(host);
++    let id = stack.item().id(host).unwrap_or_default();
+     let key = codec::component_key(stack.components().map(|components| components.as_nbt()));
+     Resource::with_extra(id, key)
+ }
+@@ -192,7 +192,7 @@ fn deposit(
+         return;
+     };
+     let resource = resource_of(host, stack);
+-    let name = stack.item().id(host);
++    let name = stack.item().id(host).unwrap_or_default().to_owned();
+     let mut storage = read(host, level, click.pos);
+     let accepted = storage.accepts(&resource);
+     let took = storage.insert(resource.clone(), u64::from(stack.count()));

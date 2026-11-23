@@ -1,0 +1,68 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index eca9a7a..101affd 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -26,7 +26,7 @@ use mod_api::{
+     ConfigKind, ConfigLoadingEvent, ConfigReloadingEvent, GameMode, GameRuleValue, Hooks, Host,
+     HostSide, Identifier, ItemKey, ItemPart, ItemStack, LevelReadError,
+     LivingEntityUseItemFinishEvent, LootDropsEvent, MobCategory, ModifierLifetime, PlayerRef,
+-    PlayerTickPostEvent, RandomSource, RegisterConfigsEvent, Registrar, RegistrationContext,
++    PlayerTickPostEvent, RegisterConfigsEvent, Registrar, RegistrationContext,
+     ServerHost, UseAnimation, UseAnimationEvent, UseDurationEvent,
+ };
+ 
+@@ -104,7 +104,7 @@ impl Hooks for Mod {
+     /// The server settings live in `config/bhc.conf`, upstream's path
+     /// (`BaubleyHeartCanisters.java:54-60`): the game writes the defaults when the file is
+     /// missing and hands the text back at `config_loading`.
+-    fn register_configs(&self, _host: HostSide, event: &mut RegisterConfigsEvent<'_>) {
++    fn register_configs(&self, _host: &dyn mod_api::ConfigContext, event: &mut RegisterConfigsEvent<'_>) {
+         let config = ModConfig::new(
+             "bhc",
+             ConfigKind::Server,
+@@ -114,7 +114,7 @@ impl Hooks for Mod {
+         event.configs.push(config);
+     }
+ 
+-    fn config_loading(&self, _host: HostSide, event: &mut ConfigLoadingEvent<'_>) {
++    fn config_loading(&self, _host: &dyn mod_api::ConfigContext, event: &mut ConfigLoadingEvent<'_>) {
+         self.read_config(event.config);
+     }
+ 
+@@ -153,7 +153,7 @@ impl Hooks for Mod {
+             return;
+         }
+         let stack = event.stack;
+-        let Some(heart) = MiniHeart::from_item(&stack.item().id(&*host)) else {
++        let Some(heart) = MiniHeart::from_item(stack.item().id(&*host).unwrap_or_default()) else {
+             return;
+         };
+         let Some(player) = host.players().acting_player() else {
+@@ -212,7 +212,7 @@ impl Hooks for Mod {
+             .map_or("", category_name);
+         let drawn = level.with_random(&mut *host, |random| {
+             heart_drops(kind, category, &config, || {
+-                u32::try_from(random.next_int_bound(100).unwrap_or(0)).unwrap_or(0)
++                u32::try_from(random.next_int_bound(100)).unwrap_or(0)
+             })
+         });
+         let Some(drops) = drawn else {
+@@ -253,12 +253,12 @@ impl ItemPart for MiniHeartPart {
+ /// The canisters one player carries, from their main inventory and off hand. The server's slot
+ /// list is the authority for a host and a guest alike.
+ fn carried_canisters(host: &dyn Host, player: PlayerRef) -> Option<Carried> {
+-    let slots = player.inventory_slots(host)?;
+-    let items: Vec<(String, u32)> = slots
+-        .iter()
+-        .filter(|(slot, _)| COUNTED_SLOTS.contains(slot) || *slot == OFF_HAND_SLOT)
+-        .map(|(_, stack)| (stack.item().id(host), stack.count()))
+-        .collect();
++    let items: Vec<(String, u32)> = player.with_inventory(host, |view| {
++        view.iter()
++            .filter(|(slot, _)| COUNTED_SLOTS.contains(slot) || *slot == OFF_HAND_SLOT)
++            .map(|(_, stack)| (stack.item().id(host).unwrap_or_default().to_owned(), stack.count()))
++            .collect()
++    })?;
+     Some(Carried::from_stacks(
+         items.iter().map(|(item, count)| (item.as_str(), *count)),
+     ))

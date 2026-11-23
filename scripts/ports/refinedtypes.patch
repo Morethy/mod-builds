@@ -1,0 +1,203 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index db9df34..b983d56 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -12,7 +12,7 @@ mod support;
+ 
+ use mod_api::{
+     self, ComponentTypesEvent, Flow, Hooks, HostSide, RegisterCommandsEvent, Registrar,
+-    RegistrationContext, RightClickBlockEvent, RunModCommandEvent, ServerHost,
++    RegistrationContext, RightClickBlockEvent, ServerHost,
+ };
+ 
+ /// The mod holds no state of its own: a block's amount is its block-entity payload, a disk's is
+@@ -42,13 +42,4 @@ impl Hooks for Mod {
+     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+         support::on_register_commands(event);
+     }
+-
+-    /// The bodies of `/refinedtypes info|insert`.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        support::on_run_mod_command(host, event)
+-    }
+ }
+diff --git a/src/support.rs b/src/support.rs
+index 213724e..ebd4cb1 100644
+--- a/src/support.rs
++++ b/src/support.rs
+@@ -9,7 +9,7 @@ use mod_api::{
+     self, BlockEntityEvent, BlockEntityPart, BlockEntityTickEvent, BlockEntityTicksEvent,
+     BlockPart, Command, CommandArgumentValue, Component, Compound, Flow, Host, HostSide,
+     HostTransaction, ItemStack, LevelSide, RegisterCommandsEvent, Registrar, RegistrationContext,
+-    RightClickBlockEvent, RunModCommandEvent, ServerHost, Tag, Text,
++    RightClickBlockEvent, ServerHost, Tag, Text,
+ };
+ 
+ use crate::runtime::{
+@@ -64,7 +64,7 @@ pub(crate) fn register(registrar: &mut dyn Registrar, _cx: &RegistrationContext)
+ 
+ /// The disk's component: the amount it carries.
+ pub(crate) fn register_component_types(event: &mut mod_api::ComponentTypesEvent<'_>) {
+-    event.types.push(COMPONENT.to_owned());
++    event.register(COMPONENT.into());
+ }
+ 
+ // --- the saved payloads ----------------------------------------------------
+@@ -174,7 +174,10 @@ fn block_id_at(host: &dyn Host, pos: [i32; 3]) -> Option<String> {
+     if !level.is_loaded(host, pos) {
+         return None;
+     }
+-    level.block(host, pos).map(|block| block.id(host))
++    level
++        .block(host, pos)
++        .and_then(|block| block.id(host))
++        .map(str::to_owned)
+ }
+ 
+ /// The node the loaded block at `pos` is.
+@@ -254,7 +257,7 @@ fn drive_disks(host: &dyn Host, drive: [i32; 3]) -> Vec<Found> {
+         let Ok(Some(stack)) = entity.item_slot(host, slot) else {
+             continue;
+         };
+-        let Some(variant) = disk_of(&stack.item().id(host)) else {
++        let Some(variant) = disk_of(stack.item().id(host).unwrap_or_default()) else {
+             continue;
+         };
+         found.push(Found {
+@@ -322,12 +325,18 @@ impl BlockEntityPart for NodePart {
+ 
+     /// One server tick of the energizer: draw the network's usage, then say whether it was
+     /// covered.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        if node_at(host, event.pos) != Some(Node::Energizer) {
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        let Some((pos, handle, old_nbt)) = event
++            .subject
++            .with_view(|view| (view.position(), view.handle(), view.nbt().clone()))
++        else {
++            return;
++        };
++        let host = event.subject.host();
++        if node_at(host, pos) != Some(Node::Energizer) {
+             return;
+         }
+-        let pos = event.pos;
+-        let mut energizer = load_energizer(&event.entity.nbt);
++        let mut energizer = load_energizer(&old_nbt);
+         // The state the block showed before this tick, so the property is written when it
+         // changes (a write every tick would be noise).
+         let was_active = energizer.active();
+@@ -345,7 +354,28 @@ impl BlockEntityPart for NodePart {
+             draw_from(host, &mut found, draw.from_storage);
+         }
+         // The state is the payload's, so it survives a save and a reload.
+-        event.entity.nbt = save_energizer(&energizer);
++        // The tick no longer commits a payload it was lent: the saved compound is the two
++        // fields `save_energizer` writes, so every other key goes and the changed ones are set.
++        let saved = save_energizer(&energizer);
++        let mut changed = false;
++        event.subject.with_view(|mut view| {
++            for (key, _) in old_nbt.iter() {
++                if saved.get(key).is_none() && view.set_nbt(key.clone(), None) {
++                    changed = true;
++                }
++            }
++            for (key, value) in saved.iter() {
++                if old_nbt.get(key) != Some(value)
++                    && view.set_nbt(key.clone(), Some(value.clone()))
++                {
++                    changed = true;
++                }
++            }
++        });
++        let host = event.subject.host();
++        if changed {
++            let _ = handle.set_changed(host);
++        }
+         if was_active != energizer.active() || !online {
+             host.set_block_property(
+                 pos,
+@@ -404,7 +434,7 @@ pub(crate) fn on_right_click_block(
+     let Some(held) = event.click.stack else {
+         return Flow::Continue;
+     };
+-    if disk_of(&held.item().id(host)).is_none() {
++    if disk_of(held.item().id(host).unwrap_or_default()).is_none() {
+         return Flow::Continue;
+     }
+     let mut one = held.clone();
+@@ -460,42 +490,44 @@ fn tell(host: &mut dyn ServerHost, uuid: u128, line: &str) {
+ pub(crate) fn on_register_commands(event: &mut RegisterCommandsEvent<'_>) {
+     event
+         .commands
+-        .push(Command::new("refinedtypes info <pos:block_pos>"));
+-    event.commands.push(Command::new(
+-        "refinedtypes insert <pos:block_pos> <family:word> <amount:integer>",
+-    ));
++        .push(Command::new("refinedtypes info <pos:block_pos>").executes(on_run_mod_command));
++    event.commands.push(
++        Command::new("refinedtypes insert <pos:block_pos> <family:word> <amount:integer>")
++            .executes(on_run_mod_command),
++    );
+ }
+ 
+ /// The `/refinedtypes` commands' bodies (`run_mod_command`).
+ pub(crate) fn on_run_mod_command(
+     host: &mut dyn ServerHost,
+-    event: &mut RunModCommandEvent<'_>,
+-) -> Flow {
+-    let [root, sub] = event.command.literals.as_slice() else {
+-        return Flow::Continue;
++    _source: &mod_api::CommandSource,
++    command: &mod_api::CommandInvocation,
++) -> Option<i32> {
++    let [root, sub] = command.literals.as_slice() else {
++        return None;
+     };
+     if root != "refinedtypes" {
+-        return Flow::Continue;
++        return None;
+     }
+-    let Some(CommandArgumentValue::BlockPos(pos)) = event.command.argument("pos") else {
++    let Some(CommandArgumentValue::BlockPos(pos)) = command.argument("pos") else {
+         feedback(
+             host,
+             "Usage: /refinedtypes <info|insert> <x> <y> <z> [family] [amount]",
+         );
+-        return Flow::Cancel;
++        return Some(1);
+     };
+     let pos = *pos;
+     match sub.as_str() {
+         "info" => {
+             info(host, pos);
+-            Flow::Cancel
++            Some(1)
+         }
+         "insert" => {
+-            let family = match event.command.argument("family") {
++            let family = match command.argument("family") {
+                 Some(CommandArgumentValue::String(name)) => Family::from_name(name),
+                 _ => None,
+             };
+-            let amount = match event.command.argument("amount") {
++            let amount = match command.argument("amount") {
+                 Some(CommandArgumentValue::Integer(amount)) => u64::try_from(*amount).ok(),
+                 _ => None,
+             };
+@@ -506,9 +538,9 @@ pub(crate) fn on_run_mod_command(
+                     "Usage: /refinedtypes insert <x> <y> <z> <energy|soul|source> <amount>",
+                 ),
+             }
+-            Flow::Cancel
++            Some(1)
+         }
+-        _ => Flow::Continue,
++        _ => None,
+     }
+ }
+ 

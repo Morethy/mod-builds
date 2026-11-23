@@ -1,0 +1,21 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 15cbd7e..71581f6 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -5,14 +5,14 @@
+ //! `farmland_trample` (NeoForge's `FarmlandTrampleEvent`) fires on the server before a landing
+ //! turns farmland into dirt; cancelling it keeps the farmland and its crop. The gamerules aren't
+ //! read: the pack's values are built in.
+-use mod_api::{FarmlandTrampleEvent, Flow, Hooks, LoopContext};
++use mod_api::{FarmlandTrampleEvent, Flow, Hooks, ServerHost};
+ 
+ #[derive(Default)]
+ struct Mod;
+ 
+ #[mod_api::sunrise_mod]
+ impl Hooks for Mod {
+-    fn farmland_trample(&self, _context: &dyn LoopContext, event: &mut FarmlandTrampleEvent) -> Flow {
++    fn farmland_trample(&self, _context: &mut dyn ServerHost, event: &mut FarmlandTrampleEvent) -> Flow {
+         event.cancelled = true;
+         Flow::Cancel
+     }

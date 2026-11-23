@@ -1,0 +1,37 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 836b5f6..dbf7a62 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -509,9 +509,10 @@ fn queue_evaluate(event: &NeighborChangedEvent) {
+ impl BlockPart for SourcePart {
+     fn state_for_placement(
+         &self,
+-        level: &dyn LevelHost,
++        level: mod_api::LevelSide<'_>,
+         event: &mut StateForPlacementEvent<'_>,
+     ) -> Option<Option<BlockState>> {
++        let (mod_api::LevelSide::Server(level) | mod_api::LevelSide::Client(level)) = level;
+         placement_state(level, event)
+     }
+ 
+@@ -528,9 +529,10 @@ struct ReceiverPart;
+ impl BlockPart for ReceiverPart {
+     fn state_for_placement(
+         &self,
+-        level: &dyn LevelHost,
++        level: mod_api::LevelSide<'_>,
+         event: &mut StateForPlacementEvent<'_>,
+     ) -> Option<Option<BlockState>> {
++        let (mod_api::LevelSide::Server(level) | mod_api::LevelSide::Client(level)) = level;
+         placement_state(level, event)
+     }
+ 
+@@ -688,7 +690,7 @@ impl Hooks for Mod {
+         let Some(stack) = click.stack else {
+             return Flow::Continue;
+         };
+-        if !sturdy_item(&stack.item().id(&*host)) {
++        if !sturdy_item(stack.item().id(&*host).unwrap_or_default()) {
+             return Flow::Continue;
+         }
+         let Some(face) = direction(click.hit.face) else {

@@ -1,0 +1,166 @@
+diff --git a/src/hint.rs b/src/hint.rs
+index 7f95e0a..5988a7f 100644
+--- a/src/hint.rs
++++ b/src/hint.rs
+@@ -127,7 +127,10 @@ pub fn render(host: &dyn ClientHost, event: &mut RenderLivingPostEvent<'_>) {
+ fn synced(host: &dyn ClientHost, entity: EntityRef) -> Option<tamed::Tamed> {
+     host.query(&TAMED)
+         .ok()?
+-        .get(AttachmentHolder::Entity(entity))
++        .get(
++            host.attachment_read_scope().ok()?,
++            AttachmentHolder::Entity(entity),
++        )
+         .ok()
+         .flatten()
+ }
+diff --git a/src/lib.rs b/src/lib.rs
+index ff7dfb0..c85270f 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -230,29 +230,36 @@ impl Hooks for Mod {
+     }
+ 
+     /// Mob ticks are told only to a mod that asks for them.
+-    fn entity_tick_listened(&self, _: &mut dyn ServerHost, event: &mut EntityTickListenedEvent) {
+-        event.listened = true;
++    fn entity_tick_listened(&self, host: HostSide<'_>, event: &mut EntityTickListenedEvent) {
++        // Only the server's mobs are looked after, as before the client was asked too.
++        if let HostSide::Server(_) = host {
++            event.listened = true;
++        }
+     }
+ 
+     /// After a mob's tick: note its type (for the damage hooks), make sure a
+     /// friendly mob has no player target, and run a tamed mob's loot and
+     /// sparkles.
+-    fn entity_tick_post(&self, host: &mut dyn ServerHost, event: &mut EntityTickPostEvent<'_>) {
+-        let (id, kind) = (event.entity, event.kind);
+-        let Some(entity) = host.entity(id) else {
+-            return;
+-        };
+-        let Some(mob) = host.mob(entity) else {
++    fn entity_tick_post(&self, host: HostSide<'_>, event: &mut EntityTickPostEvent<'_>) {
++        let HostSide::Server(host) = host else {
+             return;
+         };
+-        m::note_mob(id, kind);
+-        if m::friendly(id, kind)
+-            && let Some(target) = mob.target(&*host)
+-            && (is_player(&*host, target.entity()) || m::spares_mobs_of(id, kind))
+-        {
+-            mob.set_target(host, None);
++        for (&id, &kind) in event.entities.iter().zip(event.kinds.iter()) {
++            let Some(entity) = host.entity(id) else {
++                continue;
++            };
++            let Some(mob) = host.mob(entity) else {
++                continue;
++            };
++            m::note_mob(id, kind);
++            if m::friendly(id, kind)
++                && let Some(target) = mob.target(&*host)
++                && (is_player(&*host, target.entity()) || m::spares_mobs_of(id, kind))
++            {
++                mob.set_target(host, None);
++            }
++            tamed_tick(host, entity, kind);
+         }
+-        tamed_tick(host, entity, kind);
+     }
+ 
+     /// A tamed mob never despawns.
+@@ -285,7 +292,7 @@ impl Hooks for Mod {
+             return None;
+         };
+         let stack = event.stack?;
+-        let item = stack.item().id(&*host);
++        let item = stack.item().id(&*host).unwrap_or_default().to_owned();
+         let entity = host.entity(u32::try_from(event.entity).ok()?)?;
+         let player = host.players().acting_player()?;
+         if item == "minecraft:lead" && m::leashable(event.kind) {
+@@ -311,7 +318,7 @@ fn load_settings(host: &dyn Host) {
+ 
+ /// An entity's type id (`minecraft:zombie`).
+ fn kind_of(host: &dyn Host, entity: EntityRef) -> Option<String> {
+-    Some(entity.kind(host)?.id(host))
++    entity.kind(host)?.id(host).map(|name| name.to_string())
+ }
+ 
+ fn is_player(host: &dyn Host, entity: EntityRef) -> bool {
+@@ -327,7 +334,7 @@ fn is_tamed(host: &mut dyn Host, entity: EntityRef) -> bool {
+     attached
+         || entity
+             .tags(&*host)
+-            .is_some_and(|tags| tags.iter().any(|t| t == m::TAMED_TAG))
++            .is_some_and(|tags| tags.contains(m::TAMED_TAG))
+ }
+ 
+ /// Auto sleep: once the day has ended in the Overworld, skip to the morning
+@@ -351,7 +358,12 @@ fn auto_sleep(host: &mut dyn ServerHost) {
+     if matches!(weather, Ok(Some(GameRuleValue::Bool(true)))) {
+         level.set_weather(host, 0, 0, false, false);
+     }
+-    for player in level.online_players(&*host).unwrap_or_default() {
++    let mut players = Vec::new();
++    let _ = level.visit_online_players(&*host, &mut |player| {
++        players.push(player);
++        std::ops::ControlFlow::Continue(())
++    });
++    for player in players {
+         player.reset_stat(host, StatType::Custom, "minecraft:time_since_rest");
+     }
+ }
+@@ -469,7 +481,7 @@ fn feed(
+     if success {
+         let tamer = tamed::Tamed {
+             owner: Some(player.uuid()),
+-            owner_name: player.name(&*host),
++            owner_name: player.name(&*host).map(str::to_owned),
+             profile: player.profile(&*host).map(|p| tamed::profile_tag(&p)),
+         };
+         let _ = tamed::TAMED.set(host, Holder::Entity(entity.id()), tamer);
+@@ -494,7 +506,9 @@ fn use_up(host: &mut dyn ServerHost, player: mod_api::PlayerRef, hand: Hand, res
+     let Some(living) = host.living(player.entity()) else {
+         return;
+     };
+-    let held = living.hand_item(&*host, hand);
++    let held = living
++        .with_hand_item(&*host, hand, |s| s.project())
++        .flatten();
+     let left = held.and_then(|s| s.shrink(1));
+     let rest = rest.and_then(|r| stack_of(&*host, r));
+     match (left, rest) {
+diff --git a/src/tamed.rs b/src/tamed.rs
+index 2deeae1..e12ad34 100644
+--- a/src/tamed.rs
++++ b/src/tamed.rs
+@@ -75,23 +75,22 @@ fn decode(data: &Compound) -> Result<Tamed, AttachmentError> {
+ /// for a head that shows their skin.
+ pub fn profile_tag(profile: &mod_api::GameProfile) -> Tag {
+     let properties = profile
+-        .properties
+-        .iter()
++        .properties()
+         .map(|p| {
+             let mut c: Compound = [
+-                ("name".into(), Tag::String(p.name.as_str().into())),
+-                ("value".into(), Tag::String(p.value.as_str().into())),
++                ("name".into(), Tag::String(p.name.into())),
++                ("value".into(), Tag::String(p.value.into())),
+             ]
+             .into();
+             if let Some(sig) = &p.signature {
+-                c.insert("signature".into(), Tag::String(sig.as_str().into()));
++                c.insert("signature".into(), Tag::String((*sig).into()));
+             }
+             Tag::Compound(c)
+         })
+         .collect();
+     Tag::Compound(
+         [
+-            ("name".into(), Tag::String(profile.name.as_str().into())),
++            ("name".into(), Tag::String(profile.name.into())),
+             ("id".into(), Tag::IntArray(uuid_ints(profile.uuid))),
+             ("properties".into(), Tag::List(properties)),
+         ]

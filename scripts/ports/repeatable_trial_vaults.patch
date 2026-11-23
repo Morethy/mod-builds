@@ -1,0 +1,22 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 688b428..2efab4c 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -54,7 +54,7 @@ impl BlockPart for ResetVault {
+     ) -> Option<InteractionResult> {
+         let click = event.click;
+         let stack = click.stack?;
+-        let item = stack.item().id(host);
++        let item = stack.item().id(host).unwrap_or_default().to_owned();
+         let player = host.player(click.player)?;
+         let level = host.level(click.dimension.key().id())?;
+         let vault = host.block_entity(level, click.pos)?;
+@@ -95,7 +95,7 @@ struct ResetKeyTooltip;
+ #[mod_api::sunrise_part]
+ impl ItemPart for ResetKeyTooltip {
+     fn tooltip(&self, host: &dyn ClientHost, event: &mut TooltipEvent<'_>) {
+-        if !runtime::tooltip_applies(&event.stack.item().id(host)) {
++        if !runtime::tooltip_applies(event.stack.item().id(host).unwrap_or_default()) {
+             return;
+         }
+         event

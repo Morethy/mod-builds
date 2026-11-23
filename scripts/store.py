@@ -39,6 +39,8 @@ STORE = "store"
 BUILDS = "builds.json"
 INDEX = "index.json"
 CATALOG = "https://horizon-rust.github.io/horizon-mods/index.json"
+# Sunrise's own catalog, which a game built on Sunrise lists beside Horizon's.
+SUNRISE_CATALOG = "https://sunrise-org.github.io/sunrise-mods/index.json"
 # Each ABI the store builds for, and the Rust target its SDK slices are named after.
 TARGETS = {
     "arm64-v8a": "aarch64-linux-android",
@@ -412,6 +414,9 @@ def main(argv):
         write_index(build, run_gh, pathlib.Path("answer"))
     elif command == "plan":
         catalog = fetch_json(CATALOG)
+        other = fetch_json(SUNRISE_CATALOG) or {}
+        catalog = {**catalog, "projects": [*catalog.get("projects", []), *other.get("projects", [])],
+                   "revoked": [*catalog.get("revoked", []), *other.get("revoked", [])]}
         known = build_row(build)
         if not known:
             sys.exit(f"{build} is not in the store's {BUILDS}: run store-base.yml for it first")

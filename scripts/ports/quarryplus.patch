@@ -1,0 +1,308 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 0f287be..5713c71 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -14,10 +14,10 @@
+ mod runtime;
+ 
+ use mod_api::{
+-    self, BlockEntityPart, BlockEntityRef, BlockEntityTickEvent, BlockEntityTickReply,
++    self, BlockEntityPart, BlockEntityRef, BlockEntityTickEvent,
+     BlockEntityTicksEvent, BlockPart, Command, CommandArgumentValue, CommandSource, Compound, Dist,
+-    Flow, Hooks, HostBlockStates, Identifier, ItemKey, ItemStack, LevelRef, ModContainer,
+-    ModEnergyBuffer, RegisterCommandsEvent, Registrar, RegistrationContext, RunModCommandEvent,
++    Hooks, HostBlockStates, Identifier, ItemKey, ItemStack, LevelRef, ModContainer,
++    ModEnergyBuffer, RegisterCommandsEvent, Registrar, RegistrationContext, CommandInvocation,
+     ServerHost, Tag, Text,
+ };
+ 
+@@ -142,7 +142,7 @@ fn inventory_summary(items: &[Option<ItemStack>], host: &dyn mod_api::Host) -> S
+         .iter()
+         .flatten()
+         .filter(|stack| stack.count() > 0)
+-        .map(|stack| format!("{} x{}", stack.item().id(host), stack.count()))
++        .map(|stack| format!("{} x{}", stack.item().id(host).unwrap_or_default(), stack.count()))
+         .collect();
+     if stacks.is_empty() {
+         "empty".to_owned()
+@@ -189,7 +189,7 @@ fn mining_rights(host: &dyn ServerHost, level: LevelRef) -> Rights {
+         } else {
+             0
+         },
+-        spawn: level.respawn_data(host).map(|data| data.pos),
++        spawn: level.respawn_data(host).map(|data| { let pos = data.position.pos(); [pos.x, pos.y, pos.z] }),
+         in_overworld: level
+             .dimension()
+             .id(host)
+@@ -261,7 +261,7 @@ fn quarry_at(
+     pos: runtime::Pos,
+ ) -> Option<BlockEntityRef> {
+     let block = level.block(host, pos)?;
+-    (block.id(host) == QUARRY).then(|| host.block_entity(level, pos))?
++    (block.id(host) == Some(QUARRY)).then(|| host.block_entity(level, pos))?
+ }
+ 
+ /// What one target asks of the runtime: `None` when the level cannot answer (the quarry
+@@ -273,7 +273,7 @@ fn target_cost(
+     pos: runtime::Pos,
+ ) -> Option<Option<i32>> {
+     let block = level.block(host, pos)?;
+-    if is_air(&block.id(host)) {
++    if is_air(block.id(host).unwrap_or_default()) {
+         return Some(None);
+     }
+     if level
+@@ -291,26 +291,60 @@ fn target_cost(
+ /// One server tick of a quarry: inspect the next unvisited target, skip air/fluids and
+ /// unbreakable blocks, advance the four-tick break budget, and destroy a block once with
+ /// collected drops.
+-fn quarry_tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-    let pos = event.pos;
++fn quarry_tick(event: &mut BlockEntityTickEvent<'_>) {
++    let Some((pos, handle, mut items, mut nbt)) = event.subject.with_view(|view| {
++        let items: Vec<Option<ItemStack>> = (0..view.item_slots() as u32)
++            .map(|slot| view.item_slot(slot).and_then(|stack| stack.to_owned()))
++            .collect();
++        (view.position(), view.handle(), items, view.nbt().clone())
++    }) else {
++        return;
++    };
++    let before_items = items.clone();
++    let before_nbt = nbt.clone();
++    quarry_work(event.subject.host(), pos, &mut items, &mut nbt);
++    // Ticking alone must not dirty the chunk: it is marked only when the tick wrote.
++    let changed = event.subject.with_view(|mut view| {
++        let mut changed = false;
++        for (slot, stack) in items.iter().enumerate() {
++            if before_items.get(slot) != Some(stack) {
++                changed |= view.set_item_slot(slot as u32, stack.clone()).unwrap_or(false);
++            }
++        }
++        for (key, value) in nbt.iter() {
++            if before_nbt.get(key) != Some(value) {
++                changed |= view.set_nbt(key.clone(), Some(value.clone()));
++            }
++        }
++        changed
++    });
++    if changed == Some(true) {
++        let _ = handle.set_changed(event.subject.host());
++    }
++}
++
++/// The tick's work on the block entity's slots and saved compound, lent out of its view.
++fn quarry_work(
++    host: &mut dyn ServerHost,
++    pos: runtime::Pos,
++    items: &mut Vec<Option<ItemStack>>,
++    nbt: &mut Compound,
++) {
+     let Some(level) = in_place_level(host) else {
+         return;
+     };
+-    let mut changed = false;
+-    if event.entity.items.len() < INVENTORY_SLOTS {
+-        event.entity.items.resize(INVENTORY_SLOTS, None);
+-        changed = true;
++    if items.len() < INVENTORY_SLOTS {
++        items.resize(INVENTORY_SLOTS, None);
+     }
+-    let area = match read_area(&event.entity.nbt) {
++    let area = match read_area(nbt) {
+         Some(area) => area,
+         None => {
+             let area = Area::default_at(pos, DEFAULT_RADIUS, DEFAULT_DEPTH);
+-            write_area(&mut event.entity.nbt, &area);
+-            changed = true;
++            write_area(nbt, &area);
+             area
+         }
+     };
+-    let before = read_mining(&event.entity.nbt);
++    let before = read_mining(nbt);
+     let mut machine = before;
+     if area.is_empty() || machine.cursor > area.len() {
+         machine.cursor = area.len();
+@@ -362,20 +396,14 @@ fn quarry_tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>)
+                     .flatten()
+                     .unwrap_or_default();
+                 for drop in drops {
+-                    let _ = store_drop(&*host, &mut event.entity.items, drop);
++                    let _ = store_drop(&*host, items, drop);
+                 }
+-                changed = true;
+                 break;
+             }
+         }
+     }
+     if machine != before {
+-        write_mining(&mut event.entity.nbt, &machine);
+-        changed = true;
+-    }
+-    // Ticking alone must not dirty the chunk: the tick is `Changed` only when it did.
+-    if !changed {
+-        *event.reply = BlockEntityTickReply::Unchanged;
++        write_mining(nbt, &machine);
+     }
+ }
+ 
+@@ -391,12 +419,12 @@ fn store_drop(host: &dyn mod_api::Host, items: &mut [Option<ItemStack>], drop: I
+         .iter()
+         .map(|slot| {
+             slot.as_ref()
+-                .map(|stack| DropStack::new(&stack.item().id(host), stack.count(), stack.damage()))
++                .map(|stack| DropStack::new(stack.item().id(host).unwrap_or_default(), stack.count(), stack.damage()))
+         })
+         .collect();
+     let plan = drop_plan(
+         &existing,
+-        &DropStack::new(&drop.item().id(host), drop.count(), drop.damage()),
++        &DropStack::new(drop.item().id(host).unwrap_or_default(), drop.count(), drop.damage()),
+         max_stack,
+     );
+     let mut placed = 0;
+@@ -442,8 +470,8 @@ impl BlockEntityPart for Quarry {
+         event.ticks = true;
+     }
+ 
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        quarry_tick(host, event);
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        quarry_tick(event);
+     }
+ }
+ 
+@@ -466,27 +494,27 @@ impl Hooks for Mod {
+     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+         event
+             .commands
+-            .push(Command::new("quarryplus info <pos:block_pos>"));
++            .push(Command::new("quarryplus info <pos:block_pos>").executes(run_command));
+         event.commands.push(Command::op(
+             "quarryplus energy <amount:integer> <pos:block_pos>",
+             2,
+-        ));
++        ).executes(run_command));
+         event.commands.push(Command::op(
+             "quarryplus area <pos:block_pos> <radius:integer> <depth:integer>",
+             2,
+-        ));
++        ).executes(run_command));
+     }
++}
+ 
+-    /// Run the `/quarryplus` commands a player types.
+-    fn run_mod_command(
+-        &self,
++/// Run the `/quarryplus` commands a player types.
++fn run_command(
+         host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        let invocation = event.command;
++        source: &CommandSource,
++        invocation: &CommandInvocation,
++    ) -> Option<i32> {
+         let literals: Vec<&str> = invocation.literals.iter().map(String::as_str).collect();
+         let Some(CommandArgumentValue::BlockPos(pos)) = invocation.argument("pos") else {
+-            return Flow::Continue;
++            return None;
+         };
+         let pos = *pos;
+         let Some(level) = host
+@@ -495,26 +523,26 @@ impl Hooks for Mod {
+             .into_iter()
+             .find(|level| level.dimension() == invocation.dimension)
+         else {
+-            return Flow::Continue;
++            return None;
+         };
+         match literals.as_slice() {
+             ["quarryplus", "info"] => {
+-                if !may_read(&*host, event.source, level, pos) {
++                if !may_read(&*host, source, level, pos) {
+                     feedback(
+                         host,
+                         &format!(
+                             "You must be an operator or within {INSPECT_RANGE:.0} blocks of the quarry."
+                         ),
+                     );
+-                    return Flow::Cancel;
++                    return Some(1);
+                 }
+                 let Some(entity) = quarry_at(&*host, level, pos) else {
+                     feedback(host, "No Quarry there.");
+-                    return Flow::Cancel;
++                    return Some(1);
+                 };
+                 let Some(data) = entity.data(&*host) else {
+                     feedback(host, "No Quarry there.");
+-                    return Flow::Cancel;
++                    return Some(1);
+                 };
+                 let area = read_area(&data)
+                     .unwrap_or_else(|| Area::default_at(pos, DEFAULT_RADIUS, DEFAULT_DEPTH));
+@@ -526,21 +554,21 @@ impl Hooks for Mod {
+                 let Some(CommandArgumentValue::Integer(amount)) = invocation.argument("amount")
+                 else {
+                     feedback(host, "The energy must be a whole number.");
+-                    return Flow::Cancel;
++                    return Some(1);
+                 };
+                 let Some(entity) = quarry_at(&*host, level, pos) else {
+                     feedback(host, "No Quarry there.");
+-                    return Flow::Cancel;
++                    return Some(1);
+                 };
+                 let energy = (*amount).clamp(0, MAX_ENERGY);
+                 let Some(mut data) = entity.data(&*host) else {
+                     feedback(host, "No Quarry there.");
+-                    return Flow::Cancel;
++                    return Some(1);
+                 };
+                 put(&mut data, "energy", energy);
+                 if entity.replace_data(host, data).is_err() {
+                     feedback(host, "No Quarry there.");
+-                    return Flow::Cancel;
++                    return Some(1);
+                 }
+                 feedback(
+                     host,
+@@ -554,15 +582,15 @@ impl Hooks for Mod {
+                 ) = (invocation.argument("radius"), invocation.argument("depth"))
+                 else {
+                     feedback(host, "The radius and depth must be whole numbers.");
+-                    return Flow::Cancel;
++                    return Some(1);
+                 };
+                 let Some(entity) = quarry_at(&*host, level, pos) else {
+                     feedback(host, "No Quarry there.");
+-                    return Flow::Cancel;
++                    return Some(1);
+                 };
+                 let Some(mut data) = entity.data(&*host) else {
+                     feedback(host, "No Quarry there.");
+-                    return Flow::Cancel;
++                    return Some(1);
+                 };
+                 let area = Area::default_at(pos, *radius, *depth);
+                 let mining = read_mining(&data);
+@@ -576,15 +604,14 @@ impl Hooks for Mod {
+                 );
+                 if entity.replace_data(host, data).is_err() {
+                     feedback(host, "No Quarry there.");
+-                    return Flow::Cancel;
++                    return Some(1);
+                 }
+                 feedback(host, &format!("Quarry area set to {} blocks.", area.len()));
+             }
+-            _ => return Flow::Continue,
++            _ => return None,
+         }
+-        Flow::Cancel
++        Some(1)
+     }
+-}
+ 
+ #[cfg(test)]
+ mod tests {

@@ -1,0 +1,13 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 76da53c..d757fec 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -179,7 +179,7 @@ impl Hooks for Mod {
+                 Some(block) => {
+                     // Both blocks have no state properties, so the canonical id is the whole
+                     // answer: the light still is the block it was placed as.
+-                    let current = LightKind::of_block(&block.id(game)) == Some(light.kind);
++                    let current = LightKind::of_block(block.id(game).unwrap_or_default()) == Some(light.kind);
+                     changed |= !current;
+                     current
+                 }

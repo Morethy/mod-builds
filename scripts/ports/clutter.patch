@@ -1,0 +1,94 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index b38f0a3..15d90fd 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -534,7 +534,7 @@ fn sit(host: &mut dyn ServerHost, dim: &str, pos: [i32; 3], player: PlayerRef, o
+     let Some(id) = host.summon(dim, "minecraft:armor_stand", at, nbt) else { return false };
+     let Some(stand) = host.entity(id) else { return false };
+     stand.add_tag(host, SEAT_TAG);
+-    if !player.entity().start_riding(host, stand, true) {
++    if player.entity().start_riding(host, stand, true).is_err() {
+         stand.discard(host);
+         return false;
+     }
+@@ -559,7 +559,7 @@ fn tend_seats(host: &mut dyn ServerHost) {
+         let reader: &dyn ServerHost = &*host;
+         let Some(stand) = host.entity(s.stand) else { continue };
+         // Entity ids are reused: only ever discard the stand this seat summoned.
+-        if !stand.tags(reader).is_some_and(|t| t.iter().any(|t| t == SEAT_TAG)) {
++        if !stand.tags(reader).is_some_and(|t| t.contains(SEAT_TAG)) {
+             continue;
+         }
+         let ridden = stand.passengers(reader).is_some_and(|p| !p.is_empty());
+@@ -590,7 +590,7 @@ fn creative(host: &dyn ServerHost, player: u128) -> bool {
+ }
+ 
+ fn item_id(host: &dyn ServerHost, stack: Option<&ItemStack>) -> String {
+-    stack.filter(|s| s.count() > 0).map(|s| s.item().id(host)).unwrap_or_default()
++    stack.filter(|s| s.count() > 0).and_then(|s| s.item().id(host)).unwrap_or_default().to_owned()
+ }
+ 
+ fn stack_of(host: &dyn ServerHost, id: &str, n: u32) -> Option<ItemStack> {
+@@ -626,7 +626,7 @@ fn damage_held(host: &mut dyn ServerHost, click: &mod_api::BlockClick<'_>) {
+ 
+ fn sound(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3], sound: &str, pitch: f32) {
+     let at = pos.map(|v| f64::from(v) + 0.5);
+-    level.play_sound(host, sound, at, SoundSource::Blocks, 1.0, pitch);
++    level.play_sound(host, sound, at, SoundSource::Blocks, 1.0, pitch, None);
+ }
+ 
+ fn give(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3], id: &str, n: u32) {
+@@ -872,7 +872,7 @@ fn use_empty(host: &mut dyn ServerHost, dim: &str, level: LevelRef, st: &St, cli
+ /// `level.random.nextInt(bound)`.
+ fn rand_int(host: &mut dyn ServerHost, level: LevelRef, bound: u32) -> u32 {
+     let b = bound.max(1) as i32;
+-    level.with_random(host, |r| mod_api::RandomSource::next_int_bound(r, b).unwrap_or(0)).unwrap_or(0) as u32
++    level.with_random(host, |r| mod_api::RandomSource::next_int_bound(r, b)).unwrap_or(0) as u32
+ }
+ 
+ fn lamp_click(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3], lit: bool) {
+@@ -954,7 +954,7 @@ fn lset_default(level: &mut dyn LevelWriteHost, p: [i32; 3], id: &str, props: &[
+ }
+ 
+ fn lrand(level: &mut dyn LevelWriteHost, bound: i32) -> i32 {
+-    level.with_random(|r| mod_api::RandomSource::next_int_bound(r, bound).unwrap_or(0)).unwrap_or(0)
++    level.with_random(|r| mod_api::RandomSource::next_int_bound(r, bound)).unwrap_or(0)
+ }
+ 
+ /// One growth step; true when the block changed. `bonemeal` grows without the chance.
+@@ -1127,7 +1127,7 @@ fn grow_tree(host: &mut dyn ServerHost, dim: &str, pos: [i32; 3]) {
+ 
+ /// LampBlock / TallLampBlock.neighborChanged, run in the tick it schedules (the neighbour hook can't write).
+ fn lamp_redstone(level: &mut dyn LevelWriteHost, p: [i32; 3], st: &St) {
+-    let power = level.has_neighbor_signal(p);
++    let power = level.has_neighbor_signal(p).unwrap_or(false);
+     if power == st.is("powered", "true") {
+         return;
+     }
+@@ -1157,7 +1157,8 @@ struct Rules;
+ 
+ #[mod_api::sunrise_part]
+ impl BlockPart for Rules {
+-    fn state_for_placement(&self, level: &dyn LevelHost, event: &mut StateForPlacementEvent<'_>) -> Option<Option<mod_api::BlockState>> {
++    fn state_for_placement(&self, level: mod_api::LevelSide<'_>, event: &mut StateForPlacementEvent<'_>) -> Option<Option<mod_api::BlockState>> {
++        let (mod_api::LevelSide::Server(level) | mod_api::LevelSide::Client(level)) = level;
+         let answer = place(level, event)?;
+         if std::env::var_os("CLUTTER_DEBUG").is_some() {
+             eprintln!("[clutter] placement answer {:?} -> {:?}", answer.as_ref().map(St::text),
+@@ -1249,7 +1250,7 @@ impl BlockPart for Rules {
+             return;
+         }
+         let pos = bp(event.pos);
+-        if level.has_neighbor_signal(pos) != st.is("powered", "true") {
++        if level.has_neighbor_signal(pos).unwrap_or(false) != st.is("powered", "true") {
+             if let Some(k) = key_of(st.name()) {
+                 level.schedule_block_tick(pos, k, 1);
+             }
+@@ -1387,6 +1388,7 @@ impl Hooks for Mod {
+             r.block_part(key, Rules);
+             if let Some((be, slots, menu)) = storage(cls) {
+                 r.block_container(&key, ModContainer {
++                    insert_rules: Vec::new(),
+                     slots,
+                     faces: std::array::from_fn(|_| (0..slots).collect()),
+                     inputs: (0..slots).collect(),

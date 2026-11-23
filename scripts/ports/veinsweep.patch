@@ -1,0 +1,161 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 32dcb43..68036e2 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -8,7 +8,7 @@
+ use mod_api::{
+     self, BreakBlockEvent, ClientHost, ClientTickPostEvent, Command, CommandArgumentValue,
+     CommandSource, Flow, Hooks, Host, HostBlockStates, KeyConflictContext, KeyRegistration,
+-    RegisterCommandsEvent, RegistrationContext, Registrar, RunModCommandEvent, ServerHost,
++    RegisterCommandsEvent, RegistrationContext, Registrar, ServerHost,
+     SettingSpec, Text,
+ };
+ use std::collections::{HashSet, VecDeque};
+@@ -140,7 +140,9 @@ impl Hooks for VeinSweep {
+     fn client_tick_post(&self, host: &mut dyn ClientHost, _event: &mut ClientTickPostEvent) {
+         // 只有“正在游玩、且没有打开界面”时才把按键算作按下；
+         // 其余时候清零，避免退出界面后残留按下状态。
+-        let held = host.on(ID) && host.playing() && host.is_down(ID, TRIGGER_MAPPING);
++        let held = host.on(ID) && host.playing() && host
++                .mod_key_mapping(ID, TRIGGER_MAPPING)
++                .is_ok_and(|key| key.is_down(&*host).unwrap_or(false));
+         TRIGGER_HELD.store(held, Ordering::Relaxed);
+         // 用 UUID 记住按键属于本机哪名玩家：客户端读不到玩家名，UUID 两端一致。
+         let owner = if held {
+@@ -154,49 +156,22 @@ impl Hooks for VeinSweep {
+     }
+ 
+     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+-        event.commands.push(Command::op(
+-            "veinsweep blacklist add <block:resource:minecraft:block>",
+-            2,
+-        ));
+-        event.commands.push(Command::op(
+-            "veinsweep blacklist remove <block:resource:minecraft:block>",
+-            2,
+-        ));
+-        event.commands.push(Command::new("veinsweep blacklist list"));
+-        event.commands.push(Command::op("veinsweep blacklist clear", 2));
+-    }
+-
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        if event.command.literals.first().map(String::as_str) != Some(ID) {
+-            return Flow::Continue;
+-        }
+-        let action = event.command.literals.get(2).map(String::as_str).unwrap_or("");
+-        let reply = match action {
+-            "add" => match event.command.argument("block") {
+-                Some(CommandArgumentValue::Id(block)) => add_block(host, &block.to_string()),
+-                _ => Text::translate("veinsweep.command.usage.add", Vec::new()),
+-            },
+-            "remove" => match event.command.argument("block") {
+-                Some(CommandArgumentValue::Id(block)) => remove_block(host, &block.to_string()),
+-                _ => Text::translate("veinsweep.command.usage.remove", Vec::new()),
+-            },
+-            "list" => list_blocks(host),
+-            "clear" => clear_blocks(host),
+-            _ => Text::translate("veinsweep.command.usage", Vec::new()),
+-        };
+-        match event.source {
+-            CommandSource::Player { player, .. } => {
+-                let _ = player.tell(host, reply);
+-            }
+-            _ => {
+-                let _ = host.commands().feedback(reply);
+-            }
+-        }
+-        Flow::Cancel
++        event.commands.push(
++            Command::op(
++                "veinsweep blacklist add <block:resource:minecraft:block>",
++                2,
++            )
++            .executes(run_command),
++        );
++        event.commands.push(
++            Command::op(
++                "veinsweep blacklist remove <block:resource:minecraft:block>",
++                2,
++            )
++            .executes(run_command),
++        );
++        event.commands.push(Command::new("veinsweep blacklist list").executes(run_command));
++        event.commands.push(Command::op("veinsweep blacklist clear", 2).executes(run_command));
+     }
+ 
+     fn break_block(
+@@ -237,7 +212,7 @@ impl Hooks for VeinSweep {
+ 
+         // 连锁只由「触发条件 + 破坏方块」触发，与手里拿着什么无关；
+         // 并且只在**同种方块**内部扩散：按方块 ID 比较（忽略朝向等状态）。
+-        let origin = event.state.block().id(host);
++        let origin = event.state.block().id(host).unwrap_or_default().to_owned();
+         let blacklist = blacklist(host);
+         if blacklist.contains(&origin) {
+             return Flow::Continue;
+@@ -330,7 +305,7 @@ fn can_chain(
+     {
+         return false;
+     }
+-    state.block().id(host) == origin
++    state.block().id(host) == Some(origin)
+ }
+ 
+ /// 矿脉模式：固定 26 向 BFS，把整条同种矿脉挖完（上限是硬约束）。
+@@ -552,6 +527,39 @@ fn setting_number(host: &dyn Host, key: &str, default: f64) -> f64 {
+ 
+ /// 触发键状态是否属于这次破坏的玩家。
+ ///
++fn run_command(
++    host: &mut dyn ServerHost,
++    source: &CommandSource,
++    command: &mod_api::CommandInvocation,
++) -> Option<i32> {
++    if command.literals.first().map(String::as_str) != Some(ID) {
++        return None;
++    }
++    let action = command.literals.get(2).map(String::as_str).unwrap_or("");
++    let reply = match action {
++        "add" => match command.argument("block") {
++            Some(CommandArgumentValue::Id(block)) => add_block(host, &block.to_string()),
++            _ => Text::translate("veinsweep.command.usage.add", Vec::new()),
++        },
++        "remove" => match command.argument("block") {
++            Some(CommandArgumentValue::Id(block)) => remove_block(host, &block.to_string()),
++            _ => Text::translate("veinsweep.command.usage.remove", Vec::new()),
++        },
++        "list" => list_blocks(host),
++        "clear" => clear_blocks(host),
++        _ => Text::translate("veinsweep.command.usage", Vec::new()),
++    };
++    match source {
++        CommandSource::Player { player, .. } => {
++            let _ = player.tell(host, reply);
++        }
++        _ => {
++            let _ = host.commands().feedback(reply);
++        }
++    }
++    Some(1)
++}
++
+ /// 客户端只采样本机玩家的按键；LAN 里服务端会收到其他玩家的破坏事件，
+ /// 这里用玩家 UUID 把触发限定在本机玩家身上，避免主机的按键带动别人。
+ fn trigger_owner_is(player: mod_api::PlayerRef) -> bool {
+@@ -565,10 +573,8 @@ fn trigger_owner_is(player: mod_api::PlayerRef) -> bool {
+ fn hand_stack(host: &dyn Host, player: mod_api::PlayerRef) -> Option<mod_api::ItemStack> {
+     let slot = player.selected_slot(host)? as u32;
+     player
+-        .inventory_slots(host)?
+-        .into_iter()
+-        .find(|(index, _)| *index == slot)
+-        .map(|(_, stack)| stack)
++        .with_inventory(host, |view| view.get(slot).and_then(|stack| stack.project()))
++        .flatten()
+ }
+ 
+ /// 剩余耐久是否仍高于保留值；没有耐久概念的物品（或空手）直接放行。

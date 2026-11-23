@@ -1,0 +1,59 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index bfd9b63..42de03f 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -197,9 +197,16 @@ fn pull_travellers(
+             }
+         }
+         for level in levels {
+-            let Some(entities) = level.all_entities(host) else {
++            let mut entities = Vec::new();
++            if level
++                .visit_all_entities(host, &mut |entity| {
++                    entities.push(entity);
++                    std::ops::ControlFlow::Continue(())
++                })
++                .is_err()
++            {
+                 continue;
+-            };
++            }
+             for entity in entities {
+                 // The players are already candidates, and only a living entity rides.
+                 if player_entities.contains(&entity) || host.living(entity).is_none() {
+@@ -216,7 +223,10 @@ fn pull_travellers(
+         if state.rides.contains_key(&uuid) {
+             continue;
+         }
+-        let kind = entity.kind(host).map_or(String::new(), |key| key.id(host));
++        let kind = entity
++            .kind(host)
++            .and_then(|key| key.id(host))
++            .map_or(String::new(), |id| id.as_str().to_owned());
+         let spectator = entity.spectator(host).unwrap_or(false);
+         if !may_travel(&kind, spectator, &BLACKLISTED_TRAVELLERS) {
+             continue;
+@@ -344,9 +354,10 @@ impl BlockPart for TubeShape {
+     /// beside the cell it goes into.
+     fn state_for_placement(
+         &self,
+-        level: &dyn LevelHost,
++        level: mod_api::LevelSide<'_>,
+         event: &mut StateForPlacementEvent<'_>,
+     ) -> Option<Option<BlockState>> {
++        let (mod_api::LevelSide::Server(level) | mod_api::LevelSide::Client(level)) = level;
+         let pos = xyz(event.context.pos);
+         Some(Some(self.shape(level, pos, event.state, None)?))
+     }
+@@ -374,9 +385,10 @@ struct EntranceShape;
+ impl BlockPart for EntranceShape {
+     fn state_for_placement(
+         &self,
+-        level: &dyn LevelHost,
++        level: mod_api::LevelSide<'_>,
+         event: &mut StateForPlacementEvent<'_>,
+     ) -> Option<Option<BlockState>> {
++        let (mod_api::LevelSide::Server(level) | mod_api::LevelSide::Client(level)) = level;
+         let looked = Dir::from_look(event.context.yaw, event.context.pitch);
+         let state = level.state_with_property(event.state, FACING, looked.name())?;
+         Some(Some(state))

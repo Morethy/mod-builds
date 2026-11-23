@@ -1,0 +1,89 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 06e4a68..e7f607c 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -23,7 +23,7 @@ pub mod support;
+ pub mod zip;
+ 
+ use mod_api::{
+-    self, Hooks, RegisterCommandsEvent, RunModCommandEvent, ServerAboutToStartEvent, ServerHost,
++    self, Hooks, RegisterCommandsEvent, ServerAboutToStartEvent, ServerHost,
+     ServerStoppingEvent, ServerTickEvent, ServerTickPhase, WorldLifecycleEvent, WorldSavedEvent,
+ };
+ 
+@@ -73,13 +73,4 @@ impl Hooks for Mod {
+     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+         support::register_commands(event.commands);
+     }
+-
+-    /// Run them. The dispatcher has already parsed the usage, so `quiet` is a typed boolean.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> mod_api::Flow {
+-        support::run_command(host, event)
+-    }
+ }
+diff --git a/src/support.rs b/src/support.rs
+index 29ac82b..259f9fb 100644
+--- a/src/support.rs
++++ b/src/support.rs
+@@ -23,7 +23,7 @@ use std::thread;
+ use std::time::{SystemTime, UNIX_EPOCH};
+ 
+ use mod_api::{
+-    Command, ConfigFileError, ConfigPath, Flow, Host, RunModCommandEvent, ServerHost, Text,
++    Command, ConfigFileError, ConfigPath, Host, ServerHost, Text,
+ };
+ 
+ use crate::runtime::{
+@@ -697,20 +697,29 @@ fn walk<W: io::Write + io::Seek>(
+ }
+ 
+ /// Declares the `/simplebackups` commands (permission level 2).
+-pub fn register_commands(commands: &mut Vec<Command>) {
+-    commands.push(Command::op("simplebackups backup [quiet:boolean]", 2));
+-    commands.push(Command::op("simplebackups status", 2));
+-    commands.push(Command::op("simplebackups list", 2));
++pub fn register_commands(commands: &mut Vec<mod_api::CommandRegistration>) {
++    for usage in [
++        "simplebackups backup [quiet:boolean]",
++        "simplebackups status",
++        "simplebackups list",
++    ] {
++        commands.push(
++            Command::op(usage, 2).executes(|host, _source, command| run_command(host, command)),
++        );
++    }
+ }
+ 
+ /// Runs the commands. `backup` only queues; the save and the worker start at the tick's end,
+ /// where a save request is safe.
+-pub fn run_command(host: &mut dyn ServerHost, event: &RunModCommandEvent<'_>) -> Flow {
+-    let literals: Vec<&str> = event.command.literals.iter().map(String::as_str).collect();
++pub fn run_command(
++    host: &mut dyn ServerHost,
++    command: &mod_api::CommandInvocation,
++) -> Option<i32> {
++    let literals: Vec<&str> = command.literals.iter().map(String::as_str).collect();
+     match literals.as_slice() {
+         ["simplebackups", "backup"] => {
+             let quiet = matches!(
+-                event.command.argument("quiet"),
++                command.argument("quiet"),
+                 Some(mod_api::CommandArgumentValue::Boolean(true))
+             );
+             {
+@@ -730,9 +739,9 @@ pub fn run_command(host: &mut dyn ServerHost, event: &RunModCommandEvent<'_>) ->
+                 let _ = host.commands().feedback(Text::literal(line));
+             }
+         }
+-        _ => return Flow::Continue,
++        _ => return None,
+     }
+-    Flow::Cancel
++    Some(1)
+ }
+ 
+ fn status_lines() -> Vec<String> {

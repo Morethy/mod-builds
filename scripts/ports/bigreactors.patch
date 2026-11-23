@@ -1,0 +1,276 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 6e1ec16..957aa37 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -564,6 +564,52 @@ fn scan_energizer(
+ #[derive(Default)]
+ struct Mod;
+ 
++/// The `/bigreactors` command body: read a reactor's state.
++fn run_command(
++    host: &mut dyn ServerHost,
++    _source: &mod_api::CommandSource,
++    command: &mod_api::CommandInvocation,
++) -> Option<i32> {
++    if command.literals.first().map(String::as_str) != Some("bigreactors") {
++        return None;
++    }
++    if command.literals.get(1).map(String::as_str) != Some("status") {
++        return None;
++    }
++    let Some(pos) = position_argument(command.argument("pos")) else {
++        feedback(host, "Usage: /bigreactors status <x> <y> <z>");
++        return Some(1);
++    };
++    let line = status_text(host, pos);
++    feedback(host, &line);
++    Some(1)
++}
++
++/// Writes back the fields a tick changed in its copy of the block entity's compound, as the
++/// tick's own compound was kept before, and marks the chunk changed when any took.
++fn write_back(event: &mut BlockEntityTickEvent<'_>, saved: &Compound, nbt: &Compound) {
++    if nbt == saved {
++        return;
++    }
++    let written = event.subject.with_view(|mut view| {
++        let mut changed = false;
++        for key in saved.keys() {
++            if !nbt.contains_key(key) {
++                changed |= view.set_nbt(key.clone(), None);
++            }
++        }
++        for (key, value) in nbt.iter() {
++            if saved.get(key) != Some(value) {
++                changed |= view.set_nbt(key.clone(), Some(value.clone()));
++            }
++        }
++        (changed, view.handle())
++    });
++    if let Some((true, handle)) = written {
++        let _ = handle.set_changed(event.subject.host());
++    }
++}
++
+ #[mod_api::sunrise_mod]
+ impl Hooks for Mod {
+     /// Attach a block entity to the three blocks that own one, with the capability each block
+@@ -579,6 +625,7 @@ impl Hooks for Mod {
+                 inputs: (0..PORT_SLOTS).collect(),
+                 outputs: Vec::new(),
+                 menu: None,
++                insert_rules: Vec::new(),
+             },
+         );
+         // Upstream's active tap only gives; every face may drain it.
+@@ -609,8 +656,10 @@ impl Hooks for Mod {
+             .expect("a block entity type this mod declares takes its own part");
+         r.block_entity_part(&energizer_port_kind, EnergizerPortPart)
+             .expect("a block entity type this mod declares takes its own part");
+-        r.block_capability(&ENERGY, &energizer_port, |_host, at, _state, entity| {
+-            entity.map(|_| Box::new(PortEnergy { at }) as Box<dyn EnergyHandler>)
++        r.block_capability(&ENERGY, &energizer_port, |_host, at, _state, entity, offer| {
++            if entity.is_some() {
++                offer.offer(|| Box::new(PortEnergy { at }) as Box<dyn EnergyHandler>);
++            }
+         });
+         // The controller also answers the energy capability as a receive face, as upstream
+         // exposes the reactor's buffer on every part: another machine's port can push FE in.
+@@ -630,36 +679,19 @@ impl Hooks for Mod {
+             .expect("a block entity type this mod declares takes its own part");
+         r.block_entity_part(&tap_kind, TapPart)
+             .expect("a block entity type this mod declares takes its own part");
+-        r.block_capability(&ENERGY, &controller_block, |_host, at, _state, entity| {
+-            entity.map(|_| Box::new(ReactorInput { at }) as Box<dyn EnergyHandler>)
++        r.block_capability(&ENERGY, &controller_block, |_host, at, _state, entity, offer| {
++            if entity.is_some() {
++                offer.offer(|| Box::new(ReactorInput { at }) as Box<dyn EnergyHandler>);
++            }
+         });
+     }
+ 
+     /// `/bigreactors status <pos>`: a read-only view of a reactor, for players and the harness
+     /// (upstream has no command).
+     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+-        event.commands.push(Command::op(STATUS_USAGE, STATUS_LEVEL));
+-    }
+-
+-    /// The `/bigreactors` command body: read a reactor's state.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        if event.command.literals.first().map(String::as_str) != Some("bigreactors") {
+-            return Flow::Continue;
+-        }
+-        if event.command.literals.get(1).map(String::as_str) != Some("status") {
+-            return Flow::Continue;
+-        }
+-        let Some(pos) = position_argument(event.command.argument("pos")) else {
+-            feedback(host, "Usage: /bigreactors status <x> <y> <z>");
+-            return Flow::Cancel;
+-        };
+-        let line = status_text(host, pos);
+-        feedback(host, &line);
+-        Flow::Cancel
++        event
++            .commands
++            .push(Command::op(STATUS_USAGE, STATUS_LEVEL).executes(run_command));
+     }
+ 
+     /// A committed block change drops only the formations it can touch: one inside a
+@@ -874,15 +906,21 @@ impl BlockEntityPart for ControllerPart {
+ 
+     /// One server tick of the reactor: formation scan, fuel intake, one simulation tick, FE to
+     /// the taps.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        let Some((pos, saved)) = event
++            .subject
++            .with_view(|view| (view.position(), view.nbt().clone()))
++        else {
++            return;
++        };
++        let host = event.subject.host();
+         let Some(level) = in_place_level(host) else {
+             return;
+         };
+-        let pos = event.pos;
+         let Ok(formed) = cached_scan(host, level, pos) else {
+             return;
+         };
+-        let mut reactor = reactor_state(&event.entity.nbt);
++        let mut reactor = reactor_state(&saved);
+         let capacity = formed.design.energy_capacity();
+         if reactor.energy > f64::from(capacity) {
+             reactor.energy = f64::from(capacity);
+@@ -901,7 +939,9 @@ impl BlockEntityPart for ControllerPart {
+         }
+         reactor.tick(&formed.design);
+         fill_taps(host, level, &formed, &mut reactor);
+-        store_reactor(&mut event.entity.nbt, &reactor);
++        let mut nbt = saved.clone();
++        store_reactor(&mut nbt, &reactor);
++        write_back(event, &saved, &nbt);
+     }
+ }
+ 
+@@ -923,8 +963,7 @@ impl BlockEntityPart for PortPart {
+     }
+ 
+     /// The port itself does nothing on its tick: the controller reaches into its slot.
+-    fn block_entity_tick(&self, _host: &mut dyn ServerHost, _event: &mut BlockEntityTickEvent<'_>) {
+-    }
++    fn block_entity_tick(&self, _event: &mut BlockEntityTickEvent<'_>) {}
+ }
+ 
+ #[mod_api::sunrise_part]
+@@ -945,8 +984,11 @@ impl BlockEntityPart for TapPart {
+     }
+ 
+     /// The tap cannot reach its neighbours during its own tick, so it queues itself.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        let Some(level) = in_place_level(host) else {
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        let Some(pos) = event.subject.with_view(|view| view.position()) else {
++            return;
++        };
++        let Some(level) = in_place_level(event.subject.host()) else {
+             return;
+         };
+         let mut queue = TAP_QUEUE
+@@ -954,9 +996,9 @@ impl BlockEntityPart for TapPart {
+             .expect("the tap queue lock is held for one push");
+         if !queue
+             .iter()
+-            .any(|(queued_level, queued)| *queued_level == level && *queued == event.pos)
++            .any(|(queued_level, queued)| *queued_level == level && *queued == pos)
+         {
+-            queue.push((level, event.pos));
++            queue.push((level, pos));
+         }
+     }
+ }
+@@ -989,8 +1031,16 @@ impl BlockEntityPart for EnergizerControllerPart {
+ 
+     /// One server tick: formation scan, capacity, the ports' controller reference, and the
+     /// output push.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        energizer_tick(host, event);
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        let Some((pos, saved)) = event
++            .subject
++            .with_view(|view| (view.position(), view.nbt().clone()))
++        else {
++            return;
++        };
++        let mut nbt = saved.clone();
++        energizer_tick(event.subject.host(), pos, &mut nbt);
++        write_back(event, &saved, &nbt);
+     }
+ }
+ 
+@@ -1015,11 +1065,10 @@ impl BlockEntityPart for EnergizerPortPart {
+ /// The machine's state (on/off and the buffer) lives in its master controller; a shell
+ /// made of several controllers therefore costs one tick's work, not one per controller,
+ /// and its ports are visited once for the machine — never while it is off.
+-fn energizer_tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
++fn energizer_tick(host: &mut dyn ServerHost, pos: [i32; 3], nbt: &mut Compound) {
+     let Some(level) = in_place_level(host) else {
+         return;
+     };
+-    let pos = event.pos;
+     let Ok(formed) = energizer_cached_scan(host, level, pos) else {
+         return;
+     };
+@@ -1035,11 +1084,11 @@ fn energizer_tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_
+         return;
+     }
+     let capacity = formed.design.capacity();
+-    let mut energizer = energizer_state(&event.entity.nbt);
++    let mut energizer = energizer_state(nbt);
+     if energizer.energy > capacity {
+         energizer.energy = capacity;
+     }
+-    store_energizer(&mut event.entity.nbt, &energizer);
++    store_energizer(nbt, &energizer);
+     let active = energizer.active;
+     let visits = {
+         let mut ticks = MACHINE_TICKS
+@@ -1060,7 +1109,7 @@ fn energizer_tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_
+         )
+     };
+     record_visits(key, master, visits);
+-    store_energizer(&mut event.entity.nbt, &energizer);
++    store_energizer(nbt, &energizer);
+ }
+ 
+ /// The machine's own per-port work: an output port pushes the buffer into the first
+@@ -1503,7 +1552,7 @@ fn take_fuel(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3], max_ingo
+         let Ok(Some(stack)) = entity.item_slot(host, 0) else {
+             return Ok(0);
+         };
+-        if stack.item().id(host) != YELLORIUM_INGOT {
++        if stack.item().id(host) != Some(YELLORIUM_INGOT) {
+             return Ok(0);
+         }
+         let held = i32::try_from(stack.count()).unwrap_or(i32::MAX);
+@@ -1597,7 +1646,7 @@ fn push_out(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3]) {
+ 
+ /// The block at `pos` in `level`, as its id.
+ fn block_at(host: &dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> Option<String> {
+-    Some(level.block(host, pos)?.id(host))
++    Some(level.block(host, pos)?.id(host).unwrap_or_default().to_owned())
+ }
+ 
+ /// The level the server ticks now; its block entities and capabilities are the ones a tick may
+@@ -1677,7 +1726,7 @@ fn status_text(host: &mut dyn ServerHost, pos: [i32; 3]) -> String {
+                 .and_then(|entity| entity.item_slot(host, 0).ok().flatten())
+                 .map_or_else(
+                     || "empty".to_owned(),
+-                    |stack| format!("{} x{}", stack.item().id(host), stack.count())
++                    |stack| format!("{} x{}", stack.item().id(host).unwrap_or_default(), stack.count())
+                 ),
+             time
+         ),

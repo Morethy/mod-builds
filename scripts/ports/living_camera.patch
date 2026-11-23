@@ -1,0 +1,75 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 763997b..c435db0 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -5,7 +5,7 @@ use mod_api::client::camera::UseItem;
+ use mod_api::client::first_person::Hand;
+ use mod_api::{
+     self, CameraShakeEvent, ClientHost, ClientTickPostEvent, ComputeFovModifierEvent, Flow,
+-    HealthHudEvent, Hooks, KeyRegistration, Registrar, RegistrationContext, RenderFramePreEvent,
++    Hooks, KeyRegistration, Registrar, RegistrationContext, RenderFramePreEvent,
+     RenderHandEvent, SettingChangedEvent, SettingSpec, Text,
+ };
+ use std::cell::Cell;
+@@ -67,7 +67,8 @@ impl Hooks for LivingCamera {
+ 
+     /// Each tick: how the player moved, and the toggle key.
+     fn client_tick_post(&self, host: &mut dyn ClientHost, _: &mut ClientTickPostEvent) {
+-        while host.consume_click(camera::ID, camera::TOGGLE_KEY) {
++        let toggle = host.mod_key_mapping(camera::ID, camera::TOGGLE_KEY);
++        while toggle.is_ok_and(|key| key.consume_click(&mut *host).unwrap_or(false)) {
+             let mut settings = settings(&*host);
+             settings.toggle();
+             host.set_setting(camera::ID, OPTS[camera::o::ENABLED].key, &settings.choice_index(camera::o::ENABLED));
+@@ -123,14 +124,43 @@ impl Hooks for LivingCamera {
+ 
+     /// The health HUD, each frame it draws: the player's health (a drop shakes
+     /// the camera), a living mount, and eyes under water. It draws nothing of its own.
+-    fn health_hud(
++    fn register_gui_layers(
+         &self,
+-        _: &mut dyn ClientHost,
+-        event: &mut HealthHudEvent<'_>,
+-    ) -> Option<Vec<mod_api::GuiDraw>> {
+-        let inputs = event.inputs;
+-        camera::health(inputs.health, inputs.vehicle_hearts > 0);
+-        UNDER_WATER.set(inputs.under_water);
+-        None
++        _: &RegistrationContext,
++        event: &mut mod_api::RegisterGuiLayersEvent<'_>,
++    ) {
++        event.layers.wrap_layer(
++            "minecraft:player_health",
++            Box::new(|ctx| {
++                health_hud(ctx.host());
++                ctx.draw_previous();
++            }),
++        );
++    }
++}
++
++/// What the health HUD told while it drew: nothing with the HUD hidden or outside
++/// survival and adventure, as the hearts themselves.
++fn health_hud(host: &dyn ClientHost) {
++    if host.hud_mode() != mod_api::HudMode::AllVisible {
++        return;
++    }
++    let Some(player) = host.local_player() else {
++        return;
++    };
++    if !matches!(
++        player.game_mode(host),
++        Some(mod_api::GameMode::Survival | mod_api::GameMode::Adventure)
++    ) {
++        return;
+     }
++    let entity = player.entity();
++    let Some(health) = host.living(entity).and_then(|living| living.health(host)) else {
++        return;
++    };
++    let riding = entity
++        .vehicle(host)
++        .is_some_and(|vehicle| host.living(vehicle).is_some());
++    camera::health(health, riding);
++    UNDER_WATER.set(entity.is_under_water(host).unwrap_or(false));
+ }

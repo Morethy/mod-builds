@@ -1,0 +1,312 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index a743711..57fe041 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -15,7 +15,7 @@
+ //! work around.
+ use mod_api::{
+     self, Command, CommandArgumentValue, CommandSource, Flow, Hooks, LevelRef,
+-    RegisterCommandsEvent, Registrar, RegistrationContext, RunModCommandEvent, ServerHost, Text,
++    RegisterCommandsEvent, Registrar, RegistrationContext, ServerHost, Text,
+ };
+ 
+ use recycling_factory::FactoryPart;
+@@ -66,7 +66,7 @@ impl Hooks for Mod {
+     /// shared output and had to be careful to leave a foreign block's entry
+     /// alone. A declaration is keyed by the block, so that hazard cannot recur:
+     /// another mod's block is another key.
+-    fn register(&self, registrar: &mut dyn Registrar, context: &RegistrationContext) {
++    fn register(&self, registrar: &mut dyn Registrar, _context: &RegistrationContext) {
+         recycling_factory::remember_scrap(registrar);
+         for tier in Tier::ALL {
+             let block = registrar.block_key(tier.block());
+@@ -74,7 +74,7 @@ impl Hooks for Mod {
+             registrar.block_energy(&block, recycling_factory::battery(tier));
+             let kind = recycling_factory::declare(registrar, tier);
+             if let Err(error) = registrar.block_entity_part(&kind, FactoryPart { tier }) {
+-                context.refuse(&error.to_string());
++                registrar.refuse(&error.to_string());
+             }
+         }
+     }
+@@ -84,73 +84,81 @@ impl Hooks for Mod {
+     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+         event
+             .commands
+-            .push(Command::new("mekmm info <pos:block_pos>"));
++            .push(Command::new("mekmm info <pos:block_pos>").executes(run_command));
+         event.commands.push(Command::op(
+             "mekmm energy <amount:integer> <pos:block_pos>",
+             2,
+-        ));
++        ).executes(run_command));
+         event.commands.push(Command::op(
+             "mekmm chance <forced:integer> <pos:block_pos>",
+             2,
+-        ));
++        ).executes(run_command));
+         event
+             .commands
+-            .push(Command::new("mekmm progress <pos:block_pos>"));
++            .push(Command::new("mekmm progress <pos:block_pos>").executes(run_command));
+     }
++}
++
++/// The command bodies. The arguments are parsed and resolved by the server's
++/// dispatcher, so this only reads the block entity and answers; a factory
++/// that is not there answers "No block entity there." as it did in 0.1.0.
++fn run_command(
++host: &mut dyn ServerHost,
++source: &CommandSource,
++command: &mod_api::CommandInvocation,
++) -> Option<i32> {
++matches!(run_mod_command(host, source, command), Flow::Cancel).then_some(1)
++}
+ 
+-    /// The command bodies. The arguments are parsed and resolved by the server's
+-    /// dispatcher, so this only reads the block entity and answers; a factory
+-    /// that is not there answers "No block entity there." as it did in 0.1.0.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        let literals: Vec<&str> = event.command.literals.iter().map(String::as_str).collect();
+-        let Some(CommandArgumentValue::BlockPos(pos)) = event.command.argument("pos") else {
+-            return Flow::Continue;
+-        };
+-        let line = match literals.as_slice() {
+-            ["mekmm", "info"] => {
+-                let Some(level) = host.level(host.dimension()) else {
+-                    return Flow::Continue;
+-                };
+-                if !may_read(&*host, event.source, level, *pos) {
+-                    let line = format!(
+-                        "You must be an operator or within {:.0} blocks of the factory.",
+-                        runtime::INSPECT_RANGE
+-                    );
+-                    let _ = host.commands().feedback(Text::literal(line));
+-                    return Flow::Cancel;
+-                }
+-                recycling_factory::info_line(host, *pos)
+-                    .unwrap_or_else(|| "No block entity there.".to_owned())
++fn run_mod_command(
++host: &mut dyn ServerHost,
++source: &CommandSource,
++command: &mod_api::CommandInvocation,
++) -> Flow {
++    let literals: Vec<&str> = command.literals.iter().map(String::as_str).collect();
++    let Some(CommandArgumentValue::BlockPos(pos)) = command.argument("pos") else {
++        return Flow::Continue;
++    };
++    let line = match literals.as_slice() {
++        ["mekmm", "info"] => {
++            let Some(level) = host.level(host.dimension()) else {
++                return Flow::Continue;
++            };
++            if !may_read(&*host, source, level, *pos) {
++                let line = format!(
++                    "You must be an operator or within {:.0} blocks of the factory.",
++                    runtime::INSPECT_RANGE
++                );
++                let _ = host.commands().feedback(Text::literal(line));
++                return Flow::Cancel;
+             }
+-            ["mekmm", "energy"] => {
+-                let Some(CommandArgumentValue::Integer(amount)) = event.command.argument("amount")
+-                else {
+-                    return Flow::Continue;
+-                };
+-                match recycling_factory::set_energy(host, *pos, *amount) {
+-                    Some(after) => format!("Energy set to {after} FE."),
+-                    None => "No block entity there.".to_owned(),
+-                }
++            recycling_factory::info_line(host, *pos)
++                .unwrap_or_else(|| "No block entity there.".to_owned())
++        }
++        ["mekmm", "energy"] => {
++            let Some(CommandArgumentValue::Integer(amount)) = command.argument("amount")
++            else {
++                return Flow::Continue;
++            };
++            match recycling_factory::set_energy(host, *pos, *amount) {
++                Some(after) => format!("Energy set to {after} FE."),
++                None => "No block entity there.".to_owned(),
+             }
+-            ["mekmm", "chance"] => {
+-                let Some(CommandArgumentValue::Integer(forced)) = event.command.argument("forced")
+-                else {
+-                    return Flow::Continue;
+-                };
+-                match recycling_factory::set_chance(host, *pos, *forced) {
+-                    Some(state) => format!("Chance is now {state}."),
+-                    None => "No block entity there.".to_owned(),
+-                }
++        }
++        ["mekmm", "chance"] => {
++            let Some(CommandArgumentValue::Integer(forced)) = command.argument("forced")
++            else {
++                return Flow::Continue;
++            };
++            match recycling_factory::set_chance(host, *pos, *forced) {
++                Some(state) => format!("Chance is now {state}."),
++                None => "No block entity there.".to_owned(),
+             }
+-            ["mekmm", "progress"] => recycling_factory::progress_line(host, *pos)
+-                .unwrap_or_else(|| "No block entity there.".to_owned()),
+-            _ => return Flow::Continue,
+-        };
+-        let _ = host.commands().feedback(Text::literal(line));
+-        Flow::Cancel
+-    }
++        }
++        ["mekmm", "progress"] => recycling_factory::progress_line(host, *pos)
++            .unwrap_or_else(|| "No block entity there.".to_owned()),
++        _ => return Flow::Continue,
++    };
++    let _ = host.commands().feedback(Text::literal(line));
++    Flow::Cancel
+ }
+diff --git a/src/recycling_factory.rs b/src/recycling_factory.rs
+index 43e023e..c4fbb24 100644
+--- a/src/recycling_factory.rs
++++ b/src/recycling_factory.rs
+@@ -8,7 +8,7 @@
+ //! input-only buffer sized by the tier), that the state written to the saved
+ //! compound reads back, and the exact lines `/mekmm` prints.
+ use mod_api::{
+-    self, BlockEntityEvent, BlockEntityPart, BlockEntityTickEvent, BlockEntityTickReply,
++    self, BlockEntityEvent, BlockEntityPart, BlockEntityTickEvent,
+     BlockEntityTicksEvent, BlockEntityTypeKey, BlockPart, Compound, Host, ItemKey, ItemStack,
+     LevelSide, ModContainer, ModEnergyBuffer, ServerHost, Tag,
+ };
+@@ -103,6 +103,7 @@ pub(crate) fn container(tier: Tier) -> ModContainer {
+             .map(|process| output_slot(tier, process))
+             .collect(),
+         menu: Some(menu(tier).to_owned()),
++        insert_rules: Vec::new(),
+     }
+ }
+ 
+@@ -254,7 +255,7 @@ fn position_seed(dimension: &str, pos: [i32; 3]) -> u64 {
+ /// A slot as the pure core's stack, empty when the slot is empty.
+ fn slot_stack(host: &dyn Host, slot: Option<&ItemStack>) -> ItemCount {
+     match slot {
+-        Some(stack) => ItemCount::new(&stack.item().id(host), stack.count()),
++        Some(stack) => ItemCount::new(stack.item().id(host).unwrap_or_default(), stack.count()),
+         None => ItemCount::default(),
+     }
+ }
+@@ -336,26 +337,35 @@ impl BlockEntityPart for FactoryPart {
+     /// left `Changed` only when something moved, so an idle factory does not
+     /// dirty its chunk every tick (the retired bundle's `mark_modified`
+     /// condition).
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
+         let tier = self.tier;
+         let processes = tier.processes();
+         let slots = grid(tier);
+-        let pos = event.pos;
+-        let resized = event.entity.items.len() != slots;
++        let Some((pos, handle, old_nbt, mut items)) = event.subject.with_view(|view| {
++            let items: Vec<Option<ItemStack>> = (0..view.item_slots() as u32)
++                .map(|slot| view.item_slot(slot).and_then(|stack| stack.to_owned()))
++                .collect();
++            (view.position(), view.handle(), view.nbt().clone(), items)
++        }) else {
++            return;
++        };
++        let resized = items.len() != slots;
+         if resized {
+-            event.entity.items.resize(slots, None);
++            items.resize(slots, None);
+         }
+-        let mut saved = Tag::Compound(std::mem::take(&mut event.entity.nbt));
++        let old_items = items.clone();
++        let host = event.subject.host();
++        let mut saved = Tag::Compound(old_nbt.clone());
+         let before = read(&saved, tier);
+         let mut factory = before.clone();
+         let mut inputs: Vec<ItemCount> = (0..processes)
+-            .map(|process| slot_stack(&*host, event.entity.items[input_slot(process)].as_ref()))
++            .map(|process| slot_stack(&*host, items[input_slot(process)].as_ref()))
+             .collect();
+         let mut outputs: Vec<ItemCount> = (0..processes)
+             .map(|process| {
+                 slot_stack(
+                     &*host,
+-                    event.entity.items[output_slot(tier, process)].as_ref(),
++                    items[output_slot(tier, process)].as_ref(),
+                 )
+             })
+             .collect();
+@@ -374,17 +384,13 @@ impl BlockEntityPart for FactoryPart {
+         if changed {
+             write(&mut saved, &factory);
+         }
+-        if let Tag::Compound(nbt) = saved {
+-            event.entity.nbt = nbt;
+-        }
+         if !changed {
+-            *event.reply = BlockEntityTickReply::Unchanged;
+             return;
+         }
+         if let Some(key) = SCRAP_KEY.get().copied() {
+             for process in 0..processes {
+                 write_input(
+-                    &mut event.entity.items,
++                    &mut items,
+                     input_slot(process),
+                     &inputs[process],
+                 );
+@@ -392,7 +398,7 @@ impl BlockEntityPart for FactoryPart {
+                 // (including one holding another item) stays exactly as it was.
+                 if output_changed(&before_outputs[process], &outputs[process]) {
+                     write_output(
+-                        &mut event.entity.items,
++                        &mut items,
+                         output_slot(tier, process),
+                         &outputs[process],
+                         key,
+@@ -400,6 +406,23 @@ impl BlockEntityPart for FactoryPart {
+                 }
+             }
+         }
++        // The tick no longer commits a payload it was lent: write the fields and the slots that
++        // moved back through the view, and mark the chunk unsaved as the `Changed` reply did.
++        event.subject.with_view(|mut view| {
++            if let Tag::Compound(nbt) = &saved {
++                for (key, value) in nbt.iter() {
++                    if old_nbt.get(key) != Some(value) {
++                        view.set_nbt(key.clone(), Some(value.clone()));
++                    }
++                }
++            }
++            for (slot, stack) in items.iter().enumerate() {
++                if old_items.get(slot) != Some(stack) {
++                    let _ = view.set_item_slot(slot as u32, stack.clone());
++                }
++            }
++        });
++        let _ = handle.set_changed(event.subject.host());
+     }
+ }
+ 
+@@ -410,7 +433,7 @@ pub(crate) fn factory_at(
+     pos: [i32; 3],
+ ) -> Option<(Tier, mod_api::BlockEntityRef)> {
+     let level = host.level(host.dimension())?;
+-    let id = level.block(&*host, pos)?.id(&*host);
++    let id = level.block(&*host, pos)?.id(&*host).unwrap_or_default().to_owned();
+     let tier = Tier::from_block(&id)?;
+     host.block_entity(level, pos).map(|entity| (tier, entity))
+ }
+@@ -418,7 +441,7 @@ pub(crate) fn factory_at(
+ /// `/mekmm info <pos>`: the report line, or `None` when no factory stands there.
+ pub(crate) fn info_line(host: &mut dyn ServerHost, pos: [i32; 3]) -> Option<String> {
+     let level = host.level(host.dimension())?;
+-    let id = level.block(&*host, pos)?.id(&*host);
++    let id = level.block(&*host, pos)?.id(&*host).unwrap_or_default().to_owned();
+     let tier = Tier::from_block(&id)?;
+     let entity = host.block_entity(level, pos)?;
+     let saved = Tag::Compound(entity.data(&*host)?);

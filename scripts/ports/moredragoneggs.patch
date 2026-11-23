@@ -1,0 +1,79 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index b9217b4..0c6130b 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -39,12 +39,12 @@ impl Mod {
+ impl Hooks for Mod {
+     /// The config file upstream registers with NeoForge (`ServerConfig`): written when missing, and
+     /// read again for each world.
+-    fn register_configs(&self, _host: HostSide<'_>, event: &mut RegisterConfigsEvent<'_>) {
++    fn register_configs(&self, _host: &dyn mod_api::ConfigContext, event: &mut RegisterConfigsEvent<'_>) {
+         event.configs.push(support::Core::config_file());
+     }
+ 
+     /// A registered config was read: keep `spawn_head`.
+-    fn config_loading(&self, _host: HostSide<'_>, event: &mut ConfigLoadingEvent<'_>) {
++    fn config_loading(&self, _host: &dyn mod_api::ConfigContext, event: &mut ConfigLoadingEvent<'_>) {
+         self.core().config_loaded(event.config);
+     }
+ 
+diff --git a/src/support.rs b/src/support.rs
+index 3f937d2..a0486ee 100644
+--- a/src/support.rs
++++ b/src/support.rs
+@@ -120,11 +120,20 @@ impl Core {
+     /// One End pass: seed the counter on the first sight of the dragon, and on the kill edge resolve
+     /// the writes. Reads only; the caller drops the lock before [`place`].
+     pub fn pass(&mut self, host: &mut dyn ServerHost, level: LevelRef) -> Option<Plan> {
+-        let dimension = level.dimension().id(&*host)?;
++        let dimension = level.dimension().id(&*host)?.to_owned();
+         if dimension != runtime::THE_END {
+             return None;
+         }
+-        let players = level.online_players(&*host).unwrap_or_default();
++        let mut players = Vec::new();
++        if level
++            .visit_online_players(&*host, &mut |player| {
++                players.push(player);
++                std::ops::ControlFlow::Continue(())
++            })
++            .is_err()
++        {
++            players.clear();
++        }
+         let (present, previously_killed) = scan(host, level)?;
+         match self
+             .fight
+@@ -189,7 +198,13 @@ pub fn place(host: &mut dyn ServerHost, level: LevelRef, plan: Plan) {
+ /// `None` when the level's entity list cannot be read (a stale handle), so a pass never invents a
+ /// kill from a failed read.
+ fn scan(host: &dyn ServerHost, level: LevelRef) -> Option<(bool, Option<bool>)> {
+-    let entities = level.all_entities(host)?;
++    let mut entities = Vec::new();
++    let _ = level
++        .visit_all_entities(host, &mut |entity| {
++            entities.push(entity);
++            std::ops::ControlFlow::Continue(())
++        })
++        .ok()?;
+     let mut present = false;
+     let mut previously_killed = None;
+     for entity in entities {
+@@ -210,7 +225,7 @@ fn scan(host: &dyn ServerHost, level: LevelRef) -> Option<(bool, Option<bool>)>
+ fn is_dragon(host: &dyn Host, entity: EntityRef) -> bool {
+     entity
+         .kind(host)
+-        .is_some_and(|kind| kind.id(host) == ENDER_DRAGON)
++        .is_some_and(|kind| kind.id(host).as_deref() == Some(ENDER_DRAGON))
+ }
+ 
+ /// `getHeightmapPos(MOTION_BLOCKING, EndPodiumFeature.getLocation(origin))`: the engine's own
+@@ -264,7 +279,7 @@ fn nearest_player(host: &dyn Host, players: &[PlayerRef], base: [i32; 3]) -> Opt
+ 
+ /// The block at `pos` in the level's own read, by registry name.
+ fn block_name(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> Option<String> {
+-    level.block(host, pos).map(|block| block.id(host))
++    level.block(host, pos).and_then(|block| block.id(host)).map(str::to_owned)
+ }
+ 
+ fn cell(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> runtime::Cell {

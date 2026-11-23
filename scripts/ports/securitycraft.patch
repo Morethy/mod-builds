@@ -1,0 +1,436 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index fb32c1e..aa171c1 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -20,7 +20,7 @@ use mod_api::{
+     BlockEntityTicksEvent, BlockPart, Flow, Hooks, HostSide, InteractionResult,
+     IsSignalSourceEvent, ItemPart, LevelHost, LevelSide, LevelTickPostEvent, MenuButtonEvent,
+     MenuClosedEvent, OnBlockPlacedByEvent, PlayerContainerCloseEvent, RegisterCommandsEvent,
+-    Registrar, RegistrationContext, RunModCommandEvent, Screen, ScreenClickEvent, ScreenDrawEvent,
++    MenuButtonValidEvent, MenuPart, Registrar, RegistrationContext,
+     ServerHost, StateForPlacementEvent, UseItemOnEvent, UseWithoutItemEvent,
+ };
+ 
+@@ -61,9 +61,10 @@ impl BlockPart for Keypad {
+     /// `BlockBehaviour.getStateForPlacement`: the keypad faces the player who placed it.
+     fn state_for_placement(
+         &self,
+-        level: &dyn LevelHost,
++        level: LevelSide<'_>,
+         event: &mut StateForPlacementEvent<'_>,
+     ) -> Option<Option<mod_api::BlockState>> {
++        let (LevelSide::Server(level) | LevelSide::Client(level)) = level;
+         support::on_state_for_placement(level, event)
+     }
+ }
+@@ -84,36 +85,28 @@ impl BlockEntityPart for Keypad {
+         support::on_ticks(event);
+     }
+ 
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        support::on_tick(host, event);
+-    }
+-
+-    /// The panel's layout: one hidden container slot and the player's inventory below it.
+-    fn screen(
+-        &self,
+-        _host: &dyn mod_api::Host,
+-        _event: &mut mod_api::ScreenEvent<'_>,
+-    ) -> Option<Screen> {
+-        Some(support::screen())
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        support::on_tick(event);
+     }
++}
+ 
+-    /// The code display and the twelve keys.
+-    fn screen_draw(&self, host: &dyn mod_api::ClientHost, event: &mut ScreenDrawEvent<'_>) {
+-        support::on_screen_draw(host, event);
+-    }
++/// The keypad's menu: the keys of its screen, applied on the server.
++struct KeypadMenu;
+ 
+-    /// A press on a drawn key names the menu button the server applies.
+-    fn screen_click(
+-        &self,
+-        _host: &dyn mod_api::ClientHost,
+-        event: &mut ScreenClickEvent<'_>,
+-    ) -> Option<i32> {
+-        support::on_screen_click(event)
++#[mod_api::sunrise_part]
++impl MenuPart for KeypadMenu {
++    /// The twelve keys are the menu's buttons.
++    fn menu_button_valid(&self, _host: &dyn mod_api::Host, event: &mut MenuButtonValidEvent<'_>) -> Flow {
++        if support::is_button(event.id) {
++            Flow::Cancel
++        } else {
++            Flow::Continue
++        }
+     }
+ 
+     /// The server applies that press to the block entity.
+-    fn menu_button(&self, host: &mut dyn ServerHost, event: &mut MenuButtonEvent<'_>) {
+-        support::on_menu_button(host, event);
++    fn menu_button(&self, event: &mut MenuButtonEvent<'_>) {
++        support::on_menu_button(event);
+     }
+ }
+ 
+@@ -136,7 +129,7 @@ struct Mod;
+ impl Hooks for Mod {
+     /// Declare the keypad's block entity, its part, and its one-slot container with the mod
+     /// menu the block's use opens.
+-    fn register(&self, r: &mut dyn Registrar, cx: &RegistrationContext) {
++    fn register(&self, r: &mut dyn Registrar, _cx: &RegistrationContext) {
+         let block = r.block_key(support::KEYPAD);
+         let kind = r
+             .block_entity_type("keypad")
+@@ -146,12 +139,20 @@ impl Hooks for Mod {
+         // would stand inert: refuse the mod's registration rather than load a half-working
+         // keypad, so the game log names it.
+         if let Err(error) = r.block_entity_part(&kind, Keypad) {
+-            cx.refuse(&format!(
++            r.refuse(&format!(
+                 "securitycraft: the keypad part was refused: {error}"
+             ));
+             return;
+         }
+         r.block_container(&block, support::container());
++        r.menu_part(support::KEYPAD_MENU, KeypadMenu);
++        // The panel's layout, the code display and the twelve keys: one screen per opening.
++        if let Err(error) = r.register_menu_screen(support::KEYPAD_MENU, std::sync::Arc::new(support::screen)) {
++            r.refuse(&format!(
++                "securitycraft: the keypad screen was refused: {error}"
++            ));
++            return;
++        }
+         // Bound first: `r.item_part(r.item_key(…), …)` borrows `r` twice.
+         let item = r.item_key(support::KEYPAD_ITEM);
+         r.item_part(item, KeyPanel);
+@@ -166,15 +167,15 @@ impl Hooks for Mod {
+     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+         event
+             .commands
+-            .push(mod_api::Command::new("securitycraft info <pos:block_pos>"));
++            .push(mod_api::Command::new("securitycraft info <pos:block_pos>").executes(run_command));
+         event.commands.push(mod_api::Command::op(
+             "securitycraft code <pos:block_pos> <code:word>",
+             2,
+-        ));
++        ).executes(run_command));
+         event.commands.push(mod_api::Command::op(
+             "securitycraft owner <pos:block_pos> <who:word>",
+             2,
+-        ));
++        ).executes(run_command));
+     }
+ 
+     /// A menu a mod opened closed, or its player left: every digit that player typed is gone.
+@@ -189,7 +190,7 @@ impl Hooks for Mod {
+         _host: &mut dyn ServerHost,
+         event: &mut PlayerContainerCloseEvent<'_>,
+     ) {
+-        if event.menu == support::KEYPAD_MENU {
++        if event.menu_type == support::KEYPAD_MENU {
+             support::on_container_closed(event.player, event.dimension, event.pos);
+         }
+     }
+@@ -210,17 +211,15 @@ impl Hooks for Mod {
+             support::on_level_tick_post(host, event);
+         }
+     }
++}
+ 
+-    /// Runs a `/securitycraft` usage and reports its one line.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        let Some(line) = support::command(host, event) else {
+-            return Flow::Continue;
+-        };
+-        support::feedback(host, &line);
+-        Flow::Cancel
+-    }
++/// Runs a `/securitycraft` usage and reports its one line.
++fn run_command(
++    host: &mut dyn ServerHost,
++    source: &mod_api::CommandSource,
++    command: &mod_api::CommandInvocation,
++) -> Option<i32> {
++    let line = support::command(host, source, command)?;
++    support::feedback(host, &line);
++    Some(1)
+ }
+diff --git a/src/support.rs b/src/support.rs
+index 62e8693..8269210 100644
+--- a/src/support.rs
++++ b/src/support.rs
+@@ -27,7 +27,7 @@ use mod_api::{
+     BlockChangedEvent, BlockEntityTickEvent, ClientHost, Compound, DrawContext, Host,
+     HostTransaction, InteractionResult, ItemKey, ItemPlace, ItemResource, ItemStack, LevelHost,
+     LevelRef, LevelTickPostEvent, MenuButtonEvent, ModContainer, OnBlockPlacedByEvent,
+-    RandomSource, Screen, ScreenClickEvent, ScreenDrawEvent, ServerHost, StateForPlacementEvent,
++    MenuScreen, MenuScreenFrame, MenuScreenLayout, RandomSource, ServerHost, StateForPlacementEvent,
+     Tag, Text,
+ };
+ 
+@@ -258,8 +258,9 @@ pub(crate) fn in_place_level(host: &mut dyn ServerHost) -> Option<LevelRef> {
+ fn block_at(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> String {
+     level
+         .block(host, pos)
+-        .map(|block| block.id(host))
++        .and_then(|block| block.id(host))
+         .unwrap_or_default()
++        .to_owned()
+ }
+ 
+ /// The `powered` state of the block at `pos`.
+@@ -342,33 +343,64 @@ fn data_slots(
+ 
+ /// One keypad tick: count the signal down and turn it off when it reaches zero,
+ /// then keep the menu's data slots current.
+-pub(crate) fn on_tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-    let pos = event.pos;
+-    let Some(level) = in_place_level(host) else {
++pub(crate) fn on_tick(event: &mut BlockEntityTickEvent<'_>) {
++    let Some((pos, handle, before)) = event
++        .subject
++        .with_view(|view| (view.position(), view.handle(), view.nbt().clone()))
++    else {
+         return;
+     };
+-    let fields = &mut *event.entity;
+-    // A key written by the retired build is scrubbed, never read.
+-    scrub_legacy_entry(&mut fields.nbt);
+-    // The removal a level-side write makes is heard after this entity is gone,
+-    // so what it holds has to be known before that: refresh it every tick.
+-    let dimension = level.dimension().id(&*host);
+-    if let Some(dimension) = dimension.as_deref() {
+-        remember_modules(dimension, pos, modules(&fields.nbt));
++    let mut nbt = before.clone();
++    let slots = {
++        let host = event.subject.host();
++        let Some(level) = in_place_level(host) else {
++            return;
++        };
++        // A key written by the retired build is scrubbed, never read.
++        scrub_legacy_entry(&mut nbt);
++        // The removal a level-side write makes is heard after this entity is gone,
++        // so what it holds has to be known before that: refresh it every tick.
++        let dimension = level.dimension().id(&*host).map(str::to_owned);
++        if let Some(dimension) = dimension.as_deref() {
++            remember_modules(dimension, pos, modules(&nbt));
++        }
++        let signal = int(&nbt, KEY_SIGNAL);
++        if signal > 0 {
++            let (next, turns_off) = tick_signal(signal);
++            set_int(&mut nbt, KEY_SIGNAL, next);
++            if turns_off {
++                host.set_block_property(pos, POWERED, "false");
++            }
++        }
++        let typed = dimension.map_or(0, |dimension| typed_at_keypad(&dimension, pos));
++        data_slots(&*host, level, pos, &nbt, typed)
++    };
++    // The tick no longer commits a payload it was lent: write the fields that moved and the
++    // menu's data back through the view, and mark the chunk unsaved as the reply did.
++    let changed = event.subject.with_view(|mut view| {
++        let changed = write_nbt(&mut view, &before, &nbt);
++        view.set_data_slots(&slots);
++        changed
++    });
++    if changed == Some(true) {
++        let _ = handle.set_changed(event.subject.host());
+     }
+-    let signal = int(&fields.nbt, KEY_SIGNAL);
+-    if signal > 0 {
+-        let (next, turns_off) = tick_signal(signal);
+-        set_int(&mut fields.nbt, KEY_SIGNAL, next);
+-        if turns_off {
+-            host.set_block_property(pos, POWERED, "false");
++}
++
++/// Write the saved fields that differ from `before` (set, or removed) to the resident entity.
++fn write_nbt(view: &mut mod_api::BlockEntityView<'_>, before: &Compound, nbt: &Compound) -> bool {
++    let mut changed = false;
++    for (key, value) in nbt.iter() {
++        if before.get(key) != Some(value) {
++            changed |= view.set_nbt(key.clone(), Some(value.clone()));
+         }
+     }
+-    let typed = dimension.map_or(0, |dimension| typed_at_keypad(&dimension, pos));
+-    let slots = data_slots(&*host, level, pos, &fields.nbt, typed);
+-    if fields.data != slots {
+-        fields.data = slots;
++    for (key, _) in before.iter() {
++        if nbt.get(key).is_none() {
++            changed |= view.set_nbt(key.clone(), None);
++        }
+     }
++    changed
+ }
+ 
+ /// A player uses the keypad: a powered keypad does nothing (upstream's
+@@ -388,7 +420,7 @@ pub(crate) fn on_use(
+     // runs before the block's own use. A stranger's module, a second one of a type the
+     // keypad already has and any other held item all fall through to the menu below.
+     if let Some(stack) = click.stack
+-        && stack.item().id(&*host) == HARMING_MODULE
++        && stack.item().id(&*host) == Some(HARMING_MODULE)
+         && may_install(owner_of(&data), click.player)
+         && !has_module(&data, HARMING_MODULE)
+     {
+@@ -450,8 +482,8 @@ pub(crate) fn on_use(
+ 
+ /// The keypad's screen layout: one container slot the game keeps but the panel
+ /// does not show (a keypad has no item view), and the player's inventory below.
+-pub(crate) fn screen() -> Screen {
+-    Screen {
++pub(crate) fn screen(_host: &dyn ClientHost, _open: mod_api::MenuScreenOpen<'_>) -> Option<MenuScreen> {
++    let layout = MenuScreenLayout {
+         width: SCREEN_WIDTH,
+         height: SCREEN_HEIGHT,
+         slots: vec![None],
+@@ -459,8 +491,13 @@ pub(crate) fn screen() -> Screen {
+         inventory_x: 8.0,
+         own_labels: false,
+         own_background: false,
+-        ..Screen::default()
+-    }
++        ..MenuScreenLayout::default()
++    };
++    Some(
++        MenuScreen::new(layout)
++            .with_draw(|host, frame, draw| on_screen_draw(host, &frame, draw))
++            .with_click(|_host, frame, _right| on_screen_click(&frame)),
++    )
+ }
+ 
+ fn centred_text(draw: &mut dyn DrawContext, origin: [f32; 2], text: &str, row: f32, argb: u32) {
+@@ -470,10 +507,9 @@ fn centred_text(draw: &mut dyn DrawContext, origin: [f32; 2], text: &str, row: f
+ }
+ 
+ /// Draws the code display and the twelve keys (`screen_draw`).
+-pub(crate) fn on_screen_draw(_host: &dyn ClientHost, event: &mut ScreenDrawEvent<'_>) {
++pub(crate) fn on_screen_draw(_host: &dyn ClientHost, event: &MenuScreenFrame<'_>, draw: &mut dyn DrawContext) {
+     let data = event.data;
+     let origin = event.origin;
+-    let draw = &mut *event.draw;
+     let mode = Mode::from_int(data.first().copied().unwrap_or(0));
+     let typed = usize::try_from(data.get(1).copied().unwrap_or(0)).unwrap_or(0);
+     let status = data.get(2).copied().unwrap_or(STATUS_NONE);
+@@ -527,7 +563,7 @@ pub(crate) fn on_screen_draw(_host: &dyn ClientHost, event: &mut ScreenDrawEvent
+ 
+ /// A press on the keypad screen names the menu button the game sends to the
+ /// server (`screen_click`).
+-pub(crate) fn on_screen_click(event: &mut ScreenClickEvent<'_>) -> Option<i32> {
++pub(crate) fn on_screen_click(event: &MenuScreenFrame<'_>) -> Option<i32> {
+     let at = event.at;
+     (0..=11).find(|id| {
+         key_rect(*id).is_some_and(|[x, y, width, height]| {
+@@ -645,7 +681,7 @@ fn fresh_salt(host: &mut dyn ServerHost) -> Option<String> {
+     let bytes = level.with_random(host, |random| {
+         let mut bytes = [0u8; 16];
+         for chunk in bytes.chunks_mut(4) {
+-            let draw = random.next_int_bound(i32::MAX).unwrap_or(0).unsigned_abs();
++            let draw = random.next_int_bound(i32::MAX).unsigned_abs();
+             chunk.copy_from_slice(&draw.to_le_bytes());
+         }
+         bytes
+@@ -753,29 +789,55 @@ fn apply_key(
+ }
+ 
+ /// The server applies a key press (`menu_button`).
+-pub(crate) fn on_menu_button(host: &mut dyn ServerHost, event: &mut MenuButtonEvent<'_>) {
+-    let pos = event.context.pos;
+-    let Some(level) = in_place_level(host) else {
++pub(crate) fn on_menu_button(event: &mut MenuButtonEvent<'_>) {
++    let Some(pos) = event.context.pos else {
+         return;
+     };
+-    // The press belongs to the player the game names, at this keypad in this dimension: never to
+-    // whoever happened to type at these coordinates first.
+-    let Some(session) = session_of(&*host, level, pos, event.context.player) else {
++    let player = event.context.player;
++    let id = event.context.id;
++    let Some(before) = event.subject.with_view(|view| view.nbt().clone()) else {
+         return;
+     };
+-    let Some(key) = button(event.context.id) else {
+-        return;
++    let mut nbt = before.clone();
++    let (level, session, action) = {
++        let host = event.subject.host();
++        let Some(level) = in_place_level(host) else {
++            return;
++        };
++        // The press belongs to the player the game names, at this keypad in this dimension: never to
++        // whoever happened to type at these coordinates first.
++        let Some(session) = session_of(&*host, level, pos, player) else {
++            return;
++        };
++        let Some(key) = button(id) else {
++            return;
++        };
++        let action = apply_key(host, &session, &mut nbt, key);
++        if matches!(action, Some(Action::Open)) {
++            set_int(&mut nbt, KEY_SIGNAL, DEFAULT_SIGNAL_TICKS);
++        }
++        (level, session, action)
+     };
+-    let fields = &mut *event.entity;
+-    match apply_key(host, &session, &mut fields.nbt, key) {
+-        Some(Action::Open) => {
+-            set_int(&mut fields.nbt, KEY_SIGNAL, DEFAULT_SIGNAL_TICKS);
+-            host.set_block_property(pos, POWERED, "true");
++    // The saved fields go back before the block's state changes: a menu's loan is of the state
++    // the press was admitted for.
++    event.subject.with_view(|mut view| write_nbt(&mut view, &before, &nbt));
++    let slots = {
++        let host = event.subject.host();
++        match action {
++            Some(Action::Open) => {
++                host.set_block_property(pos, POWERED, "true");
++            }
++            Some(Action::Wrong) => hurt_for_wrong_code(host, &session, &nbt),
++            _ => {}
+         }
+-        Some(Action::Wrong) => hurt_for_wrong_code(host, &session, &fields.nbt),
+-        _ => {}
+-    }
+-    fields.data = data_slots(&*host, level, pos, &fields.nbt, entry_at(&session).len());
++        data_slots(&*host, level, pos, &nbt, entry_at(&session).len())
++    };
++    event.subject.with_view(|mut view| view.set_data_slots(&slots));
++}
++
++/// Whether `id` is one of the screen's keys.
++pub(crate) fn is_button(id: i32) -> bool {
++    button(id).is_some()
+ }
+ 
+ /// A wrong submission with the harming module installed hurts the player who made it
+@@ -972,6 +1034,7 @@ pub(crate) fn container() -> ModContainer {
+         inputs: Vec::new(),
+         outputs: Vec::new(),
+         menu: Some(KEYPAD_MENU.to_owned()),
++        insert_rules: Vec::new(),
+     }
+ }
+ 
+@@ -1153,10 +1216,10 @@ fn set_owner(
+ /// Answers a `/securitycraft` invocation, or `None` when it is not one.
+ pub(crate) fn command(
+     host: &mut dyn ServerHost,
+-    event: &mut mod_api::RunModCommandEvent<'_>,
++    source: &mod_api::CommandSource,
++    invocation: &mod_api::CommandInvocation,
+ ) -> Option<String> {
+-    let invocation = event.command;
+-    let asking = match event.source {
++    let asking = match source {
+         mod_api::CommandSource::Player { player, .. } => Some(player.uuid()),
+         _ => None,
+     };

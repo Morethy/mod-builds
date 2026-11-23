@@ -1,0 +1,105 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index bf56bf4..d4feb12 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -29,7 +29,7 @@ use mod_api::{
+     self, ActiveEffect, BlockUpdateFlags, Config, ConfigKind, ConfigLoadingEvent,
+     ConsumeEffectEvent, EffectKey, Hand, Hooks, Host, HostSide, HostTransaction, InteractionResult,
+     ItemKey, ItemPart, ItemPlace, ItemResource, ItemStack, LevelRef, LootDropsEvent, PlayerRef,
+-    RandomSource, RegisterConfigsEvent, Registrar, RegistrationContext, ServerHost, Tag,
++    RegisterConfigsEvent, Registrar, RegistrationContext, ServerHost, Tag,
+     UseItemEvent, UseOnEvent,
+ };
+ 
+@@ -117,7 +117,7 @@ impl Hooks for Mod {
+     /// Register `config/rootsclassic-common.toml` — the jar's own file name — as this mod's
+     /// common config. The game writes `default` there when the file is missing, as NeoForge's
+     /// `ModContainer.registerConfig` does, so a first run leaves the jar's defaults on disk.
+-    fn register_configs(&self, _host: HostSide, event: &mut RegisterConfigsEvent<'_>) {
++    fn register_configs(&self, _host: &dyn mod_api::ConfigContext, event: &mut RegisterConfigsEvent<'_>) {
+         let default = default_config(runtime::Chances::default());
+         event
+             .configs
+@@ -126,7 +126,7 @@ impl Hooks for Mod {
+ 
+     /// The game read a config; ours it is `rootsclassic`, so parse its `[items]` section. Every
+     /// mod hears every config, so the id is checked.
+-    fn config_loading(&self, _host: HostSide, event: &mut ConfigLoadingEvent<'_>) {
++    fn config_loading(&self, _host: &dyn mod_api::ConfigContext, event: &mut ConfigLoadingEvent<'_>) {
+         if event.config.mod_id == MOD_ID {
+             loaded(&event.config.text);
+         }
+@@ -170,7 +170,7 @@ impl Hooks for Mod {
+         };
+         // `random.nextInt(chance) == 0`, drawn from the level's own stream in vanilla's order.
+         let bound = i32::try_from(chance).unwrap_or(i32::MAX);
+-        let Some(Ok(draw)) = level.with_random(host, |random| random.next_int_bound(bound)) else {
++        let Some(draw) = level.with_random(host, |random| random.next_int_bound(bound)) else {
+             return;
+         };
+         if !runtime::rolls(chance, u32::try_from(draw).unwrap_or(0)) {
+@@ -186,7 +186,6 @@ impl Hooks for Mod {
+                 let len = i32::try_from(runtime::BERRIES.len()).unwrap_or(1);
+                 let pick = level
+                     .with_random(host, |random| random.next_int_bound(len))
+-                    .and_then(Result::ok)
+                     .unwrap_or(0);
+                 let pick = usize::try_from(pick).unwrap_or(0);
+                 ids.berries.get(pick).copied().unwrap_or(ids.berries[0])
+@@ -287,24 +286,31 @@ fn mutate(host: &mut dyn ServerHost, ids: &PowderIds, event: &UseItemEvent<'_>)
+     let look = look_vector(rotation[0], rotation[1]);
+     let target = ray_target(&*host, level, eye, look);
+     let (min, max) = mutation_box(target);
+-    let Some(entities) = level.entities_in(&*host, min, max) else {
++    let mut entities = Vec::new();
++    if level
++        .visit_entities_in(&*host, min, max, &mut |entity| {
++            entities.push(entity);
++            std::ops::ControlFlow::Continue(())
++        })
++        .is_err()
++    {
+         return;
+-    };
++    }
+     let mut items = Vec::new();
+     let mut found = Vec::new();
+     for candidate in entities {
+         let Some(item) = host.item_entity(candidate) else {
+             continue;
+         };
+-        let Some(stack) = item.stack(&*host) else {
++        let Some(held) = item.with_stack(&*host, |stack| stack.item()) else {
+             continue;
+         };
+-        found.push(stack.item().id(&*host));
++        found.push(held.id(&*host).unwrap_or_default().to_owned());
+         items.push(candidate);
+     }
+     let effects = effect_ids(&*host, player);
+     let base = block_name(&*host, level, target).unwrap_or_default();
+-    let dimension = level.dimension().id(&*host).unwrap_or_default();
++    let dimension = level.dimension().id(&*host).unwrap_or_default().to_owned();
+     let below2 =
+         block_name(&*host, level, [target[0], target[1] - 2, target[2]]).unwrap_or_default();
+     let ring: [String; 8] =
+@@ -356,9 +362,7 @@ fn crafted(
+         }
+         runtime::Mutation::MidnightBloom => {
+             // `player.getPersistentData().putInt(Const.NBT_SKIP_TICKS, 200)`.
+-            let mut data = player.persistent_data(&*host).unwrap_or_default();
+-            data.insert(SKIP_TICKS.into(), Tag::Int(200));
+-            let _ = player.set_persistent_data(host, data);
++            let _ = player.set_persistent_data_key(host, &SKIP_TICKS.into(), Some(&Tag::Int(200)));
+         }
+         runtime::Mutation::RadiantDaisy => {
+             // `new MobEffectInstance(MobEffects.BLINDNESS, 1200, 0)`: ambient false, particles and
+@@ -459,7 +463,7 @@ fn effect_ids(host: &dyn Host, player: PlayerRef) -> Vec<String> {
+     };
+     effects
+         .into_iter()
+-        .map(|effect| effect.id.id(host))
++        .map(|effect| effect.id.id(host).unwrap_or_default().to_owned())
+         .collect()
+ }
+ 

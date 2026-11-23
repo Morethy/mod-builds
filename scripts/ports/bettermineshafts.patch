@@ -1,0 +1,100 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 682689e..4e4e5e4 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -18,8 +18,7 @@ pub mod runtime;
+ pub mod support;
+ 
+ use mod_api::{
+-    self, Flow, Hooks, RegisterCommandsEvent, Registrar, RegistrationContext, RunModCommandEvent,
+-    ServerHost,
++    self, Hooks, RegisterCommandsEvent, Registrar, RegistrationContext, ServerHost,
+ };
+ 
+ #[derive(Default)]
+@@ -36,13 +35,4 @@ impl Hooks for Mod {
+     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+         support::declare_commands(event.commands);
+     }
+-
+-    /// Answer `/bettermineshafts status` and take the command.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        support::run_command(host, event)
+-    }
+ }
+diff --git a/src/support.rs b/src/support.rs
+index 83843c3..1e1dac7 100644
+--- a/src/support.rs
++++ b/src/support.rs
+@@ -9,8 +9,8 @@
+ use std::sync::Arc;
+ 
+ use mod_api::{
+-    self, BlockMetadata, Command, Compound, Flow, FoundStructure, GenerationContext, HeightmapType,
+-    Registrar, RunModCommandEvent, ServerHost, StructureError, StructurePiece, StructureRandom,
++    self, BlockMetadata, Command, Compound, FoundStructure, GenerationContext, HeightmapType,
++    Registrar, ServerHost, StructureError, StructurePiece,
+     StructureType, Tag, Text,
+ };
+ 
+@@ -92,7 +92,7 @@ impl StructureType for MineshaftType {
+ }
+ 
+ /// The game's piece random as the layout's [`Roll`].
+-struct EngineRoll<'a>(&'a mut dyn StructureRandom);
++struct EngineRoll<'a>(&'a mut dyn mod_api::RandomSource);
+ 
+ impl Roll for EngineRoll<'_> {
+     fn next_i32(&mut self, bound: i32) -> i32 {
+@@ -278,26 +278,26 @@ pub fn last_lines(chunk: Option<[i32; 2]>) -> Vec<String> {
+ }
+ 
+ /// The commands, each usage on its own.
+-pub fn declare_commands(commands: &mut Vec<Command>) {
++pub fn declare_commands(commands: &mut Vec<mod_api::CommandRegistration>) {
+     for usage in [
+         "bettermineshafts",
+         "bettermineshafts status",
+         "bettermineshafts last",
+         "bettermineshafts last [chunk_x:integer] [chunk_z:integer]",
+     ] {
+-        commands.push(Command::new(usage));
++        commands.push(Command::new(usage).executes(|host, _source, command| run_command(host, command)));
+     }
+ }
+ 
+-/// Answer `/bettermineshafts [status|last]` and take it; `Flow::Continue` for another mod's line.
+-pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>) -> Flow {
+-    let path: Vec<&str> = event.command.literals.iter().map(String::as_str).collect();
++/// Answer `/bettermineshafts [status|last]`: the executor of every usage.
++pub fn run_command(host: &mut dyn ServerHost, command: &mod_api::CommandInvocation) -> Option<i32> {
++    let path: Vec<&str> = command.literals.iter().map(String::as_str).collect();
+     let lines = match path.as_slice() {
+         ["bettermineshafts"] | ["bettermineshafts", "status"] => runtime::status_lines(),
+         ["bettermineshafts", "last"] => {
+             let mut chunk = [0; 2];
+             let mut given = 0;
+-            for argument in &event.command.arguments {
++            for argument in &command.arguments {
+                 if let mod_api::CommandArgumentValue::Integer(value) = &argument.value {
+                     chunk[given] = *value;
+                     given += 1;
+@@ -305,12 +305,12 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
+             }
+             last_lines((given == 2).then_some(chunk))
+         }
+-        _ => return Flow::Continue,
++        _ => return None,
+     };
+     for line in lines {
+         let _ = host.commands().feedback(Text::literal(line));
+     }
+-    Flow::Cancel
++    Some(1)
+ }
+ 
+ /// A structure's palette from the NBT its definition carries: every field the config states
