@@ -286,6 +286,8 @@ def build_one(row, mods, source, result, build, profile):
         status.update(id=mod, version=version)
         cargo = native_of(folder, manifest)
         check(manifest, cargo, folder)
+        if not sunrise_game(source) and not (folder / "horizon-mod.toml").is_file():
+            raise Refused("is made for a newer Starling")
         package = adopted(hmod, folder, work / f"{mod}.smod", mod) if sunrise_game(source) else hmod
         if package != hmod:
             cargo = tomllib.loads(RENAMED.sub("sunrise", (folder / "Cargo.toml").read_text()))
