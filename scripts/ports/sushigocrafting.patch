@@ -1,0 +1,496 @@
+diff --git a/src/barrel.rs b/src/barrel.rs
+index 10f6ff9..19a1eb7 100644
+--- a/src/barrel.rs
++++ b/src/barrel.rs
+@@ -12,8 +12,7 @@ use std::array;
+ use mod_api::{
+     self, BlockClick, BlockEntityPart, BlockEntityTickEvent, BlockEntityTicksEvent, BlockPart,
+     CommandInvocation, Compound, GameMode, Host, HostTransaction, InteractionResult, ItemPlace,
+-    ItemResource, ItemStack, LevelRef, ModContainer, ModFluidTanks, RandomSource, Screen,
+-    ScreenEvent, ServerHost, Tag, UseItemOnEvent,
++    ItemResource, ItemStack, LevelRef, ModContainer, ModFluidTanks, RandomSource, ServerHost, Tag, UseItemOnEvent,
+ };
+ 
+ use crate::board::{amount_stack, in_tag};
+@@ -46,6 +45,10 @@ const BUCKET: &str = "minecraft:bucket";
+ 
+ /// The barrel's block entity type: one entity for the block, starting from an empty compound.
+ pub(crate) fn declare(registrar: &mut dyn mod_api::Registrar) -> mod_api::BlockEntityTypeKey {
++    // Starling's port: the barrel's screen, on its own menu type.
++    if let Err(error) = registrar.register_menu_screen(MENU, std::sync::Arc::new(starling_menu_screen)) {
++        registrar.refuse(&error);
++    }
+     registrar
+         .block_entity_type(BARREL_TYPE)
+         .blocks(&[BARREL_TYPE])
+@@ -59,6 +62,7 @@ pub(crate) fn declare(registrar: &mut dyn mod_api::Registrar) -> mod_api::BlockE
+ pub(crate) fn container() -> ModContainer {
+     let all = vec![INPUT, OUTPUT];
+     ModContainer {
++        insert_rules: Vec::new(),
+         slots: SLOTS,
+         faces: array::from_fn(|_| all.clone()),
+         inputs: vec![INPUT],
+@@ -81,16 +85,16 @@ pub(crate) fn tanks() -> ModFluidTanks {
+ 
+ /// The menu's layout: upstream's 176 x 166 Titanium panel, with the input at 30,48 and the
+ /// output at 130,48 as its `InventoryComponent`s place them.
+-pub(crate) fn screen() -> Screen {
+-    Screen {
++pub(crate) fn screen() -> mod_api::MenuScreenLayout {
++    mod_api::MenuScreenLayout {
+         width: 176.0,
+         height: 166.0,
+-        slots: vec![Some([30.0, 48.0]), Some([130.0, 48.0])],
++        slots: vec![Some(mod_api::ScreenSlot { position: [30.0, 48.0], no_item_icon: None }), Some(mod_api::ScreenSlot { position: [130.0, 48.0], no_item_icon: None })],
+         inventory_y: 84.0,
+         inventory_x: 8.0,
+         own_labels: false,
+         own_background: false,
+-        ..Screen::default()
++        ..mod_api::MenuScreenLayout::default()
+     }
+ }
+ 
+@@ -125,13 +129,8 @@ impl BlockEntityPart for BarrelPart {
+ 
+     /// One server tick of `ActiveTile`'s bar: count it while a batch can start, reset it
+     /// when one cannot, and run the batch on the hundredth.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        tick(host, event);
+-    }
+-
+-    /// The menu's layout: the two slots where upstream's panel puts them.
+-    fn screen(&self, _host: &dyn Host, _event: &mut ScreenEvent<'_>) -> Option<Screen> {
+-        Some(screen())
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        crate::starling_tick::run(event, |host, entity, pos| tick(host, entity, pos));
+     }
+ }
+ 
+@@ -141,17 +140,17 @@ impl BlockEntityPart for BarrelPart {
+ 
+ /// One tick: read the slot, the tank and the bar, ask the pure rules, write back what
+ /// changed. The menu's two data slots carry the bar to the client (`syncObject(this.bar)`).
+-fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-    if event.entity.items.len() < SLOTS {
+-        event.entity.items.resize(SLOTS, None);
++fn tick(host: &mut dyn ServerHost, entity: &mut crate::starling_tick::OldEntity, tick_pos: [i32; 3]) {
++    if (*entity).items.len() < SLOTS {
++        (*entity).items.resize(SLOTS, None);
+     }
+-    if event.entity.data.len() < 2 {
+-        event.entity.data.resize(2, 0);
++    if (*entity).data.len() < 2 {
++        (*entity).data.resize(2, 0);
+     }
+-    let input = item_of(host, &event.entity.items, INPUT);
+-    let output = item_of(host, &event.entity.items, OUTPUT);
+-    let tank = read_tank(&event.entity.nbt);
+-    let progress = read_int(&event.entity.nbt, KEY_PROGRESS);
++    let input = item_of(host, &(*entity).items, INPUT);
++    let output = item_of(host, &(*entity).items, OUTPUT);
++    let tank = read_tank(&(*entity).nbt);
++    let progress = read_int(&(*entity).nbt, KEY_PROGRESS);
+     let recipe = barrel_startable(
+         input.as_ref().map(|(item, _)| item.as_str()),
+         tank.as_ref().map(|(fluid, mb)| (fluid.as_str(), *mb)),
+@@ -162,30 +161,30 @@ fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+     let next = match step {
+         Step::Reset => {
+             if progress != 0 {
+-                write_int(&mut event.entity.nbt, KEY_PROGRESS, 0);
++                write_int(&mut (*entity).nbt, KEY_PROGRESS, 0);
+             }
+             0
+         }
+         Step::Counting(counted) => {
+-            write_int(&mut event.entity.nbt, KEY_PROGRESS, counted);
++            write_int(&mut (*entity).nbt, KEY_PROGRESS, counted);
+             counted
+         }
+         Step::Finish => {
+             if let Some(recipe) = recipe {
+-                finish(host, event, recipe, input, output, tank);
++                finish(host, entity, tick_pos, recipe, input, output, tank);
+             }
+             0
+         }
+     };
+-    event.entity.data[0] = i32::try_from(next).unwrap_or(i32::MAX);
+-    event.entity.data[1] = i32::try_from(BARREL_TICKS).unwrap_or(i32::MAX);
++    (*entity).data[0] = i32::try_from(next).unwrap_or(i32::MAX);
++    (*entity).data[1] = i32::try_from(BARREL_TICKS).unwrap_or(i32::MAX);
+ }
+ 
+ /// The hundredth tick: drain a batch, shrink the input, and put the rolled output in the
+ /// output slot, combining into a stack already holding one (`FermentationBarrelTile.onFinish`).
+ fn finish(
+     host: &mut dyn ServerHost,
+-    event: &mut BlockEntityTickEvent<'_>,
++    entity: &mut crate::starling_tick::OldEntity, tick_pos: [i32; 3],
+     recipe: &'static crate::runtime::BarrelRecipe,
+     input: Option<(String, u32)>,
+     output: Option<(String, u32)>,
+@@ -201,26 +200,26 @@ fn finish(
+     );
+     match batch.input_left {
+         Some(left) => {
+-            if let Some(stack) = event.entity.items.get_mut(INPUT).and_then(Option::as_mut) {
++            if let Some(stack) = (*entity).items.get_mut(INPUT).and_then(Option::as_mut) {
+                 let _ = stack.set_count(left);
+             }
+         }
+         None => {
+-            if let Some(slot) = event.entity.items.get_mut(INPUT) {
++            if let Some(slot) = (*entity).items.get_mut(INPUT) {
+                 *slot = None;
+             }
+         }
+     }
+     write_tank(
+-        &mut event.entity.nbt,
++        &mut (*entity).nbt,
+         batch.fluid_left.map(|(fluid, mb)| (fluid.to_owned(), mb)),
+     );
+     if let Some(stack) = amount_stack(&*host, recipe.output, batch.output_amount)
+-        && let Some(slot) = event.entity.items.get_mut(OUTPUT)
++        && let Some(slot) = (*entity).items.get_mut(OUTPUT)
+     {
+         *slot = Some(stack);
+     }
+-    write_int(&mut event.entity.nbt, KEY_PROGRESS, 0);
++    write_int(&mut (*entity).nbt, KEY_PROGRESS, 0);
+ }
+ 
+ /// The amount's roll, from the level's own stream (`world.random.nextInt`), stored back so a
+@@ -232,7 +231,7 @@ fn draw(host: &mut dyn ServerHost, recipe: &'static crate::runtime::BarrelRecipe
+         return 0;
+     };
+     level
+-        .with_random(host, |random| random.next_int_bound(bound).ok())
++        .with_random(host, |random| Some(random.next_int_bound(bound)))
+         .flatten()
+         .map_or(0, |roll| u32::try_from(roll).unwrap_or(0))
+ }
+@@ -248,7 +247,7 @@ fn bucket(host: &mut dyn ServerHost, click: &BlockClick<'_>) -> Option<Interacti
+     let stack = click.stack.filter(|stack| stack.count() > 0)?;
+     let level = host.level(click.dimension.key().id())?;
+     let pos = click.pos;
+-    let held = stack.item().id(&*host);
++    let held = stack.item().id(&*host).unwrap_or_default();
+     let entity = host.block_entity(level, pos)?;
+     let tank = entity.data(&*host).and_then(|data| read_tank(&data));
+     let decision = bucket_click(
+@@ -370,7 +369,7 @@ pub(crate) fn write_tank(nbt: &mut Compound, tank: Option<(String, u32)>) {
+ /// Slot `index` of a block entity's items, with its count, as an owned pair.
+ fn item_of(host: &dyn Host, items: &[Option<ItemStack>], index: usize) -> Option<(String, u32)> {
+     let stack = items.get(index)?.as_ref()?;
+-    (stack.count() > 0).then(|| (stack.item().id(host), stack.count()))
++    (stack.count() > 0).then(|| (stack.item().id(host).unwrap_or_default().to_owned(), stack.count()))
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -388,7 +387,7 @@ pub(crate) fn readout(
+     };
+     let block = level
+         .block(&*host, pos)
+-        .map_or_else(String::new, |key| key.id(&*host));
++        .map_or_else(String::new, |key| key.id(&*host).unwrap_or_default().to_owned());
+     // The readout reads slot zero and the saved compound of whatever stands here: require this
+     // mod's own barrel first, so another block's inventory is never reported (the review fix on
+     // the board's command).
+@@ -407,7 +406,7 @@ pub(crate) fn readout(
+             .ok()
+             .flatten()
+             .filter(|stack| stack.count() > 0)
+-            .map(|stack| (stack.item().id(&*host), stack.count()))
++            .map(|stack| (stack.item().id(&*host).unwrap_or_default().to_owned(), stack.count()))
+     };
+     let input = slot(INPUT);
+     let data = entity.data(&*host).unwrap_or_default();
+@@ -442,7 +441,7 @@ pub(crate) fn set_tank(
+     };
+     let block = level
+         .block(&*host, pos)
+-        .map_or_else(String::new, |key| key.id(&*host));
++        .map_or_else(String::new, |key| key.id(&*host).unwrap_or_default().to_owned());
+     if block != BARREL {
+         return;
+     }
+@@ -490,7 +489,7 @@ mod tests {
+     fn the_screen_puts_the_slots_where_upstreams_panel_does() {
+         let screen = screen();
+         assert_eq!((screen.width, screen.height), (176.0, 166.0));
+-        assert_eq!(screen.slots, vec![Some([30.0, 48.0]), Some([130.0, 48.0])]);
++        assert_eq!(screen.slots, vec![Some(mod_api::ScreenSlot { position: [30.0, 48.0], no_item_icon: None }), Some(mod_api::ScreenSlot { position: [130.0, 48.0], no_item_icon: None })]);
+         assert_eq!(screen.slots.len(), SLOTS);
+     }
+ 
+@@ -524,3 +523,11 @@ mod tests {
+         assert_eq!(MENU, "sushigocrafting:fermentation_barrel");
+     }
+ }
++
++/// Starling's port: the menu's screen, registered for its own menu type.
++pub(crate) fn starling_menu_screen(
++    _host: &dyn mod_api::ClientHost,
++    _open: mod_api::MenuScreenOpen<'_>,
++) -> Option<mod_api::MenuScreen> {
++    Some(mod_api::MenuScreen::new(screen()))
++}
+diff --git a/src/board.rs b/src/board.rs
+index 6d1ea56..d3205d0 100644
+--- a/src/board.rs
++++ b/src/board.rs
+@@ -58,6 +58,7 @@ pub(crate) fn declare(registrar: &mut dyn Registrar) -> mod_api::BlockEntityType
+ /// `InventoryComponent` and never calls `openGui`.
+ pub(crate) fn container() -> ModContainer {
+     ModContainer {
++        insert_rules: Vec::new(),
+         slots: SLOT_COUNT,
+         faces: std::array::from_fn(|_| vec![INPUT_SLOT]),
+         inputs: vec![INPUT_SLOT],
+@@ -78,11 +79,10 @@ pub(crate) struct BoardPart;
+ impl BlockPart for BoardPart {
+     /// A placed board faces its placer (`Titanium`'s `FOUR_WAY`), as the retired
+     /// `state_for_placement` injection set it.
+-    fn state_for_placement(
+-        &self,
+-        level: &dyn LevelHost,
++    fn state_for_placement(&self, level: mod_api::LevelSide<'_>,
+         event: &mut StateForPlacementEvent<'_>,
+     ) -> Option<Option<BlockState>> {
++        let (mod_api::LevelSide::Server(level) | mod_api::LevelSide::Client(level)) = level;
+         let faced =
+             level.state_with_property(event.state, SUBFACING, facing_for_yaw(event.context.yaw))?;
+         Some(Some(faced))
+@@ -139,10 +139,10 @@ fn observe(
+     let clicks = saved_clicks(&entity.data(host).unwrap_or_default());
+     let recipe = slot
+         .as_ref()
+-        .and_then(|stack| recipe_for(&stack.item().id(host), |item, tag| in_tag(host, item, tag)));
++        .and_then(|stack| recipe_for(&stack.item().id(host).unwrap_or_default(), |item, tag| in_tag(host, item, tag)));
+     let (knife, ingredient) = match held.filter(|stack| stack.count() > 0) {
+         Some(stack) => {
+-            let item = stack.item().id(host);
++            let item = stack.item().id(host).unwrap_or_default();
+             (
+                 is_knife(&item, |item, tag| in_tag(host, item, tag)),
+                 accepts(&item, |item, tag| in_tag(host, item, tag)),
+@@ -192,7 +192,7 @@ fn click(
+         //    keeps its identity on the board.
+         if board.slot.is_none() && board.ingredient {
+             let limit = host.max_stack_size(stack.item()).unwrap_or(MAX_STACK);
+-            let item = stack.item().id(&*host);
++            let item = stack.item().id(&*host).unwrap_or_default();
+             let take = fits(None, &item, stack.count(), limit);
+             if take > 0 && insert(host, level, pos, stack, take, click.hand, click.player) {
+                 return Some(InteractionResult::Success);
+@@ -280,7 +280,7 @@ fn cut(
+     // Draw from the level's own stream and store it back, so a mod's draw moves vanilla's
+     // later ones as a Java mod's does.
+     let roll = level
+-        .with_random(host, |random| random.next_int_bound(bound).ok())
++        .with_random(host, |random| Some(random.next_int_bound(bound)))
+         .flatten()
+         .map_or(0, |roll| u32::try_from(roll).unwrap_or(0));
+     let amount = cut_amount(recipe.amount, roll);
+@@ -377,18 +377,18 @@ fn write_clicks(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3], click
+ pub(crate) fn declare_commands(event: &mut RegisterCommandsEvent<'_>) {
+     event
+         .commands
+-        .push(Command::new("sushigocrafting board <pos:block_pos>"));
++        .push(Command::new("sushigocrafting board <pos:block_pos>").executes(crate::starling_run_command));
+     event
+         .commands
+-        .push(Command::new("sushigocrafting barrel <pos:block_pos>"));
++        .push(Command::new("sushigocrafting barrel <pos:block_pos>").executes(crate::starling_run_command));
+     event.commands.push(Command::op(
+         "sushigocrafting clicks <pos:block_pos> <clicks:integer>",
+         2,
+-    ));
++    ).executes(crate::starling_run_command));
+     event.commands.push(Command::op(
+         "sushigocrafting tank <pos:block_pos> <fluid:id> <mb:integer>",
+         2,
+-    ));
++    ).executes(crate::starling_run_command));
+ }
+ 
+ /// The command bodies, on the typed invocation: `board` is the readout, `clicks` sets the
+@@ -439,7 +439,7 @@ fn readout(host: &mut dyn ServerHost, invocation: &CommandInvocation, pos: [i32;
+     };
+     let block = level
+         .block(&*host, pos)
+-        .map_or_else(String::new, |key| key.id(&*host));
++        .map_or_else(String::new, |key| key.id(&*host).unwrap_or_default().to_owned());
+     // The readout reaches `observe`, which reads slot zero and the saved stroke count of whatever
+     // block entity stands there. Require this mod's own block key first: another mod's inventory
+     // is not ours to report, and its slot zero is not a cutting board's input.
+@@ -455,7 +455,7 @@ fn readout(host: &mut dyn ServerHost, invocation: &CommandInvocation, pos: [i32;
+     let input = board
+         .slot
+         .as_ref()
+-        .map(|stack| (stack.item().id(&*host), stack.count()));
++        .map(|stack| (stack.item().id(&*host).unwrap_or_default().to_owned(), stack.count()));
+     summary(
+         pos,
+         input.as_ref().map(|(item, count)| (item.as_str(), *count)),
+@@ -473,7 +473,7 @@ fn answers_as_a_board(block: &str) -> bool {
+ fn is_board(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> bool {
+     level
+         .block(&*host, pos)
+-        .is_some_and(|key| answers_as_a_board(&key.id(&*host)))
++        .is_some_and(|key| answers_as_a_board(key.id(&*host).unwrap_or_default()))
+ }
+ 
+ /// The level a command executes in, from the dimension its invocation named (after
+diff --git a/src/lib.rs b/src/lib.rs
+index ccfe861..a1ef3d8 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -30,13 +30,14 @@
+ //! | `perform_command` (8) | [`Hooks::run_mod_command`], on typed arguments |
+ //! | the `content_root` injection (AE2 pattern) | gone: one flat `.hmod` carries `assets/` and `data/` itself |
+ 
++mod starling_tick;
+ pub mod barrel;
+ pub mod board;
+ pub mod runtime;
+ 
+ use mod_api::{
+     self, ComponentTypesEvent, Flow, Hooks, RegisterCommandsEvent, Registrar, RegistrationContext,
+-    RunModCommandEvent, ServerHost,
++    ServerHost,
+ };
+ 
+ /// The mod has no per-session state: a board's whole state is its block entity's slot and
+@@ -66,7 +67,7 @@ impl Hooks for Mod {
+         // and the engine refuses the whole package.
+         let kind = barrel::declare(registrar);
+         if let Err(error) = registrar.block_entity_part(&kind, barrel::BarrelPart) {
+-            _cx.refuse(&error.to_string());
++            registrar.refuse(&error.to_string());
+         }
+     }
+ 
+@@ -75,7 +76,7 @@ impl Hooks for Mod {
+     /// knows its type (an unregistered component is kept as an unknown entry and does not
+     /// survive to the client — measured in game, `notes.md` deviation 3).
+     fn component_types(&self, _cx: &RegistrationContext, event: &mut ComponentTypesEvent<'_>) {
+-        event.types.push(board::AMOUNT.to_owned());
++        event.register(board::AMOUNT.to_owned().into());
+     }
+ 
+     /// `/sushigocrafting board|clicks <x> <y> <z>`: the readout and the harness's stroke
+@@ -83,22 +84,6 @@ impl Hooks for Mod {
+     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+         board::declare_commands(event);
+     }
+-
+-    /// The command bodies. The dispatcher has already parsed and resolved every argument,
+-    /// so nothing here splits a line; the readout text is the retired port's, byte for
+-    /// byte, because the existing in-game assertions match on it.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        if event.command.literals.first().map(String::as_str) != Some(board::COMMAND) {
+-            return Flow::Continue;
+-        }
+-        let line = board::run_command(host, event.command);
+-        board::feedback(host, &line);
+-        Flow::Cancel
+-    }
+ }
+ 
+ #[cfg(test)]
+@@ -130,3 +115,17 @@ mod tests {
+         );
+     }
+ }
++
++/// Starling's port: the old `run_mod_command`, every declared usage's executor.
++pub(crate) fn starling_run_command(
++    host: &mut dyn ServerHost,
++    source: &mod_api::CommandSource,
++    command: &mod_api::CommandInvocation,
++) -> Option<i32> {
++    if command.literals.first().map(String::as_str) != Some(board::COMMAND) {
++            return None;
++        }
++        let line = board::run_command(host, command);
++        board::feedback(host, &line);
++        Some(1)
++}
+diff --git a/sushigocrafting/src/starling_tick.rs b/src/starling_tick.rs
+new file mode 100644
+index 0000000..4de1a43
+--- /dev/null
++++ b/src/starling_tick.rs
+@@ -0,0 +1,63 @@
++//! Starling's port to Sunrise's API: a block entity tick written for Horizon's, which handed the
++//! tick the block entity's slots, compound and data slots to change in place, runs here on a copy
++//! of them taken from the tick's view; what it changed is written back and the chunk marked
++//! unsaved, as Horizon's reply did.
++use mod_api::{BlockEntityTickEvent, Compound, ItemStack, ServerHost};
++
++/// The block entity as Horizon's tick had it.
++pub(crate) struct OldEntity {
++    pub items: Vec<Option<ItemStack>>,
++    pub nbt: Compound,
++    pub data: Vec<i32>,
++}
++
++/// Run `body` on a copy of the ticking block entity (its host, the copy, its position).
++pub(crate) fn run(
++    event: &mut BlockEntityTickEvent<'_>,
++    body: impl FnOnce(&mut dyn ServerHost, &mut OldEntity, [i32; 3]),
++) {
++    let Some((handle, pos, before)) = event.subject.with_view(|view| {
++        let items = (0..view.item_slots() as u32)
++            .map(|slot| view.item_slot(slot).and_then(|stack| stack.to_owned()))
++            .collect();
++        let entity = OldEntity {
++            items,
++            nbt: view.nbt().clone(),
++            data: view.data_slots().to_vec(),
++        };
++        (view.handle(), view.position(), entity)
++    }) else {
++        return;
++    };
++    let mut after = OldEntity {
++        items: before.items.clone(),
++        nbt: before.nbt.clone(),
++        data: before.data.clone(),
++    };
++    body(event.subject.host(), &mut after, pos);
++    let mut changed = false;
++    event.subject.with_view(|mut view| {
++        for (key, value) in after.nbt.iter() {
++            if before.nbt.get(key) != Some(value) && view.set_nbt(key.clone(), Some(value.clone())) {
++                changed = true;
++            }
++        }
++        for (key, _) in before.nbt.iter() {
++            if after.nbt.get(key).is_none() && view.set_nbt(key.clone(), None) {
++                changed = true;
++            }
++        }
++        for (slot, stack) in after.items.iter().enumerate() {
++            if before.items.get(slot) != Some(stack) {
++                let _ = view.set_item_slot(slot as u32, stack.clone());
++                changed = true;
++            }
++        }
++        if after.data != before.data && view.set_data_slots(&after.data) {
++            changed = true;
++        }
++    });
++    if changed {
++        let _ = handle.set_changed(event.subject.host());
++    }
++}

@@ -1,0 +1,443 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 14efdc7..bf9dad5 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -15,13 +15,16 @@
+ //! The numbers — the jar's 86 recipes, the oven's progress rule and the brazier's burn rule —
+ //! live in [`runtime`], which holds no `mod_api` type and is unit-tested by `cargo test` alone.
+ 
++mod starling_tick;
++mod starling_command;
+ pub mod runtime;
+ pub mod support;
+ 
++use crate::starling_command::RunModCommandEvent;
+ use mod_api::{
+     self, BlockEntityEvent, BlockEntityPart, BlockEntityTickEvent, BlockEntityTicksEvent,
+     BlockPart, Compound, Flow, Hooks, Host, InteractionResult, LevelSide, RegisterCommandsEvent,
+-    Registrar, RegistrationContext, RunModCommandEvent, ServerHost, UseItemOnEvent,
++    Registrar, RegistrationContext, ServerHost, UseItemOnEvent,
+     UseWithoutItemEvent,
+ };
+ 
+@@ -40,15 +43,6 @@ impl Hooks for Mod {
+     fn register_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+         support::declare_commands(event.commands);
+     }
+-
+-    /// Run one of the commands above and take it.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        support::run_command(host, event)
+-    }
+ }
+ 
+ /// The calcination oven: its block entity (input 0, output 1) and the click that feeds it and
+@@ -85,8 +79,8 @@ impl BlockEntityPart for Oven {
+         event.ticks = true;
+     }
+ 
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        support::oven_tick(host, event);
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        crate::starling_tick::run(event, |host, entity, pos| support::oven_tick(host, entity, pos));
+     }
+ }
+ 
+@@ -122,7 +116,24 @@ impl BlockEntityPart for Brazier {
+         event.ticks = true;
+     }
+ 
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        support::brazier_tick(host, event);
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        crate::starling_tick::run(event, |host, entity, pos| support::brazier_tick(host, entity, pos));
+     }
+ }
++
++/// Starling's port: the old `run_mod_command` hook's body.
++pub(crate) fn starling_run_mod_command(
++    host: &mut dyn ServerHost,
++    event: &mut crate::starling_command::RunModCommandEvent<'_>,
++) -> Flow {
++        support::run_command(host, event)
++    }
++
++/// Starling's port: every declared usage runs the old hook's body.
++pub(crate) fn starling_executor(
++    host: &mut dyn ServerHost,
++    source: &mod_api::CommandSource,
++    command: &mod_api::CommandInvocation,
++) -> Option<i32> {
++    crate::starling_command::execute(host, source, command, starling_run_mod_command)
++}
+diff --git a/theurgy/src/starling_command.rs b/src/starling_command.rs
+new file mode 100644
+index 0000000..894f55f
+--- /dev/null
++++ b/src/starling_command.rs
+@@ -0,0 +1,31 @@
++//! Starling's port to Sunrise's API: Horizon's `run_mod_command` hook, which got every command of
++//! the mod in one event, is a per-usage executor in Sunrise. The old event is rebuilt here around
++//! the executor's arguments, so the mod's command code runs as it was written.
++use mod_api::{CommandInvocation, CommandSource, Flow, ServerHost};
++
++/// Horizon's `RunModCommandEvent`: the parsed command and who ran it.
++pub(crate) struct RunModCommandEvent<'a> {
++    pub command: &'a CommandInvocation,
++    pub source: &'a CommandSource,
++    /// Whether an earlier mod took the command: in Sunrise each usage has its own executor, so never.
++    pub cancelled: bool,
++}
++
++/// The executor of every usage the mod declares: the old hook's body (`run`), whose `Cancel` was a
++/// command it ran and `Continue` one it did not.
++pub(crate) fn execute(
++    host: &mut dyn ServerHost,
++    source: &CommandSource,
++    command: &CommandInvocation,
++    run: fn(&mut dyn ServerHost, &mut RunModCommandEvent<'_>) -> Flow,
++) -> Option<i32> {
++    let mut event = RunModCommandEvent {
++        command,
++        source,
++        cancelled: false,
++    };
++    match run(host, &mut event) {
++        Flow::Continue => None,
++        _ => Some(1),
++    }
++}
+diff --git a/theurgy/src/starling_tick.rs b/src/starling_tick.rs
+new file mode 100644
+index 0000000..4de1a43
+--- /dev/null
++++ b/src/starling_tick.rs
+@@ -0,0 +1,63 @@
++//! Starling's port to Sunrise's API: a block entity tick written for Horizon's, which handed the
++//! tick the block entity's slots, compound and data slots to change in place, runs here on a copy
++//! of them taken from the tick's view; what it changed is written back and the chunk marked
++//! unsaved, as Horizon's reply did.
++use mod_api::{BlockEntityTickEvent, Compound, ItemStack, ServerHost};
++
++/// The block entity as Horizon's tick had it.
++pub(crate) struct OldEntity {
++    pub items: Vec<Option<ItemStack>>,
++    pub nbt: Compound,
++    pub data: Vec<i32>,
++}
++
++/// Run `body` on a copy of the ticking block entity (its host, the copy, its position).
++pub(crate) fn run(
++    event: &mut BlockEntityTickEvent<'_>,
++    body: impl FnOnce(&mut dyn ServerHost, &mut OldEntity, [i32; 3]),
++) {
++    let Some((handle, pos, before)) = event.subject.with_view(|view| {
++        let items = (0..view.item_slots() as u32)
++            .map(|slot| view.item_slot(slot).and_then(|stack| stack.to_owned()))
++            .collect();
++        let entity = OldEntity {
++            items,
++            nbt: view.nbt().clone(),
++            data: view.data_slots().to_vec(),
++        };
++        (view.handle(), view.position(), entity)
++    }) else {
++        return;
++    };
++    let mut after = OldEntity {
++        items: before.items.clone(),
++        nbt: before.nbt.clone(),
++        data: before.data.clone(),
++    };
++    body(event.subject.host(), &mut after, pos);
++    let mut changed = false;
++    event.subject.with_view(|mut view| {
++        for (key, value) in after.nbt.iter() {
++            if before.nbt.get(key) != Some(value) && view.set_nbt(key.clone(), Some(value.clone())) {
++                changed = true;
++            }
++        }
++        for (key, _) in before.nbt.iter() {
++            if after.nbt.get(key).is_none() && view.set_nbt(key.clone(), None) {
++                changed = true;
++            }
++        }
++        for (slot, stack) in after.items.iter().enumerate() {
++            if before.items.get(slot) != Some(stack) {
++                let _ = view.set_item_slot(slot as u32, stack.clone());
++                changed = true;
++            }
++        }
++        if after.data != before.data && view.set_data_slots(&after.data) {
++            changed = true;
++        }
++    });
++    if changed {
++        let _ = handle.set_changed(event.subject.host());
++    }
++}
+diff --git a/src/support.rs b/src/support.rs
+index 23fdddc..e1afe0a 100644
+--- a/src/support.rs
++++ b/src/support.rs
+@@ -11,11 +11,11 @@
+ 
+ use std::sync::atomic::{AtomicI64, Ordering};
+ 
++use crate::starling_command::RunModCommandEvent;
+ use mod_api::{
+     BlockClick, BlockEntityRef, BlockEntityTickEvent, Command, CommandArgument,
+     CommandArgumentValue, CommandSource, Compound, Flow, Host, HostTransaction, Identifier,
+-    InteractionResult, ItemKey, ItemPlace, ItemResource, ItemStack, LevelRef, ModBlockEntityView,
+-    ModContainer, Registrar, RunModCommandEvent, ServerHost, Tag, Text, UseItemOnEvent,
++    InteractionResult, ItemKey, ItemPlace, ItemResource, ItemStack, LevelRef, ModContainer, Registrar, ServerHost, Tag, Text, UseItemOnEvent,
+     UseWithoutItemEvent,
+ };
+ 
+@@ -86,6 +86,7 @@ pub fn declare(r: &mut dyn Registrar) {
+ /// a fill reaches the input, a drain takes the input or the output.
+ fn oven_container() -> ModContainer {
+     ModContainer {
++        insert_rules: Vec::new(),
+         slots: SLOTS,
+         faces: std::array::from_fn(|_| vec![INPUT, OUTPUT]),
+         inputs: vec![INPUT],
+@@ -97,6 +98,7 @@ fn oven_container() -> ModContainer {
+ /// The brazier's plain `ItemStackHandler(1)` is reachable both ways from every side.
+ fn brazier_container() -> ModContainer {
+     ModContainer {
++        insert_rules: Vec::new(),
+         slots: 1,
+         faces: std::array::from_fn(|_| vec![0]),
+         inputs: vec![0],
+@@ -106,10 +108,10 @@ fn brazier_container() -> ModContainer {
+ }
+ 
+ /// `/theurgy info|recipe|recipes` — the readouts players and the harness use.
+-pub fn declare_commands(commands: &mut Vec<Command>) {
+-    commands.push(Command::new("theurgy info <pos:block_pos>"));
+-    commands.push(Command::new("theurgy recipe <item:item>"));
+-    commands.push(Command::new("theurgy recipes"));
++pub fn declare_commands(commands: &mut Vec<mod_api::CommandRegistration>) {
++    commands.push(Command::new("theurgy info <pos:block_pos>").executes(crate::starling_executor));
++    commands.push(Command::new("theurgy recipe <item:item>").executes(crate::starling_executor));
++    commands.push(Command::new("theurgy recipes").executes(crate::starling_executor));
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -118,37 +120,37 @@ pub fn declare_commands(commands: &mut Vec<Command>) {
+ 
+ /// `CalcinationOvenBlockEntity.tickServer`: sample the heat below every 20 ticks, then advance
+ /// the recipe by one.
+-pub fn oven_tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
++pub fn oven_tick(host: &mut dyn ServerHost, entity: &mut crate::starling_tick::OldEntity, tick_pos: [i32; 3]) {
+     let Some(level) = level_in_place(host) else {
+         return;
+     };
+-    let pos = event.pos;
+-    if event.entity.items.len() < SLOTS {
+-        event.entity.items.resize(SLOTS, None);
++    let pos = tick_pos;
++    if (*entity).items.len() < SLOTS {
++        (*entity).items.resize(SLOTS, None);
+     }
+     let now = level.game_time(&*host).unwrap_or(0).max(0).unsigned_abs();
+     if heat_sample_due(now) {
+         let heated = heat_below(&*host, level, pos);
+-        write_int(&mut event.entity.nbt, KEY_HEAT, i32::from(heated));
++        write_int(&mut (*entity).nbt, KEY_HEAT, i32::from(heated));
+         set_lit(host, level, pos, heated);
+     }
+-    let heated = read_int(&event.entity.nbt, KEY_HEAT) != 0;
++    let heated = read_int(&(*entity).nbt, KEY_HEAT) != 0;
+     let mut oven = Oven {
+-        progress: read_int(&event.entity.nbt, KEY_PROGRESS).clamp(0, i32::from(u16::MAX)) as u16,
+-        total: read_int(&event.entity.nbt, KEY_TOTAL).clamp(0, i32::from(u16::MAX)) as u16,
++        progress: read_int(&(*entity).nbt, KEY_PROGRESS).clamp(0, i32::from(u16::MAX)) as u16,
++        total: read_int(&(*entity).nbt, KEY_TOTAL).clamp(0, i32::from(u16::MAX)) as u16,
+     };
+     if oven.total == 0 {
+         oven = Oven::new();
+     }
+     // `InputInventory.onContentTypeChanged`: a new item sets the recipe's time and starts the
+     // progress over.
+-    let input_id = event.entity.items[INPUT]
++    let input_id = (*entity).items[INPUT]
+         .as_ref()
+-        .map(|stack| stack.item().id(&*host));
+-    let stored = read_str(&event.entity.nbt, KEY_INPUT_ITEM);
++        .map(|stack| stack.item().id(&*host).unwrap_or_default().to_owned());
++    let stored = read_str(&(*entity).nbt, KEY_INPUT_ITEM);
+     let current = input_id.as_deref().unwrap_or("");
+     if stored != current {
+-        write_str(&mut event.entity.nbt, KEY_INPUT_ITEM, current);
++        write_str(&mut (*entity).nbt, KEY_INPUT_ITEM, current);
+         match input_id.as_deref() {
+             Some(item) => {
+                 let host_ref: &dyn Host = &*host;
+@@ -159,13 +161,13 @@ pub fn oven_tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>
+             None => oven.progress = 0,
+         }
+     }
+-    let input_count = event.entity.items[INPUT]
++    let input_count = (*entity).items[INPUT]
+         .as_ref()
+         .map_or(0, ItemStack::count);
+-    let output_id = event.entity.items[OUTPUT]
++    let output_id = (*entity).items[OUTPUT]
+         .as_ref()
+-        .map(|stack| stack.item().id(&*host));
+-    let output_count = event.entity.items[OUTPUT]
++        .map(|stack| stack.item().id(&*host).unwrap_or_default().to_owned());
++    let output_count = (*entity).items[OUTPUT]
+         .as_ref()
+         .map_or(0, ItemStack::count);
+     let step = {
+@@ -181,51 +183,51 @@ pub fn oven_tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>
+     if let Step::Craft(recipe) = step {
+         let left = input_count.saturating_sub(recipe.count);
+         if left == 0 {
+-            event.entity.items[INPUT] = None;
+-        } else if let Some(stack) = event.entity.items[INPUT].as_mut() {
++            (*entity).items[INPUT] = None;
++        } else if let Some(stack) = (*entity).items[INPUT].as_mut() {
+             let _ = stack.set_count(left);
+         }
+-        match event.entity.items[OUTPUT].as_mut() {
++        match (*entity).items[OUTPUT].as_mut() {
+             Some(stack) => {
+                 let total = stack.count().saturating_add(recipe.output_count);
+                 let _ = stack.set_count(total);
+             }
+             None => {
+-                event.entity.items[OUTPUT] = item_key(&*host, recipe.output)
++                (*entity).items[OUTPUT] = item_key(&*host, recipe.output)
+                     .and_then(|key| ItemStack::new(key, recipe.output_count));
+             }
+         }
+     }
+     write_int(
+-        &mut event.entity.nbt,
++        &mut (*entity).nbt,
+         KEY_PROGRESS,
+         i32::from(oven.progress),
+     );
+-    write_int(&mut event.entity.nbt, KEY_TOTAL, i32::from(oven.total));
++    write_int(&mut (*entity).nbt, KEY_TOTAL, i32::from(oven.total));
+ }
+ 
+ /// `PyromanticBrazierBlockEntity.tickServer`: burn down, then load the next fuel item, and
+ /// publish `lit`.
+-pub fn brazier_tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
++pub fn brazier_tick(host: &mut dyn ServerHost, entity: &mut crate::starling_tick::OldEntity, tick_pos: [i32; 3]) {
+     let Some(level) = level_in_place(host) else {
+         return;
+     };
+-    let pos = event.pos;
+-    if event.entity.items.is_empty() {
+-        event.entity.items.push(None);
++    let pos = tick_pos;
++    if (*entity).items.is_empty() {
++        (*entity).items.push(None);
+     }
+-    let fuel = event.entity.items[0]
++    let fuel = (*entity).items[0]
+         .as_ref()
+         .map(|stack| burn_time(&*host, stack));
+     let mut brazier = Brazier {
+-        remaining: read_int(&event.entity.nbt, KEY_REMAINING).clamp(0, i32::from(u16::MAX)) as u16,
++        remaining: read_int(&(*entity).nbt, KEY_REMAINING).clamp(0, i32::from(u16::MAX)) as u16,
+     };
+     let burn = brazier.tick(fuel);
+     if burn.consumed {
+-        take_one_fuel(host, &mut event.entity);
++        take_one_fuel(host, &mut (*entity));
+     }
+     write_int(
+-        &mut event.entity.nbt,
++        &mut (*entity).nbt,
+         KEY_REMAINING,
+         i32::from(brazier.remaining),
+     );
+@@ -258,11 +260,11 @@ pub fn oven_use_item_on(
+     if !is_kind(&*host, entity, OVEN) {
+         return None;
+     }
+-    let held = stack.item().id(&*host);
++    let held = stack.item().id(&*host).unwrap_or_default().to_owned();
+     let stored = entity.item_slot(&*host, INPUT as u32).ok().flatten();
+     if stored
+         .as_ref()
+-        .is_some_and(|stored| stored.item().id(&*host) != held)
++        .is_some_and(|stored| stored.item().id(&*host).unwrap_or_default() != held)
+     {
+         return None;
+     }
+@@ -339,7 +341,7 @@ pub fn brazier_use_item_on(
+     // converted into the held one, and different components are not equal
+     // either (the review finding). The click then does nothing.
+     if let Some(stored) = stored.as_ref()
+-        && (!runtime::fuel_merges(&stored.item().id(&*host), &held.item().id(&*host))
++        && (!runtime::fuel_merges(&stored.item().id(&*host).unwrap_or_default(), &held.item().id(&*host).unwrap_or_default())
+             || !stored.same_components(held))
+     {
+         return None;
+@@ -434,7 +436,7 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
+                 feedback(host, "usage: /theurgy recipe <item>");
+                 return Flow::Cancel;
+             };
+-            let item = stack.item().id(&*host);
++            let item = stack.item().id(&*host).unwrap_or_default().to_owned();
+             let recipe = {
+                 let host_ref: &dyn Host = &*host;
+                 let in_tag = |item: &str, tag: &str| in_item_tag(host_ref, item, tag);
+@@ -507,7 +509,7 @@ fn readout(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> String
+     let lit = level
+         .block_property(&*host, pos, "lit")
+         .unwrap_or_else(|| "?".to_owned());
+-    let kind = entity.kind(&*host).map(|kind| kind.id(&*host));
++    let kind = entity.kind(&*host).and_then(|kind| kind.id(&*host).map(str::to_owned));
+     let data = entity.data(&*host).unwrap_or_else(Compound::new);
+     match kind.as_deref() {
+         Some(OVEN) => {
+@@ -540,7 +542,7 @@ fn readout(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> String
+ /// `"<item> x<count>"`, or `empty` for a slot that holds nothing.
+ fn slot_text(host: &dyn Host, stack: Option<&ItemStack>) -> String {
+     match stack {
+-        Some(stack) => format!("{} x{}", stack.item().id(host), stack.count()),
++        Some(stack) => format!("{} x{}", stack.item().id(host).unwrap_or_default(), stack.count()),
+         None => "empty".to_owned(),
+     }
+ }
+@@ -559,8 +561,7 @@ fn heat_below(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> bool {
+     let below = [pos[0], pos[1] - 1, pos[2]];
+     level
+         .block(host, below)
+-        .map(|block| block.id(host))
+-        .as_deref()
++        .and_then(|block| block.id(host))
+         == Some(BRAZIER)
+         && level.block_property(host, below, "lit").as_deref() == Some("true")
+ }
+@@ -581,7 +582,7 @@ fn burn_time(host: &dyn Host, stack: &ItemStack) -> u32 {
+ 
+ /// Consume one fuel item, honouring a crafting remainder (a lava bucket leaves its bucket), as
+ /// `PyromanticBrazierBlockEntity.tickServer` does.
+-fn take_one_fuel(host: &mut dyn ServerHost, entity: &mut ModBlockEntityView<'_>) {
++fn take_one_fuel(host: &mut dyn ServerHost, entity: &mut crate::starling_tick::OldEntity) {
+     let Some(slot) = entity.items.first_mut() else {
+         return;
+     };
+@@ -682,7 +683,7 @@ fn level_in_place(host: &dyn ServerHost) -> Option<LevelRef> {
+ 
+ /// Whether the block entity is the type `id` (`theurgy:<path>`).
+ fn is_kind(host: &dyn Host, entity: BlockEntityRef, id: &str) -> bool {
+-    entity.kind(host).is_some_and(|kind| kind.id(host) == id)
++    entity.kind(host).is_some_and(|kind| kind.id(host) == Some(id))
+ }
+ 
+ fn item_key(host: &dyn Host, id: &str) -> Option<ItemKey> {

@@ -1,0 +1,409 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 3f67ff9..178c00c 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -27,15 +27,18 @@
+ //! Its `content_root` embedded-content helper has no successor: one `.hmod`
+ //! carries the content and the code, which is what that helper existed to work
+ //! around.
++mod starling_tick;
++mod starling_command;
+ pub mod runtime;
+ 
+ mod powah;
+ 
+ use std::sync::{Arc, Mutex};
+ 
++use crate::starling_command::RunModCommandEvent;
+ use mod_api::{
+     self, Flow, Hooks, HostSide, LevelTickPostEvent, RegisterCommandsEvent, Registrar,
+-    RegistrationContext, RunModCommandEvent, ServerHost, Text, WorldLifecycleEvent,
++    RegistrationContext, ServerHost, Text, WorldLifecycleEvent,
+ };
+ 
+ use crate::powah::{Queue, SetOutcome};
+@@ -51,7 +54,7 @@ fn declare_idle(
+     let kind = powah::declare(registrar, name);
+     let part = powah::IdlePart::new(Arc::clone(queue));
+     if let Err(error) = registrar.block_entity_part(&kind, part) {
+-        context.refuse(&error.to_string());
++        registrar.refuse(&error.to_string());
+     }
+ }
+ 
+@@ -84,7 +87,7 @@ impl Hooks for Mod {
+             let kind = powah::declare(registrar, name);
+             let part = powah::FurnatorPart::new(Arc::clone(&self.queue), tier);
+             if let Err(error) = registrar.block_entity_part(&kind, part) {
+-                context.refuse(&error.to_string());
++                registrar.refuse(&error.to_string());
+             }
+         }
+         // Every energy cell tier: one buffer with the tier's own capacity and
+@@ -110,7 +113,7 @@ impl Hooks for Mod {
+         // jobs). Every furnator tier was declared above, where its tier's buffer is.
+         let orb_kind = powah::declare(registrar, powah::ORB_TYPE);
+         if let Err(error) = registrar.block_entity_part(&orb_kind, powah::OrbPart) {
+-            context.refuse(&error.to_string());
++            registrar.refuse(&error.to_string());
+         }
+         for (_, name) in powah::CELLS {
+             declare_idle(registrar, context, &self.queue, name);
+@@ -162,14 +165,13 @@ impl Hooks for Mod {
+     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+         powah::declare_commands(event.commands);
+     }
++}
+ 
+-    /// The command bodies: the arguments are parsed and resolved by the server's
+-    /// dispatcher, so this only reads a machine and answers, in 0.1.0's words.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
++/// Starling's port: the old `run_mod_command` hook's body.
++pub(crate) fn starling_run_mod_command(
++    host: &mut dyn ServerHost,
++    event: &mut crate::starling_command::RunModCommandEvent<'_>,
++) -> Flow {
+         let literals: Vec<&str> = event.command.literals.iter().map(String::as_str).collect();
+         let pos = powah::block_pos(event.command.argument("pos"));
+         let amount = powah::integer(event.command.argument("amount"));
+@@ -192,4 +194,12 @@ impl Hooks for Mod {
+         let _ = host.commands().feedback(Text::literal(line));
+         Flow::Cancel
+     }
++
++/// Starling's port: every declared usage runs the old hook's body.
++pub(crate) fn starling_executor(
++    host: &mut dyn ServerHost,
++    source: &mod_api::CommandSource,
++    command: &mod_api::CommandInvocation,
++) -> Option<i32> {
++    crate::starling_command::execute(host, source, command, starling_run_mod_command)
+ }
+diff --git a/src/powah.rs b/src/powah.rs
+index 9893095..e117491 100644
+--- a/src/powah.rs
++++ b/src/powah.rs
+@@ -15,7 +15,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
+ use std::sync::{Arc, Mutex};
+ 
+ use mod_api::{
+-    self, BlockEntityPart, BlockEntityTickEvent, BlockEntityTickReply, BlockEntityTicksEvent,
++    self, BlockEntityPart, BlockEntityTickEvent, BlockEntityTicksEvent,
+     BlockEntityTypeKey, BlockPart, Command, CommandArgumentValue, Compound, Direction, ENERGY,
+     Host, HostTransaction, Identifier, LevelRef, ModContainer, ModEnergyBuffer, Registrar,
+     ServerHost, Tag, move_energy,
+@@ -180,6 +180,7 @@ pub(crate) fn declare(registrar: &mut dyn Registrar, name: &str) -> BlockEntityT
+ /// has no GUI). Upstream has two slots — the charging slot is a gap.
+ pub(crate) fn container() -> ModContainer {
+     ModContainer {
++        insert_rules: Vec::new(),
+         slots: SLOT_COUNT,
+         faces: std::array::from_fn(|_| vec![FUEL_SLOT]),
+         inputs: vec![FUEL_SLOT],
+@@ -303,7 +304,7 @@ fn input_ids(host: &dyn Host, items: &[Option<mod_api::ItemStack>]) -> Vec<Strin
+         .iter()
+         .skip(1)
+         .flatten()
+-        .map(|stack| stack.item().id(host))
++        .map(|stack| stack.item().id(host).unwrap_or_default().to_owned())
+         .collect()
+ }
+ 
+@@ -321,7 +322,7 @@ pub(crate) fn read_orb(
+         // `items` with its container, but a freshly placed orb answers before its
+         // first tick) reads as empty rather than as a missing orb.
+         if let Ok(Some(stack)) = entity.item_slot(&*host, slot) {
+-            inputs.push(stack.item().id(&*host));
++            inputs.push(stack.item().id(&*host).unwrap_or_default().to_owned());
+         }
+     }
+     let recipe = {
+@@ -339,15 +340,15 @@ pub(crate) fn read_orb(
+ /// the buffer the rods fill, and produce when it reaches the recipe's energy. The
+ /// payload is left `Changed` only when something was written, so a waiting orb
+ /// does not dirty its chunk every tick and a rod's fill survives it.
+-fn orb_tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) -> bool {
+-    let resized = event.entity.items.len() != ORB_SLOTS;
++fn orb_tick(host: &mut dyn ServerHost, entity: &mut crate::starling_tick::OldEntity, tick_pos: [i32; 3]) -> bool {
++    let resized = (*entity).items.len() != ORB_SLOTS;
+     if resized {
+-        event.entity.items.resize(ORB_SLOTS, None);
++        (*entity).items.resize(ORB_SLOTS, None);
+     }
+-    let mut saved = Tag::Compound(std::mem::take(&mut event.entity.nbt));
++    let mut saved = Tag::Compound(std::mem::take(&mut (*entity).nbt));
+     let energy = int(&saved, KEY_ENERGY);
+     let recorded = string(&saved, KEY_RECIPE);
+-    let inputs = input_ids(&*host, &event.entity.items);
++    let inputs = input_ids(&*host, &(*entity).items);
+     let ids: Vec<&str> = inputs.iter().map(String::as_str).collect();
+     let step = crate::runtime::orb_step(&ids, energy, recorded.as_deref());
+     let mut changed = resized;
+@@ -358,8 +359,8 @@ fn orb_tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) ->
+             let output = host
+                 .item_key(&Identifier::parse(recipe.output).expect("a registry id"))
+                 .and_then(|item| mod_api::ItemStack::new(item, recipe.count.unsigned_abs()));
+-            event.entity.items.fill(None);
+-            event.entity.items[ORB_OUTPUT_SLOT] = output;
++            (*entity).items.fill(None);
++            (*entity).items[ORB_OUTPUT_SLOT] = output;
+             write_string(&mut saved, KEY_RECIPE, NO_RECIPE);
+             changed = true;
+         }
+@@ -381,7 +382,7 @@ fn orb_tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) ->
+         changed = true;
+     }
+     if let Tag::Compound(nbt) = saved {
+-        event.entity.nbt = nbt;
++        (*entity).nbt = nbt;
+     }
+     changed
+ }
+@@ -555,6 +556,7 @@ pub(crate) fn rod_of(block: &str) -> Option<RodTier> {
+ /// allows; there is no menu (no GUI in this port).
+ pub(crate) fn orb_container() -> ModContainer {
+     ModContainer {
++        insert_rules: Vec::new(),
+         slots: ORB_SLOTS,
+         faces: std::array::from_fn(|_| (0..ORB_SLOTS).collect()),
+         inputs: (1..ORB_SLOTS).collect(),
+@@ -661,16 +663,16 @@ pub(crate) fn level_now(host: &dyn ServerHost) -> Option<LevelRef> {
+ 
+ /// The id of the block at `pos`, if there is one.
+ pub(crate) fn block_at(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> Option<String> {
+-    Some(level.block(host, pos)?.id(host))
++    level.block(host, pos)?.id(host).map(str::to_owned)
+ }
+ 
+ /// The two usages `/powah` declares, both operator-only (level 2). They are
+ /// administrative: `set` writes a machine's stored FE and `info` reads its fuel
+ /// slot, at coordinates the caller chooses, so they are operator diagnostics
+ /// rather than gameplay (review finding 2026-11-18).
+-pub(crate) fn declare_commands(commands: &mut Vec<Command>) {
+-    commands.push(Command::op("powah info <pos:block_pos>", 2));
+-    commands.push(Command::op("powah set <amount:integer> <pos:block_pos>", 2));
++pub(crate) fn declare_commands(commands: &mut Vec<mod_api::CommandRegistration>) {
++    commands.push(Command::op("powah info <pos:block_pos>", 2).executes(crate::starling_executor));
++    commands.push(Command::op("powah set <amount:integer> <pos:block_pos>", 2).executes(crate::starling_executor));
+ }
+ 
+ /// A machine's readout, or `None` when no Powah machine stands there. The block id
+@@ -688,7 +690,7 @@ pub(crate) fn info_line(host: &mut dyn ServerHost, pos: [i32; 3]) -> Option<Stri
+                 .item_slot(&*host, FUEL_SLOT as u32)
+                 .ok()
+                 .flatten()
+-                .map(|stack| (stack.item().id(&*host), stack.count()));
++                .map(|stack| (stack.item().id(&*host).unwrap_or_default().to_owned(), stack.count()));
+             (state.energy, state.carbon, fuel)
+         }
+         Kind::Cell(tier) => {
+@@ -792,12 +794,14 @@ impl BlockEntityPart for FurnatorPart {
+     /// then queue this position for the level's move phase. The payload is left
+     /// `Changed` only when something moved, so an idle furnator does not dirty its
+     /// chunk every tick.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        let changed = burn(host, event, self.tier);
+-        self.enqueue(host, event.pos);
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        crate::starling_tick::run(event, |host, entity, tick_pos| {
++        let changed = burn(host, entity, tick_pos, self.tier);
++        self.enqueue(host, tick_pos);
+         if !changed {
+-            *event.reply = BlockEntityTickReply::Unchanged;
++            // (unchanged: nothing is written back)
+         }
++    });
+     }
+ }
+ 
+@@ -841,14 +845,16 @@ impl BlockEntityPart for IdlePart {
+ 
+     /// The cell stores its FE in its saved compound and the cable in nothing, so
+     /// neither has a rule of its own: both only queue the move phase.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        crate::starling_tick::run(event, |host, entity, tick_pos| {
+         if let Some(level) = level_now(host) {
+             self.queue
+                 .lock()
+                 .expect("the powah queue lock is held for one insert")
+-                .push(level, event.pos);
++                .push(level, tick_pos);
+         }
+-        *event.reply = BlockEntityTickReply::Unchanged;
++        // (unchanged: nothing is written back)
++    });
+     }
+ }
+ 
+@@ -867,10 +873,12 @@ impl BlockEntityPart for OrbPart {
+ 
+     /// One server tick: the recipe the inputs match, the buffer's value and the
+     /// result, as `EnergizingOrbTile` decides them.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        if !orb_tick(host, event) {
+-            *event.reply = BlockEntityTickReply::Unchanged;
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        crate::starling_tick::run(event, |host, entity, tick_pos| {
++        if !orb_tick(host, entity, tick_pos) {
++            // (unchanged: nothing is written back)
+         }
++    });
+     }
+ }
+ 
+@@ -878,21 +886,21 @@ impl BlockEntityPart for OrbPart {
+ /// production, and the state written back. Answers whether anything changed.
+ fn burn(
+     host: &mut dyn ServerHost,
+-    event: &mut BlockEntityTickEvent<'_>,
++    entity: &mut crate::starling_tick::OldEntity, tick_pos: [i32; 3],
+     tier: FurnatorTier,
+ ) -> bool {
+-    let resized = event.entity.items.len() != SLOT_COUNT;
++    let resized = (*entity).items.len() != SLOT_COUNT;
+     if resized {
+-        event.entity.items.resize(SLOT_COUNT, None);
++        (*entity).items.resize(SLOT_COUNT, None);
+     }
+-    let mut saved = Tag::Compound(std::mem::take(&mut event.entity.nbt));
++    let mut saved = Tag::Compound(std::mem::take(&mut (*entity).nbt));
+     let before = read(&saved, tier);
+     let mut state = before;
+     let mut took = false;
+     if state.wants_fuel() {
+         let mut fuel = FuelSlot {
+             host: &*host,
+-            entity: &mut event.entity,
++            entity: &mut (*entity),
+         };
+         let burn_time = fuel.peek();
+         if state.load_fuel(burn_time) {
+@@ -903,19 +911,19 @@ fn burn(
+     let produced = state.tick(tier) > 0;
+     write(&mut saved, &state);
+     if let Tag::Compound(nbt) = saved {
+-        event.entity.nbt = nbt;
++        (*entity).nbt = nbt;
+     }
+     resized || took || produced
+ }
+ 
+ /// The fuel slot, as `AbstractGeneratorBlock.initBurn` reads it: the item's
+ /// smelting burn time and the shrink (or the crafting remainder) that takes it.
+-struct FuelSlot<'a, 'g> {
++struct FuelSlot<'a> {
+     host: &'a dyn ServerHost,
+-    entity: &'a mut mod_api::ModBlockEntityView<'g>,
++    entity: &'a mut crate::starling_tick::OldEntity,
+ }
+ 
+-impl FuelSlot<'_, '_> {
++impl FuelSlot<'_> {
+     /// The burn time the item in the fuel slot gives, 0 when there is none.
+     fn peek(&self) -> u32 {
+         let Some(Some(stack)) = self.entity.items.first() else {
+diff --git a/powah/src/starling_command.rs b/src/starling_command.rs
+new file mode 100644
+index 0000000..9198ea5
+--- /dev/null
++++ b/src/starling_command.rs
+@@ -0,0 +1,25 @@
++//! Starling's port to Sunrise's API: Horizon's `run_mod_command` hook, which got every command of
++//! the mod in one event, is a per-usage executor in Sunrise. The old event is rebuilt here around
++//! the executor's arguments, so the mod's command code runs as it was written.
++use mod_api::{CommandInvocation, CommandSource, Flow, ServerHost};
++
++/// Horizon's `RunModCommandEvent`: the parsed command and who ran it.
++pub(crate) struct RunModCommandEvent<'a> {
++    pub command: &'a CommandInvocation,
++    pub source: &'a CommandSource,
++}
++
++/// The executor of every usage the mod declares: the old hook's body (`run`), whose `Cancel` was a
++/// command it ran and `Continue` one it did not.
++pub(crate) fn execute(
++    host: &mut dyn ServerHost,
++    source: &CommandSource,
++    command: &CommandInvocation,
++    run: fn(&mut dyn ServerHost, &mut RunModCommandEvent<'_>) -> Flow,
++) -> Option<i32> {
++    let mut event = RunModCommandEvent { command, source };
++    match run(host, &mut event) {
++        Flow::Continue => None,
++        _ => Some(1),
++    }
++}
+diff --git a/powah/src/starling_tick.rs b/src/starling_tick.rs
+new file mode 100644
+index 0000000..4de1a43
+--- /dev/null
++++ b/src/starling_tick.rs
+@@ -0,0 +1,63 @@
++//! Starling's port to Sunrise's API: a block entity tick written for Horizon's, which handed the
++//! tick the block entity's slots, compound and data slots to change in place, runs here on a copy
++//! of them taken from the tick's view; what it changed is written back and the chunk marked
++//! unsaved, as Horizon's reply did.
++use mod_api::{BlockEntityTickEvent, Compound, ItemStack, ServerHost};
++
++/// The block entity as Horizon's tick had it.
++pub(crate) struct OldEntity {
++    pub items: Vec<Option<ItemStack>>,
++    pub nbt: Compound,
++    pub data: Vec<i32>,
++}
++
++/// Run `body` on a copy of the ticking block entity (its host, the copy, its position).
++pub(crate) fn run(
++    event: &mut BlockEntityTickEvent<'_>,
++    body: impl FnOnce(&mut dyn ServerHost, &mut OldEntity, [i32; 3]),
++) {
++    let Some((handle, pos, before)) = event.subject.with_view(|view| {
++        let items = (0..view.item_slots() as u32)
++            .map(|slot| view.item_slot(slot).and_then(|stack| stack.to_owned()))
++            .collect();
++        let entity = OldEntity {
++            items,
++            nbt: view.nbt().clone(),
++            data: view.data_slots().to_vec(),
++        };
++        (view.handle(), view.position(), entity)
++    }) else {
++        return;
++    };
++    let mut after = OldEntity {
++        items: before.items.clone(),
++        nbt: before.nbt.clone(),
++        data: before.data.clone(),
++    };
++    body(event.subject.host(), &mut after, pos);
++    let mut changed = false;
++    event.subject.with_view(|mut view| {
++        for (key, value) in after.nbt.iter() {
++            if before.nbt.get(key) != Some(value) && view.set_nbt(key.clone(), Some(value.clone())) {
++                changed = true;
++            }
++        }
++        for (key, _) in before.nbt.iter() {
++            if after.nbt.get(key).is_none() && view.set_nbt(key.clone(), None) {
++                changed = true;
++            }
++        }
++        for (slot, stack) in after.items.iter().enumerate() {
++            if before.items.get(slot) != Some(stack) {
++                let _ = view.set_item_slot(slot as u32, stack.clone());
++                changed = true;
++            }
++        }
++        if after.data != before.data && view.set_data_slots(&after.data) {
++            changed = true;
++        }
++    });
++    if changed {
++        let _ = handle.set_changed(event.subject.host());
++    }
++}

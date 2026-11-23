@@ -1,0 +1,505 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 4aa591f..a270d64 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -35,13 +35,14 @@
+ //! | `component_types` (65) | [`Mod::component_types`] |
+ //! | `register_commands` (8) | [`Mod::register_commands`] |
+ //! | `perform_command` (8) | [`Mod::run_mod_command`] (typed arguments, not a split line) |
++mod starling_tick;
+ pub mod runtime;
+ pub mod support;
+ 
+ use mod_api::{
+     self, BreakBlockEvent, ComponentTypesEvent, ExplosionDetonateEvent, Flow, Hooks, HostSide,
+     LeftClickBlockEvent, LevelTickPostEvent, LootDropsEvent, RegisterCommandsEvent, Registrar,
+-    RegistrationContext, RightClickBlockEvent, RunModCommandEvent, ServerHost, ServerTickEvent,
++    RegistrationContext, RightClickBlockEvent, ServerHost, ServerTickEvent,
+ };
+ 
+ /// The mod keeps its state (the break stash, the comparator readings, the click window) in
+@@ -62,7 +63,11 @@ impl Hooks for Mod {
+     /// The item component that carries a broken drawer's contents, registered before content (and
+     /// so the item's stack codec) loads.
+     fn component_types(&self, _context: &RegistrationContext, event: &mut ComponentTypesEvent<'_>) {
+-        support::declare_component(event.types);
++        let mut types = Vec::new();
++        support::declare_component(&mut types);
++        for id in types {
++            event.register(id.into());
++        }
+     }
+ 
+     /// `/functionalstorage info <x> <y> <z>`.
+@@ -70,15 +75,6 @@ impl Hooks for Mod {
+         support::declare_commands(event.commands);
+     }
+ 
+-    /// Run the command above and take it.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        support::run_command(host, event)
+-    }
+-
+     /// A right click on the drawer's front: insert the held stack, sweep the inventory on a second
+     /// click within 300 ms, toggle the lock with a sneak and an empty hand, or let the menu open.
+     fn right_click_block(&self, host: HostSide<'_>, event: &mut RightClickBlockEvent<'_>) -> Flow {
+diff --git a/functionalstorage/src/starling_tick.rs b/src/starling_tick.rs
+new file mode 100644
+index 0000000..4de1a43
+--- /dev/null
++++ b/src/starling_tick.rs
+@@ -0,0 +1,63 @@
++//! Starling's port to Sunrise's API: a block entity tick written for Horizon's, which handed the
++//! tick the block entity's slots, compound and data slots to change in place, runs here on a copy
++//! of them taken from the tick's view; what it changed is written back and the chunk marked
++//! unsaved, as Horizon's reply did.
++use mod_api::{BlockEntityTickEvent, Compound, ItemStack, ServerHost};
++
++/// The block entity as Horizon's tick had it.
++pub(crate) struct OldEntity {
++    pub items: Vec<Option<ItemStack>>,
++    pub nbt: Compound,
++    pub data: Vec<i32>,
++}
++
++/// Run `body` on a copy of the ticking block entity (its host, the copy, its position).
++pub(crate) fn run(
++    event: &mut BlockEntityTickEvent<'_>,
++    body: impl FnOnce(&mut dyn ServerHost, &mut OldEntity, [i32; 3]),
++) {
++    let Some((handle, pos, before)) = event.subject.with_view(|view| {
++        let items = (0..view.item_slots() as u32)
++            .map(|slot| view.item_slot(slot).and_then(|stack| stack.to_owned()))
++            .collect();
++        let entity = OldEntity {
++            items,
++            nbt: view.nbt().clone(),
++            data: view.data_slots().to_vec(),
++        };
++        (view.handle(), view.position(), entity)
++    }) else {
++        return;
++    };
++    let mut after = OldEntity {
++        items: before.items.clone(),
++        nbt: before.nbt.clone(),
++        data: before.data.clone(),
++    };
++    body(event.subject.host(), &mut after, pos);
++    let mut changed = false;
++    event.subject.with_view(|mut view| {
++        for (key, value) in after.nbt.iter() {
++            if before.nbt.get(key) != Some(value) && view.set_nbt(key.clone(), Some(value.clone())) {
++                changed = true;
++            }
++        }
++        for (key, _) in before.nbt.iter() {
++            if after.nbt.get(key).is_none() && view.set_nbt(key.clone(), None) {
++                changed = true;
++            }
++        }
++        for (slot, stack) in after.items.iter().enumerate() {
++            if before.items.get(slot) != Some(stack) {
++                let _ = view.set_item_slot(slot as u32, stack.clone());
++                changed = true;
++            }
++        }
++        if after.data != before.data && view.set_data_slots(&after.data) {
++            changed = true;
++        }
++    });
++    if changed {
++        let _ = handle.set_changed(event.subject.host());
++    }
++}
+diff --git a/src/support.rs b/src/support.rs
+index 2b64a1c..3bd0f53 100644
+--- a/src/support.rs
++++ b/src/support.rs
+@@ -25,12 +25,11 @@ use std::time::{Duration, Instant};
+ 
+ use mod_api::{
+     AnalogOutputEvent, BlockEntityPart, BlockEntityRef, BlockEntitySubmitEvent,
+-    BlockEntityTickEvent, BlockEntityTickReply, BlockEntityTicksEvent, BlockEntityUpdateTagEvent,
++    BlockEntityTickEvent, BlockEntityTicksEvent, BlockEntityUpdateTagEvent,
+     BlockPart, BlockState, ClientHost, Command, CommandArgumentValue, Component, Compound, Flow,
+     Hand, HasAnalogOutputEvent, Host, HostBlockStates, HostSide, HostTransaction,
+     InteractionResult, ItemDisplayContext, ItemPart, ItemStack, LevelHost, LevelRef, ModContainer,
+-    NeighbourUpdate, OnBlockPlacedByEvent, Registrar, RunModCommandEvent, Screen, ScreenDrawEvent,
+-    ScreenEvent, ServerHost, ServerTickEvent, ServerTickPhase, StateForPlacementEvent, Tag, Text,
++    NeighbourUpdate, OnBlockPlacedByEvent, Registrar, ServerHost, ServerTickEvent, ServerTickPhase, StateForPlacementEvent, Tag, Text,
+ };
+ 
+ use crate::runtime::{Drawer, Sync, capacity};
+@@ -123,6 +122,10 @@ fn is_drawer(block: &str) -> bool {
+ /// menu each, the block-entity Part (which answers the block moments too), and the item Parts that
+ /// restore a placed drawer's contents.
+ pub fn declare(r: &mut dyn Registrar) {
++    // The drawer's screen, on the menu type its content declares.
++    if let Err(error) = r.register_menu_screen(DRAWER_MENU, std::sync::Arc::new(drawer_screen)) {
++        r.refuse(&error);
++    }
+     let kind = r
+         .block_entity_type(DRAWER_TYPE)
+         .blocks(DRAWER_PATHS)
+@@ -145,6 +148,7 @@ pub fn declare(r: &mut dyn Registrar) {
+ /// hoppers may both fill and empty the view.
+ pub fn container() -> ModContainer {
+     ModContainer {
++        insert_rules: Vec::new(),
+         slots: 1,
+         faces: std::array::from_fn(|_| vec![0]),
+         inputs: vec![0],
+@@ -166,8 +170,8 @@ pub fn declare_component(types: &mut Vec<String>) {
+ /// It is an **operator's** command: any position the server has loaded can be named, and the answer
+ /// names a drawer's stored item and amount, so a normal player has no business reading another
+ /// machine's contents through chat.
+-pub fn declare_commands(commands: &mut Vec<Command>) {
+-    commands.push(Command::op("functionalstorage info <pos:block_pos>", 2));
++pub fn declare_commands(commands: &mut Vec<mod_api::CommandRegistration>) {
++    commands.push(Command::op("functionalstorage info <pos:block_pos>", 2).executes(run_command));
+ }
+ 
+ /// The item component a broken drawer's contents ride: the drawer's own saved compound
+@@ -202,11 +206,10 @@ pub struct DrawerPart;
+ impl BlockPart for DrawerPart {
+     /// Upstream's `getNearestLookingDirection().getOpposite()`: the drawer's front faces the player
+     /// who placed it.
+-    fn state_for_placement(
+-        &self,
+-        level: &dyn LevelHost,
++    fn state_for_placement(&self, level: mod_api::LevelSide<'_>,
+         event: &mut StateForPlacementEvent<'_>,
+     ) -> Option<Option<BlockState>> {
++        let (mod_api::LevelSide::Server(level) | mod_api::LevelSide::Client(level)) = level;
+         let block = level.state_block(event.state)?;
+         if !is_drawer(block) {
+             return None;
+@@ -227,7 +230,8 @@ impl BlockPart for DrawerPart {
+     }
+ 
+     /// `BlockBehaviour.getAnalogOutputSignal`: the fullness the drawer's last tick read.
+-    fn analog_output(&self, level: &dyn LevelHost, event: &mut AnalogOutputEvent) {
++    fn analog_output(&self, level: &mut dyn mod_api::LevelRandomHost, event: &mut AnalogOutputEvent) {
++        let level: &dyn mod_api::LevelHost = &*level;
+         if !is_ours(level, event.state) {
+             return;
+         }
+@@ -254,8 +258,8 @@ impl BlockEntityPart for DrawerPart {
+     /// One server tick: reconcile the view slot with the true amount, write it back and note the
+     /// comparator answer. The payload is left `Changed` only when something moved, so an idle
+     /// drawer does not dirty its chunk every tick.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        tick(host, event);
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        crate::starling_tick::run(event, |host, entity, pos| tick(host, entity, pos));
+     }
+ 
+     /// What clients get of a drawer: the item id and one item, for the front renderer.
+@@ -275,17 +279,6 @@ impl BlockEntityPart for DrawerPart {
+         Some(out)
+     }
+ 
+-    /// The drawer's one-slot menu layout.
+-    fn screen(&self, _host: &dyn Host, _event: &mut ScreenEvent<'_>) -> Option<Screen> {
+-        Some(screen())
+-    }
+-
+-    /// Draws the true count over the drawer menu (the menu's data slots are
+-    /// `[amount, limit, locked]`) and the lock state under it.
+-    fn screen_draw(&self, _host: &dyn ClientHost, event: &mut ScreenDrawEvent<'_>) {
+-        draw_screen(event);
+-    }
+-
+     /// Draws the stored item at the drawer's front. The pack has no in-world text helper, so the
+     /// count is only in the menu and the action bar.
+     fn block_entity_submit(&self, host: &dyn ClientHost, event: &mut BlockEntitySubmitEvent<'_>) {
+@@ -319,7 +312,7 @@ fn tag<'a>(nbt: &'a Compound, key: &str) -> Option<&'a Tag> {
+ fn stack_key(host: &dyn Host, stack: &ItemStack) -> String {
+     format!(
+         "{}|{}|{:?}",
+-        stack.item().id(host),
++        stack.item().id(host).unwrap_or_default(),
+         stack.damage(),
+         stack.components()
+     )
+@@ -473,7 +466,7 @@ fn menu_data(drawer: &Drawer, max_stack: u32) -> Vec<i32> {
+ fn read_state(host: &dyn ServerHost, pos: [i32; 3]) -> Option<(Drawer, Option<ItemStack>)> {
+     let level = host.level(host.dimension())?;
+     let block = level.block(host, pos)?;
+-    if !is_drawer(&block.id(host)) {
++    if !is_drawer(block.id(host).unwrap_or_default()) {
+         return None;
+     }
+     let entity = host.block_entity(level, pos)?;
+@@ -561,22 +554,21 @@ fn eject(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3], stack: ItemS
+ // ---------------------------------------------------------------------------
+ 
+ /// One server tick of a drawer.
+-fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-    let pos = event.pos;
+-    if event.entity.items.is_empty() {
+-        event.entity.items.resize(1, None);
++fn tick(host: &mut dyn ServerHost, entity: &mut crate::starling_tick::OldEntity, tick_pos: [i32; 3]) {
++    let pos = tick_pos;
++    if (*entity).items.is_empty() {
++        (*entity).items.resize(1, None);
+     }
+     let Some(level) = level_in_place(&*host) else {
+         return;
+     };
+-    let (mut drawer, stored) = read_drawer(&*host, &event.entity.nbt);
++    let (mut drawer, stored) = read_drawer(&*host, &(*entity).nbt);
+     let max_stack = stored
+         .as_ref()
+         .map_or(64, |stack| max_stack_of(&*host, stack));
+     // 1. Reconcile what an outside actor did to the view slot (a hopper, the menu). 2. Write the
+     //    drawer back with the view the true amount now implies.
+-    let observed = event
+-        .entity
++    let observed = (*entity)
+         .items
+         .first()
+         .and_then(Option::as_ref)
+@@ -587,7 +579,7 @@ fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+         max_stack,
+     );
+     if sync.rejected.is_some()
+-        && let Some(stack) = event.entity.items[0].take()
++        && let Some(stack) = (*entity).items[0].take()
+     {
+         eject(host, level, pos, stack);
+     }
+@@ -595,33 +587,33 @@ fn tick(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+         None => None,
+         Some(key) => match &stored {
+             Some(stack) if stack_key(&*host, stack) == key => Some(stack.clone()),
+-            _ => event.entity.items.first().and_then(Option::clone),
++            _ => (*entity).items.first().and_then(Option::clone),
+         },
+     };
+     if drawer.item(0).is_none() {
+         new_stored = None;
+     }
+-    let before_nbt = event.entity.nbt.clone();
+-    let before_items = event.entity.items.clone();
+-    let before_data = event.entity.data.clone();
++    let before_nbt = (*entity).nbt.clone();
++    let before_items = (*entity).items.clone();
++    let before_data = (*entity).data.clone();
+     write_drawer(
+         &*host,
+-        &mut event.entity.nbt,
++        &mut (*entity).nbt,
+         &drawer,
+         new_stored.as_ref(),
+         max_stack,
+     );
+     let view = view_stack(&drawer, new_stored.as_ref(), max_stack);
+-    event.entity.items[0] = view;
++    (*entity).items[0] = view;
+     let data = menu_data(&drawer, max_stack);
+-    if event.entity.data != data {
+-        event.entity.data = data;
++    if (*entity).data != data {
++        (*entity).data = data;
+     }
+-    if event.entity.nbt == before_nbt
+-        && event.entity.items == before_items
+-        && event.entity.data == before_data
++    if (*entity).nbt == before_nbt
++        && (*entity).items == before_items
++        && (*entity).data == before_data
+     {
+-        *event.reply = BlockEntityTickReply::Unchanged;
++        // (unchanged: nothing is written back)
+     }
+     note_signal(host, pos, drawer.signal(max_stack));
+ }
+@@ -734,7 +726,7 @@ pub fn right_click(host: HostSide<'_>, event: &mut mod_api::RightClickBlockEvent
+     let Some(block) = level.block(&*server, pos) else {
+         return Flow::Continue;
+     };
+-    if !is_drawer(&block.id(&*server)) {
++    if !is_drawer(block.id(&*server).unwrap_or_default()) {
+         return Flow::Continue;
+     }
+     let facing = {
+@@ -851,7 +843,7 @@ pub fn left_click(host: &mut dyn ServerHost, event: &mut mod_api::LeftClickBlock
+     let Some(block) = level.block(&*host, pos) else {
+         return Flow::Continue;
+     };
+-    if !is_drawer(&block.id(&*host)) {
++    if !is_drawer(block.id(&*host).unwrap_or_default()) {
+         return Flow::Continue;
+     }
+     let facing = {
+@@ -970,7 +962,7 @@ fn sweep_inventory(host: &mut dyn ServerHost, pos: [i32; 3]) {
+     let Some(player) = host.players().acting_player() else {
+         return;
+     };
+-    let slots = player.inventory_slots(&*host).unwrap_or_default();
++    let slots = player.with_inventory(host, |view| view.iter().filter_map(|(slot, stack)| stack.project().map(|stack| (slot, stack))).collect::<Vec<_>>()).unwrap_or_default();
+     for (slot, stack) in slots {
+         // The main inventory (0..=35) and the off hand (40): the armour and body slots are not
+         // swept, as the retired `native_take_items` path did not reach them.
+@@ -1000,7 +992,7 @@ fn sweep_inventory(host: &mut dyn ServerHost, pos: [i32; 3]) {
+ /// The view slot is left alone: the container's removal spills it, and the two halves add back to
+ /// the true amount (the 0.1.0 run verified this accounting in game).
+ pub fn break_block(host: &mut dyn ServerHost, event: &mut mod_api::BreakBlockEvent<'_>) -> Flow {
+-    if !event.cancelled && is_drawer(&event.state.block().id(&*host)) {
++    if !event.cancelled && is_drawer(event.state.block().id(&*host).unwrap_or_default()) {
+         let dimension = host.dimension().to_owned();
+         stash_bulk(host, &dimension, event.pos);
+     }
+@@ -1021,7 +1013,7 @@ pub fn explosion_detonate(
+         let Some(block) = level.block(&*host, pos) else {
+             continue;
+         };
+-        if is_drawer(&block.id(&*host)) {
++        if is_drawer(block.id(&*host).unwrap_or_default()) {
+             stash_bulk(host, &dimension, pos);
+         }
+     }
+@@ -1080,14 +1072,14 @@ pub fn loot_drops(host: &mut dyn ServerHost, event: &mut mod_api::LootDropsEvent
+     let Some((pos, state)) = event.context.block else {
+         return;
+     };
+-    let block = state.block().id(&*host);
++    let block = state.block().id(&*host).unwrap_or_default();
+     if !is_drawer(&block) {
+         return;
+     }
+     let Some(index) = event
+         .drops
+         .iter()
+-        .position(|stack| stack.item().id(&*host) == block)
++        .position(|stack| stack.item().id(&*host).unwrap_or_default() == block)
+     else {
+         return;
+     };
+@@ -1112,7 +1104,7 @@ pub fn loot_drops(host: &mut dyn ServerHost, event: &mut mod_api::LootDropsEvent
+ 
+ /// A drawer is placed from a stack: restore the contents its component carries.
+ fn block_placed(host: &mut dyn ServerHost, event: &mut OnBlockPlacedByEvent<'_>) {
+-    let block = event.state.block().id(&*host);
++    let block = event.state.block().id(&*host).unwrap_or_default();
+     if !is_drawer(&block) {
+         return;
+     }
+@@ -1134,18 +1126,22 @@ fn block_placed(host: &mut dyn ServerHost, event: &mut OnBlockPlacedByEvent<'_>)
+ }
+ 
+ /// Run `/functionalstorage info <pos>`.
+-pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>) -> Flow {
+-    if event.command.literals.first().map(String::as_str) != Some("functionalstorage") {
+-        return Flow::Continue;
++pub fn run_command(
++    host: &mut dyn ServerHost,
++    source: &mod_api::CommandSource,
++    command: &mod_api::CommandInvocation,
++) -> Option<i32> {
++    if command.literals.first().map(String::as_str) != Some("functionalstorage") {
++        return None;
+     }
+-    if event.command.literals.get(1).map(String::as_str) != Some("info") {
+-        return Flow::Continue;
++    if command.literals.get(1).map(String::as_str) != Some("info") {
++        return None;
+     }
+-    let Some(CommandArgumentValue::BlockPos(pos)) = event.command.argument("pos") else {
++    let Some(CommandArgumentValue::BlockPos(pos)) = command.argument("pos") else {
+         let _ = host
+             .commands()
+             .feedback(Text::literal("usage: /functionalstorage info <x> <y> <z>"));
+-        return Flow::Cancel;
++        return Some(1);
+     };
+     let pos = *pos;
+     let line = match read_state(&*host, pos) {
+@@ -1155,7 +1151,7 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
+                 .map_or(64, |stack| max_stack_of(&*host, stack));
+             let item = stored
+                 .as_ref()
+-                .map_or_else(|| "empty".to_owned(), |stack| stack.item().id(&*host));
++                .map_or_else(|| "empty".to_owned(), |stack| stack.item().id(&*host).unwrap_or_default().to_owned());
+             format!(
+                 "{}: {}/{} {}{}",
+                 block_id(host, pos),
+@@ -1171,14 +1167,14 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
+         None => "Not a drawer.".to_owned(),
+     };
+     let _ = host.commands().feedback(Text::literal(line));
+-    Flow::Cancel
++    Some(1)
+ }
+ 
+ /// The block id at `pos`, or "" where no level is in place.
+ fn block_id(host: &dyn ServerHost, pos: [i32; 3]) -> String {
+     host.level(host.dimension())
+         .and_then(|level| level.block(host, pos))
+-        .map(|block| block.id(host))
++        .and_then(|block| block.id(host).map(str::to_owned))
+         .unwrap_or_default()
+ }
+ 
+@@ -1219,36 +1215,46 @@ fn submit(host: &dyn ClientHost, event: &mut BlockEntitySubmitEvent<'_>) {
+ }
+ 
+ /// The drawer's one-slot screen layout.
+-fn screen() -> Screen {
+-    Screen {
++fn screen() -> mod_api::MenuScreenLayout {
++    mod_api::MenuScreenLayout {
+         width: 176.0,
+         height: 166.0,
+-        slots: vec![Some([80.0, 20.0])],
++        slots: vec![Some(mod_api::ScreenSlot {
++            position: [80.0, 20.0],
++            no_item_icon: None,
++        })],
+         inventory_y: 84.0,
+         inventory_x: 8.0,
+         own_labels: false,
+         // Horizon draws the plain panel and the slot frames (the drawer has no GUI texture).
+         own_background: false,
+-        ..Screen::default()
++        ..mod_api::MenuScreenLayout::default()
+     }
+ }
+ 
++/// The drawer menu's screen: one slot, the true count and the lock state (the menu's data slots
++/// are `[amount, limit, locked]`).
++pub(crate) fn drawer_screen(
++    _host: &dyn ClientHost,
++    _open: mod_api::MenuScreenOpen<'_>,
++) -> Option<mod_api::MenuScreen> {
++    Some(mod_api::MenuScreen::new(screen()).with_draw(|_host, frame, draw| draw_screen(&frame, draw)))
++}
++
+ /// Draws the true count and the lock state over the drawer menu.
+-fn draw_screen(event: &mut ScreenDrawEvent<'_>) {
++fn draw_screen(event: &mod_api::MenuScreenFrame<'_>, draw: &mut dyn mod_api::DrawContext) {
+     let amount = event.data.first().copied().unwrap_or(0);
+     let limit = event.data.get(1).copied().unwrap_or(0);
+     let locked = event.data.get(2).copied().unwrap_or(0) != 0;
+     let [x, y] = event.origin;
+-    event.draw.text(
++    draw.text(
+         &format!("{amount} / {limit}"),
+         [x + 8.0, y + 40.0],
+         0xFF40_4040,
+         false,
+     );
+     if locked {
+-        event
+-            .draw
+-            .text("Locked", [x + 8.0, y + 52.0], 0xFF8B_0000, false);
++        draw.text("Locked", [x + 8.0, y + 52.0], 0xFF8B_0000, false);
+     }
+ }
+ 

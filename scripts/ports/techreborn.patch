@@ -1,0 +1,452 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 0812c59..5484746 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -15,6 +15,8 @@
+ //! writes its own buffer through the entity it is handed and reaches its neighbours through the
+ //! `horizon:energy` capability.
+ 
++mod starling_tick;
++mod starling_command;
+ pub mod runtime;
+ 
+ use mod_api::*;
+@@ -93,45 +95,11 @@ impl Hooks for Mod {
+     ) {
+         event
+             .commands
+-            .push(Command::new("techreborn info <pos:block_pos>"));
++            .push(Command::new("techreborn info <pos:block_pos>").executes(crate::starling_executor));
+         event.commands.push(Command::op(
+             "techreborn energy <pos:block_pos> <amount:integer>",
+             2,
+-        ));
+-    }
+-
+-    /// The executor of both `/techreborn` usages.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut mod_api::RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        if event.command.literals.first().map(String::as_str) != Some("techreborn") {
+-            return Flow::Continue;
+-        }
+-        let Some(pos) = position_argument(event.command.argument("pos")) else {
+-            feedback(host, "usage: /techreborn info <x> <y> <z>");
+-            return Flow::Cancel;
+-        };
+-        match event.command.literals.get(1).map(String::as_str) {
+-            Some("info") => {
+-                let line = readout(host, pos);
+-                feedback(host, &line);
+-            }
+-            Some("energy") => {
+-                let Some(amount) = integer_argument(event.command.argument("amount")) else {
+-                    feedback(host, "usage: /techreborn energy <x> <y> <z> <amount>");
+-                    return Flow::Cancel;
+-                };
+-                let line = set_energy(host, pos, amount);
+-                feedback(host, &line);
+-            }
+-            _ => feedback(
+-                host,
+-                "usage: /techreborn info <x> <y> <z> | /techreborn energy <x> <y> <z> <amount>",
+-            ),
+-        }
+-        Flow::Cancel
++        ).executes(crate::starling_executor));
+     }
+ }
+ 
+@@ -145,11 +113,10 @@ struct GeneratorPart;
+ #[mod_api::sunrise_part]
+ impl BlockPart for GeneratorPart {
+     /// `BlockMachineBase.setPlacedBy`: the machine faces its placer.
+-    fn state_for_placement(
+-        &self,
+-        level: &dyn LevelHost,
++    fn state_for_placement(&self, level: mod_api::LevelSide<'_>,
+         event: &mut mod_api::StateForPlacementEvent<'_>,
+     ) -> Option<Option<BlockState>> {
++        let (mod_api::LevelSide::Server(level) | mod_api::LevelSide::Client(level)) = level;
+         facing_state(level, event)
+     }
+ }
+@@ -168,12 +135,8 @@ impl mod_api::BlockEntityPart for GeneratorPart {
+         event.ticks = true;
+     }
+ 
+-    fn block_entity_tick(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut mod_api::BlockEntityTickEvent<'_>,
+-    ) {
+-        generator_tick(host, event);
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        crate::starling_tick::run(event, |host, entity, pos| generator_tick(host, entity, pos));
+     }
+ }
+ 
+@@ -197,12 +160,8 @@ impl mod_api::BlockEntityPart for CablePart {
+         event.ticks = true;
+     }
+ 
+-    fn block_entity_tick(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut mod_api::BlockEntityTickEvent<'_>,
+-    ) {
+-        cable_tick(host, event);
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        crate::starling_tick::run(event, |host, entity, pos| cable_tick(host, entity, pos));
+     }
+ }
+ 
+@@ -211,11 +170,10 @@ struct FurnacePart;
+ 
+ #[mod_api::sunrise_part]
+ impl BlockPart for FurnacePart {
+-    fn state_for_placement(
+-        &self,
+-        level: &dyn LevelHost,
++    fn state_for_placement(&self, level: mod_api::LevelSide<'_>,
+         event: &mut mod_api::StateForPlacementEvent<'_>,
+     ) -> Option<Option<BlockState>> {
++        let (mod_api::LevelSide::Server(level) | mod_api::LevelSide::Client(level)) = level;
+         facing_state(level, event)
+     }
+ }
+@@ -234,12 +192,8 @@ impl mod_api::BlockEntityPart for FurnacePart {
+         event.ticks = true;
+     }
+ 
+-    fn block_entity_tick(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut mod_api::BlockEntityTickEvent<'_>,
+-    ) {
+-        furnace_tick_of(host, event);
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        crate::starling_tick::run(event, |host, entity, pos| furnace_tick_of(host, entity, pos));
+     }
+ }
+ 
+@@ -284,6 +238,7 @@ fn furnace_buffer() -> ModEnergyBuffer {
+ /// no screen in this slice, so it opens no menu.
+ fn generator_container() -> ModContainer {
+     ModContainer {
++        insert_rules: Vec::new(),
+         slots: GENERATOR_SLOTS,
+         faces: std::array::from_fn(|_| vec![0, 1]),
+         inputs: vec![0],
+@@ -296,6 +251,7 @@ fn generator_container() -> ModContainer {
+ /// vanilla furnace menu.
+ fn furnace_container() -> ModContainer {
+     ModContainer {
++        insert_rules: Vec::new(),
+         slots: MENU_SLOTS,
+         faces: std::array::from_fn(|_| vec![INPUT_SLOT, OUTPUT_SLOT, 2]),
+         inputs: vec![INPUT_SLOT],
+@@ -323,25 +279,25 @@ fn facing_state(
+ 
+ /// `SolidFuelGeneratorBlockEntity.tick`: burn a step of fuel into the buffer, then load the
+ /// next item when the steps run out.
+-fn generator_tick(host: &mut dyn ServerHost, event: &mut mod_api::BlockEntityTickEvent<'_>) {
++fn generator_tick(host: &mut dyn ServerHost, entity: &mut crate::starling_tick::OldEntity, tick_pos: [i32; 3]) {
+     let mut generator = Generator::new();
+-    generator.energy = be_int(&event.entity.nbt, KEY_ENERGY).clamp(0, GENERATOR_CAPACITY);
+-    generator.burn_time = be_int(&event.entity.nbt, KEY_BURN_TIME);
+-    generator.total_burn = be_int(&event.entity.nbt, KEY_TOTAL_BURN);
+-    if event.entity.items.len() < GENERATOR_SLOTS {
+-        event.entity.items.resize(GENERATOR_SLOTS, None);
++    generator.energy = be_int(&(*entity).nbt, KEY_ENERGY).clamp(0, GENERATOR_CAPACITY);
++    generator.burn_time = be_int(&(*entity).nbt, KEY_BURN_TIME);
++    generator.total_burn = be_int(&(*entity).nbt, KEY_TOTAL_BURN);
++    if (*entity).items.len() < GENERATOR_SLOTS {
++        (*entity).items.resize(GENERATOR_SLOTS, None);
+     }
+     {
+         let mut fuel = SlotFuel {
+             host: &mut *host,
+-            items: &mut event.entity.items,
++            items: &mut (*entity).items,
+         };
+         generator.tick(&mut fuel);
+     }
+-    set_be_int(&mut event.entity.nbt, KEY_ENERGY, generator.energy);
+-    set_be_int(&mut event.entity.nbt, KEY_BURN_TIME, generator.burn_time);
+-    set_be_int(&mut event.entity.nbt, KEY_TOTAL_BURN, generator.total_burn);
+-    set_active(host, event.pos, generator.active);
++    set_be_int(&mut (*entity).nbt, KEY_ENERGY, generator.energy);
++    set_be_int(&mut (*entity).nbt, KEY_BURN_TIME, generator.burn_time);
++    set_be_int(&mut (*entity).nbt, KEY_TOTAL_BURN, generator.total_burn);
++    set_active(host, tick_pos, generator.active);
+ }
+ 
+ /// The generator's fuel slot: the item's smelting burn time, and the shrink (or the crafting
+@@ -376,14 +332,14 @@ impl FuelSlot for SlotFuel<'_> {
+ /// `CableTickManager.handleCableTick` for one cable: pull from every neighbour that gives into
+ /// its 512 E buffer, then push into every neighbour that takes, at most 128 E per neighbour per
+ /// tick, sharing evenly as upstream's `min(remaining / remainingTargets, transferRate)` does.
+-fn cable_tick(host: &mut dyn ServerHost, event: &mut mod_api::BlockEntityTickEvent<'_>) {
+-    let energy = clamp_energy(be_int(&event.entity.nbt, KEY_ENERGY));
++fn cable_tick(host: &mut dyn ServerHost, entity: &mut crate::starling_tick::OldEntity, tick_pos: [i32; 3]) {
++    let energy = clamp_energy(be_int(&(*entity).nbt, KEY_ENERGY));
+     let Some(level) = in_place_level(host) else {
+         return;
+     };
+     let mut endpoints = Vec::with_capacity(6);
+     for face in Direction::ALL {
+-        let at = neighbour(event.pos, face);
++        let at = neighbour(tick_pos, face);
+         let Some((stored, capacity)) = energy_of(host, level, at, face.opposite()) else {
+             continue;
+         };
+@@ -417,7 +373,7 @@ fn cable_tick(host: &mut dyn ServerHost, event: &mut mod_api::BlockEntityTickEve
+             Move::Push { face, amount } => (face, amount, false),
+         };
+         let direction = Direction::ALL[face as usize];
+-        let at = neighbour(event.pos, direction);
++        let at = neighbour(tick_pos, direction);
+         let limit = cable_move_limit(*change, current).min(amount).max(0);
+         if limit == 0 {
+             continue;
+@@ -431,19 +387,19 @@ fn cable_tick(host: &mut dyn ServerHost, event: &mut mod_api::BlockEntityTickEve
+     }
+     let after = clamp_energy(current);
+     if after != energy {
+-        set_be_int(&mut event.entity.nbt, KEY_ENERGY, after);
++        set_be_int(&mut (*entity).nbt, KEY_ENERGY, after);
+     }
+ }
+ 
+ /// `ElectricFurnaceBlockEntity.tick`: smelt the vanilla smelting recipe of the input slot for
+ /// its own ticks, spending 1 E a tick, and put the result in the output slot when the cook
+ /// completes.
+-fn furnace_tick_of(host: &mut dyn ServerHost, event: &mut mod_api::BlockEntityTickEvent<'_>) {
+-    if event.entity.items.len() < MENU_SLOTS {
+-        event.entity.items.resize(MENU_SLOTS, None);
++fn furnace_tick_of(host: &mut dyn ServerHost, entity: &mut crate::starling_tick::OldEntity, tick_pos: [i32; 3]) {
++    if (*entity).items.len() < MENU_SLOTS {
++        (*entity).items.resize(MENU_SLOTS, None);
+     }
+-    let input = event.entity.items[INPUT_SLOT].clone();
+-    let output = event.entity.items[OUTPUT_SLOT].clone();
++    let input = (*entity).items[INPUT_SLOT].clone();
++    let output = (*entity).items[OUTPUT_SLOT].clone();
+     let recipe = input.as_ref().and_then(|stack| {
+         let level = in_place_level(host)?;
+         let kind = Identifier::parse("minecraft:smelting").ok()?;
+@@ -462,9 +418,9 @@ fn furnace_tick_of(host: &mut dyn ServerHost, event: &mut mod_api::BlockEntityTi
+         }
+     };
+     let mut furnace = Furnace {
+-        energy: be_int(&event.entity.nbt, KEY_ENERGY).clamp(0, FURNACE_CAPACITY),
+-        cook_time: be_int(&event.entity.nbt, KEY_COOK_TIME),
+-        cook_total: be_int(&event.entity.nbt, KEY_COOK_TOTAL),
++        energy: be_int(&(*entity).nbt, KEY_ENERGY).clamp(0, FURNACE_CAPACITY),
++        cook_time: be_int(&(*entity).nbt, KEY_COOK_TIME),
++        cook_total: be_int(&(*entity).nbt, KEY_COOK_TOTAL),
+         active: false,
+     };
+     let step = furnace_tick(
+@@ -474,26 +430,26 @@ fn furnace_tick_of(host: &mut dyn ServerHost, event: &mut mod_api::BlockEntityTi
+         output_fits,
+     );
+     if step.energy_used != 0 || step.craft || furnace.cook_time == 0 {
+-        set_be_int(&mut event.entity.nbt, KEY_ENERGY, furnace.energy);
+-        set_be_int(&mut event.entity.nbt, KEY_COOK_TIME, furnace.cook_time);
+-        set_be_int(&mut event.entity.nbt, KEY_COOK_TOTAL, furnace.cook_total);
++        set_be_int(&mut (*entity).nbt, KEY_ENERGY, furnace.energy);
++        set_be_int(&mut (*entity).nbt, KEY_COOK_TIME, furnace.cook_time);
++        set_be_int(&mut (*entity).nbt, KEY_COOK_TOTAL, furnace.cook_total);
+     }
+     if step.craft
+         && let Some((_, result, _)) = recipe
+     {
+-        apply_craft(&mut event.entity, &result);
++        apply_craft(&mut (*entity), &result);
+     }
+     let active = furnace.active;
+     let data = furnace_data(&furnace, &step);
+-    if event.entity.data.get(..MENU_DATA) != Some(&data[..]) {
+-        event.entity.data = data.to_vec();
++    if (*entity).data.get(..MENU_DATA) != Some(&data[..]) {
++        (*entity).data = data.to_vec();
+     }
+-    set_active(host, event.pos, active);
++    set_active(host, tick_pos, active);
+ }
+ 
+ /// Take one input item and put the recipe's result in the output slot
+ /// (`ElectricFurnaceBlockEntity.craftRecipe`).
+-fn apply_craft(entity: &mut mod_api::ModBlockEntityView<'_>, result: &ItemStack) {
++fn apply_craft(entity: &mut crate::starling_tick::OldEntity, result: &ItemStack) {
+     if let Some(slot) = entity.items.get_mut(INPUT_SLOT)
+         && let Some(stack) = slot.take()
+     {
+@@ -538,7 +494,7 @@ fn property_of(host: &dyn ServerHost, pos: [i32; 3], key: &str) -> Option<String
+ /// The block at `pos` in the level in place, as its id.
+ fn block_at(host: &dyn ServerHost, pos: [i32; 3]) -> Option<String> {
+     let level = in_place_level(host)?;
+-    Some(level.block(host, pos)?.id(host))
++    level.block(host, pos)?.id(host).map(str::to_owned)
+ }
+ 
+ /// The level the server ticks now: the only one whose block entities a capability reads.
+@@ -669,7 +625,7 @@ fn set_energy(host: &mut dyn ServerHost, pos: [i32; 3], amount: i32) -> String {
+ }
+ 
+ fn slot_text(host: &dyn ServerHost, stack: &ItemStack) -> String {
+-    format!("{}x{}", stack.item().id(host), stack.count())
++    format!("{}x{}", stack.item().id(host).unwrap_or_default(), stack.count())
+ }
+ 
+ fn position_argument(value: Option<&CommandArgumentValue>) -> Option<[i32; 3]> {
+@@ -733,3 +689,45 @@ mod registration {
+         );
+     }
+ }
++
++/// Starling's port: the old `run_mod_command` hook's body.
++pub(crate) fn starling_run_mod_command(
++    host: &mut dyn ServerHost,
++    event: &mut crate::starling_command::RunModCommandEvent<'_>,
++) -> Flow {
++        if event.command.literals.first().map(String::as_str) != Some("techreborn") {
++            return Flow::Continue;
++        }
++        let Some(pos) = position_argument(event.command.argument("pos")) else {
++            feedback(host, "usage: /techreborn info <x> <y> <z>");
++            return Flow::Cancel;
++        };
++        match event.command.literals.get(1).map(String::as_str) {
++            Some("info") => {
++                let line = readout(host, pos);
++                feedback(host, &line);
++            }
++            Some("energy") => {
++                let Some(amount) = integer_argument(event.command.argument("amount")) else {
++                    feedback(host, "usage: /techreborn energy <x> <y> <z> <amount>");
++                    return Flow::Cancel;
++                };
++                let line = set_energy(host, pos, amount);
++                feedback(host, &line);
++            }
++            _ => feedback(
++                host,
++                "usage: /techreborn info <x> <y> <z> | /techreborn energy <x> <y> <z> <amount>",
++            ),
++        }
++        Flow::Cancel
++    }
++
++/// Starling's port: every declared usage runs the old hook's body.
++pub(crate) fn starling_executor(
++    host: &mut dyn ServerHost,
++    source: &mod_api::CommandSource,
++    command: &mod_api::CommandInvocation,
++) -> Option<i32> {
++    crate::starling_command::execute(host, source, command, starling_run_mod_command)
++}
+diff --git a/techreborn/src/starling_command.rs b/src/starling_command.rs
+new file mode 100644
+index 0000000..9198ea5
+--- /dev/null
++++ b/src/starling_command.rs
+@@ -0,0 +1,25 @@
++//! Starling's port to Sunrise's API: Horizon's `run_mod_command` hook, which got every command of
++//! the mod in one event, is a per-usage executor in Sunrise. The old event is rebuilt here around
++//! the executor's arguments, so the mod's command code runs as it was written.
++use mod_api::{CommandInvocation, CommandSource, Flow, ServerHost};
++
++/// Horizon's `RunModCommandEvent`: the parsed command and who ran it.
++pub(crate) struct RunModCommandEvent<'a> {
++    pub command: &'a CommandInvocation,
++    pub source: &'a CommandSource,
++}
++
++/// The executor of every usage the mod declares: the old hook's body (`run`), whose `Cancel` was a
++/// command it ran and `Continue` one it did not.
++pub(crate) fn execute(
++    host: &mut dyn ServerHost,
++    source: &CommandSource,
++    command: &CommandInvocation,
++    run: fn(&mut dyn ServerHost, &mut RunModCommandEvent<'_>) -> Flow,
++) -> Option<i32> {
++    let mut event = RunModCommandEvent { command, source };
++    match run(host, &mut event) {
++        Flow::Continue => None,
++        _ => Some(1),
++    }
++}
+diff --git a/techreborn/src/starling_tick.rs b/src/starling_tick.rs
+new file mode 100644
+index 0000000..4de1a43
+--- /dev/null
++++ b/src/starling_tick.rs
+@@ -0,0 +1,63 @@
++//! Starling's port to Sunrise's API: a block entity tick written for Horizon's, which handed the
++//! tick the block entity's slots, compound and data slots to change in place, runs here on a copy
++//! of them taken from the tick's view; what it changed is written back and the chunk marked
++//! unsaved, as Horizon's reply did.
++use mod_api::{BlockEntityTickEvent, Compound, ItemStack, ServerHost};
++
++/// The block entity as Horizon's tick had it.
++pub(crate) struct OldEntity {
++    pub items: Vec<Option<ItemStack>>,
++    pub nbt: Compound,
++    pub data: Vec<i32>,
++}
++
++/// Run `body` on a copy of the ticking block entity (its host, the copy, its position).
++pub(crate) fn run(
++    event: &mut BlockEntityTickEvent<'_>,
++    body: impl FnOnce(&mut dyn ServerHost, &mut OldEntity, [i32; 3]),
++) {
++    let Some((handle, pos, before)) = event.subject.with_view(|view| {
++        let items = (0..view.item_slots() as u32)
++            .map(|slot| view.item_slot(slot).and_then(|stack| stack.to_owned()))
++            .collect();
++        let entity = OldEntity {
++            items,
++            nbt: view.nbt().clone(),
++            data: view.data_slots().to_vec(),
++        };
++        (view.handle(), view.position(), entity)
++    }) else {
++        return;
++    };
++    let mut after = OldEntity {
++        items: before.items.clone(),
++        nbt: before.nbt.clone(),
++        data: before.data.clone(),
++    };
++    body(event.subject.host(), &mut after, pos);
++    let mut changed = false;
++    event.subject.with_view(|mut view| {
++        for (key, value) in after.nbt.iter() {
++            if before.nbt.get(key) != Some(value) && view.set_nbt(key.clone(), Some(value.clone())) {
++                changed = true;
++            }
++        }
++        for (key, _) in before.nbt.iter() {
++            if after.nbt.get(key).is_none() && view.set_nbt(key.clone(), None) {
++                changed = true;
++            }
++        }
++        for (slot, stack) in after.items.iter().enumerate() {
++            if before.items.get(slot) != Some(stack) {
++                let _ = view.set_item_slot(slot as u32, stack.clone());
++                changed = true;
++            }
++        }
++        if after.data != before.data && view.set_data_slots(&after.data) {
++            changed = true;
++        }
++    });
++    if changed {
++        let _ = handle.set_changed(event.subject.host());
++    }
++}

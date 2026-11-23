@@ -1,0 +1,555 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 2d25f80..17b6b56 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -16,18 +16,21 @@
+ //! The numbers, and every rule that decides aura, live in [`runtime`], which has no
+ //! `mod_api` type and is unit-tested by `cargo test` alone.
+ 
++mod starling_tick;
++mod starling_command;
+ pub mod runtime;
+ 
+ use std::array;
+ use std::sync::OnceLock;
+ 
++use crate::starling_command::RunModCommandEvent;
+ use mod_api::{
+     self, AttachmentCodec, AttachmentError, AttachmentType, BlockClick, BlockEntityEvent,
+     BlockEntityPart, BlockEntityTickEvent, BlockEntityTicksEvent, BlockKey, BlockPart,
+     BlockUpdateFlags, Command, CommandArgumentValue, CommandSource, Compound, Flow, Hooks, Host,
+     HostTransaction, InteractionResult, ItemKey, ItemPlace, ItemResource, ItemStack, LevelRef,
+-    LevelSide, ModBlockEntityView, ModContainer, RegisterCommandsEvent, Registrar,
+-    RegistrationContext, RunModCommandEvent, ServerHost, Tag, Text, UseItemOnEvent,
++    LevelSide, ModContainer, RegisterCommandsEvent, Registrar,
++    RegistrationContext, ServerHost, Tag, Text, UseItemOnEvent,
+     UseWithoutItemEvent,
+ };
+ use runtime::{
+@@ -291,15 +294,17 @@ impl BlockEntityPart for BloomPart {
+         event.ticks = true;
+     }
+ 
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        if read_int(&event.entity.nbt, KEY_JUST_GENERATED) == 0 {
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        crate::starling_tick::run(event, |host, entity, tick_pos| {
++        if read_int(&(*entity).nbt, KEY_JUST_GENERATED) == 0 {
+             // Nothing of this Part's payload changed: do not dirty the chunk every tick.
+-            *event.reply = mod_api::BlockEntityTickReply::Unchanged;
++            // (unchanged: nothing is written back)
+             return;
+         }
+-        let pos = event.pos;
+-        write_int(&mut event.entity.nbt, KEY_JUST_GENERATED, 0);
++        let pos = tick_pos;
++        write_int(&mut (*entity).nbt, KEY_JUST_GENERATED, 0);
+         generate_aura(host, pos, BLOOM_GENERATED_AURA);
++    });
+     }
+ }
+ 
+@@ -329,13 +334,15 @@ impl BlockEntityPart for AltarEntityPart {
+         event.ticks = true;
+     }
+ 
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        crate::starling_tick::run(event, |host, entity, tick_pos| {
+         let Some(level) = level_in_place(host) else {
+-            *event.reply = mod_api::BlockEntityTickReply::Unchanged;
++            // (unchanged: nothing is written back)
+             return;
+         };
+-        let pos = event.pos;
+-        altar_tick(host, level, pos, &mut event.entity);
++        let pos = tick_pos;
++        altar_tick(host, level, pos, &mut (*entity));
++    });
+     }
+ }
+ 
+@@ -368,7 +375,7 @@ fn altar_tick(
+     host: &mut dyn ServerHost,
+     level: LevelRef,
+     pos: [i32; 3],
+-    entity: &mut ModBlockEntityView<'_>,
++    entity: &mut crate::starling_tick::OldEntity,
+ ) {
+     if entity.items.len() < SLOT_COUNT {
+         entity.items.resize(SLOT_COUNT, None);
+@@ -408,7 +415,7 @@ fn altar_tick(
+         }
+         let slot = entity.items[ALTAR_SLOT as usize]
+             .as_ref()
+-            .map(|stack| stack.item().id(host));
++            .map(|stack| stack.item().id(host).unwrap_or_default());
+         if let Some(recipe) = altar.step(slot.as_deref())
+             && let Some(index) = altar_recipe(recipe.input)
+             && let Some(stack) =
+@@ -471,7 +478,7 @@ fn altar_click(
+     };
+     if let Some(stack) = held
+         && stack.count() > 0
+-        && altar_recipe(&stack.item().id(host)).is_some()
++        && altar_recipe(&stack.item().id(host).unwrap_or_default()).is_some()
+         && altar_slot(host, level, pos).is_none()
+     {
+         let one = ItemStack::of(stack.item());
+@@ -497,7 +504,7 @@ fn altar_click(
+         // 0.1.0's unconditional cancel did.
+         return Some(InteractionResult::Success);
+     };
+-    if altar_recipe(&stack.item().id(host)).is_some() {
++    if altar_recipe(&stack.item().id(host).unwrap_or_default()).is_some() {
+         return Some(InteractionResult::Success);
+     }
+     let resource = ItemResource::of(&stack);
+@@ -555,6 +562,7 @@ impl Hooks for Mod {
+         r.block_container(
+             &altar,
+             ModContainer {
++                insert_rules: Vec::new(),
+                 slots: SLOT_COUNT,
+                 faces: array::from_fn(|_| vec![ALTAR_SLOT as usize]),
+                 inputs: vec![ALTAR_SLOT as usize],
+@@ -570,163 +578,24 @@ impl Hooks for Mod {
+     fn register_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+         event.commands.push(Command::new(
+             "naturesaura aura <pos:block_pos> [radius:integer]",
+-        ));
++        ).executes(crate::starling_executor));
+         event
+             .commands
+-            .push(Command::new("naturesaura spot <pos:block_pos>"));
++            .push(Command::new("naturesaura spot <pos:block_pos>").executes(crate::starling_executor));
+         event
+             .commands
+-            .push(Command::new("naturesaura altar <pos:block_pos>"));
++            .push(Command::new("naturesaura altar <pos:block_pos>").executes(crate::starling_executor));
+         event
+             .commands
+-            .push(Command::op("naturesaura altar-build <pos:block_pos>", 2));
++            .push(Command::op("naturesaura altar-build <pos:block_pos>", 2).executes(crate::starling_executor));
+         event.commands.push(Command::op(
+             "naturesaura altar-aura <pos:block_pos> <amount:integer>",
+             2,
+-        ));
++        ).executes(crate::starling_executor));
+         event.commands.push(Command::op(
+             "naturesaura drain <pos:block_pos> <amount:integer>",
+             2,
+-        ));
+-    }
+-
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        let invocation = event.command;
+-        let Some(CommandArgumentValue::BlockPos(pos)) = invocation.argument("pos") else {
+-            feedback(
+-                host,
+-                "usage: /naturesaura aura|spot|altar|altar-build|drain ...",
+-            );
+-            return Flow::Cancel;
+-        };
+-        let pos = *pos;
+-        match invocation.literals.get(1).map(String::as_str) {
+-            Some("aura") => {
+-                let radius = match invocation.argument("radius") {
+-                    Some(CommandArgumentValue::Integer(radius)) => (*radius).clamp(0, 128),
+-                    _ => ALTAR_RADIUS,
+-                };
+-                let (spots, count) = area_spots(host, pos, radius);
+-                let area = DEFAULT_AURA.saturating_add(spots);
+-                feedback(
+-                    host,
+-                    format!(
+-                        "Nature's Aura at {}, {}, {} (radius {radius}): area={area} base={DEFAULT_AURA} spots={spots} count={count}",
+-                        pos[0], pos[1], pos[2]
+-                    ),
+-                );
+-                Flow::Cancel
+-            }
+-            Some("spot") => {
+-                let amount = amount_at(host, pos);
+-                feedback(
+-                    host,
+-                    format!("Aura spot at {}, {}, {}: {amount}", pos[0], pos[1], pos[2]),
+-                );
+-                Flow::Cancel
+-            }
+-            Some("altar") => {
+-                // The readout names the altar's item and count: gate it like a
+-                // reach, so another player's altar is not read from afar.
+-                let Some(level) = level_of(host, invocation) else {
+-                    feedback(host, format!("{pos:?} is not a mod block entity."));
+-                    return Flow::Cancel;
+-                };
+-                if !may_read(&*host, event.source, level, pos) {
+-                    feedback(
+-                        host,
+-                        format!(
+-                            "You must be an operator or within {:.0} blocks of the altar.",
+-                            runtime::INSPECT_RANGE
+-                        ),
+-                    );
+-                    return Flow::Cancel;
+-                }
+-                let line = altar_readout(host, invocation, pos);
+-                feedback(host, line);
+-                Flow::Cancel
+-            }
+-            Some("altar-build") => {
+-                let placed = build_altar(host, invocation, pos);
+-                let (spots, _) = area_spots(host, pos, ALTAR_RADIUS);
+-                feedback(
+-                    host,
+-                    format!(
+-                        "Nature's Altar frame around {}, {}, {}: placed {placed} blocks; area={}",
+-                        pos[0],
+-                        pos[1],
+-                        pos[2],
+-                        DEFAULT_AURA.saturating_add(spots)
+-                    ),
+-                );
+-                Flow::Cancel
+-            }
+-            Some("altar-aura") => {
+-                let Some(CommandArgumentValue::Integer(amount)) = invocation.argument("amount")
+-                else {
+-                    feedback(
+-                        host,
+-                        "usage: /naturesaura altar-aura <x> <y> <z> <amount>".to_owned(),
+-                    );
+-                    return Flow::Cancel;
+-                };
+-                let amount = (*amount).clamp(0, ALTAR_MAX_AURA);
+-                let level = level_of(host, invocation)
+-                    .filter(|level| altar_block_there(&*host, *level, pos));
+-                let line = match level {
+-                    Some(level) => {
+-                        let mut data = Compound::new();
+-                        write_int(&mut data, KEY_AURA, amount);
+-                        if merge_data(host, level, pos, data) {
+-                            format!(
+-                                "Nature's Altar at {}, {}, {}: the container holds {amount}/{ALTAR_MAX_AURA} aura.",
+-                                pos[0], pos[1], pos[2]
+-                            )
+-                        } else {
+-                            format!("{pos:?} is not a nature's altar.")
+-                        }
+-                    }
+-                    None => format!("{pos:?} is not a nature's altar."),
+-                };
+-                feedback(host, line);
+-                Flow::Cancel
+-            }
+-            Some("drain") => {
+-                let Some(CommandArgumentValue::Integer(amount)) = invocation.argument("amount")
+-                else {
+-                    feedback(
+-                        host,
+-                        "usage: /naturesaura drain <x> <y> <z> <amount>".to_owned(),
+-                    );
+-                    return Flow::Cancel;
+-                };
+-                let drained = drain_at(host, pos, (*amount).max(0));
+-                let left = amount_at(host, pos);
+-                let (spots, _) = area_spots(host, pos, ALTAR_RADIUS);
+-                feedback(
+-                    host,
+-                    format!(
+-                        "Aura spot at {}, {}, {}: drained {drained}, {left} left; area={}",
+-                        pos[0],
+-                        pos[1],
+-                        pos[2],
+-                        DEFAULT_AURA.saturating_add(spots)
+-                    ),
+-                );
+-                Flow::Cancel
+-            }
+-            _ => {
+-                feedback(
+-                    host,
+-                    "usage: /naturesaura aura|spot|altar|altar-build|drain ...",
+-                );
+-                Flow::Cancel
+-            }
+-        }
++        ).executes(crate::starling_executor));
+     }
+ }
+ 
+@@ -795,7 +664,7 @@ fn altar_readout(
+         _ => "none".to_owned(),
+     };
+     let slot = match altar_slot(host, level, pos) {
+-        Some(stack) => format!("{} x{}", stack.item().id(host), stack.count()),
++        Some(stack) => format!("{} x{}", stack.item().id(host).unwrap_or_default(), stack.count()),
+         None => "empty".to_owned(),
+     };
+     let complete = read_int(&nbt, KEY_COMPLETE) == 1;
+@@ -886,7 +755,7 @@ fn is_block(host: &dyn Host, level: LevelRef, pos: [i32; 3], key: &OnceLock<Bloc
+ }
+ 
+ fn block_id(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> Option<String> {
+-    level.block(host, pos).map(|key| key.id(host))
++    level.block(host, pos).and_then(|key| key.id(host).map(str::to_owned))
+ }
+ 
+ /// Merge `data` into the block entity at `pos` (`BlockDataAccessor.setData`: load,
+@@ -926,3 +795,151 @@ fn read_int(nbt: &Compound, key: &str) -> i32 {
+ fn write_int(nbt: &mut Compound, key: &str, value: i32) {
+     nbt.insert(key.into(), Tag::Int(value));
+ }
++
++/// Starling's port: the old `run_mod_command` hook's body.
++pub(crate) fn starling_run_mod_command(
++    host: &mut dyn ServerHost,
++    event: &mut crate::starling_command::RunModCommandEvent<'_>,
++) -> Flow {
++        let invocation = event.command;
++        let Some(CommandArgumentValue::BlockPos(pos)) = invocation.argument("pos") else {
++            feedback(
++                host,
++                "usage: /naturesaura aura|spot|altar|altar-build|drain ...",
++            );
++            return Flow::Cancel;
++        };
++        let pos = *pos;
++        match invocation.literals.get(1).map(String::as_str) {
++            Some("aura") => {
++                let radius = match invocation.argument("radius") {
++                    Some(CommandArgumentValue::Integer(radius)) => (*radius).clamp(0, 128),
++                    _ => ALTAR_RADIUS,
++                };
++                let (spots, count) = area_spots(host, pos, radius);
++                let area = DEFAULT_AURA.saturating_add(spots);
++                feedback(
++                    host,
++                    format!(
++                        "Nature's Aura at {}, {}, {} (radius {radius}): area={area} base={DEFAULT_AURA} spots={spots} count={count}",
++                        pos[0], pos[1], pos[2]
++                    ),
++                );
++                Flow::Cancel
++            }
++            Some("spot") => {
++                let amount = amount_at(host, pos);
++                feedback(
++                    host,
++                    format!("Aura spot at {}, {}, {}: {amount}", pos[0], pos[1], pos[2]),
++                );
++                Flow::Cancel
++            }
++            Some("altar") => {
++                // The readout names the altar's item and count: gate it like a
++                // reach, so another player's altar is not read from afar.
++                let Some(level) = level_of(host, invocation) else {
++                    feedback(host, format!("{pos:?} is not a mod block entity."));
++                    return Flow::Cancel;
++                };
++                if !may_read(&*host, event.source, level, pos) {
++                    feedback(
++                        host,
++                        format!(
++                            "You must be an operator or within {:.0} blocks of the altar.",
++                            runtime::INSPECT_RANGE
++                        ),
++                    );
++                    return Flow::Cancel;
++                }
++                let line = altar_readout(host, invocation, pos);
++                feedback(host, line);
++                Flow::Cancel
++            }
++            Some("altar-build") => {
++                let placed = build_altar(host, invocation, pos);
++                let (spots, _) = area_spots(host, pos, ALTAR_RADIUS);
++                feedback(
++                    host,
++                    format!(
++                        "Nature's Altar frame around {}, {}, {}: placed {placed} blocks; area={}",
++                        pos[0],
++                        pos[1],
++                        pos[2],
++                        DEFAULT_AURA.saturating_add(spots)
++                    ),
++                );
++                Flow::Cancel
++            }
++            Some("altar-aura") => {
++                let Some(CommandArgumentValue::Integer(amount)) = invocation.argument("amount")
++                else {
++                    feedback(
++                        host,
++                        "usage: /naturesaura altar-aura <x> <y> <z> <amount>".to_owned(),
++                    );
++                    return Flow::Cancel;
++                };
++                let amount = (*amount).clamp(0, ALTAR_MAX_AURA);
++                let level = level_of(host, invocation)
++                    .filter(|level| altar_block_there(&*host, *level, pos));
++                let line = match level {
++                    Some(level) => {
++                        let mut data = Compound::new();
++                        write_int(&mut data, KEY_AURA, amount);
++                        if merge_data(host, level, pos, data) {
++                            format!(
++                                "Nature's Altar at {}, {}, {}: the container holds {amount}/{ALTAR_MAX_AURA} aura.",
++                                pos[0], pos[1], pos[2]
++                            )
++                        } else {
++                            format!("{pos:?} is not a nature's altar.")
++                        }
++                    }
++                    None => format!("{pos:?} is not a nature's altar."),
++                };
++                feedback(host, line);
++                Flow::Cancel
++            }
++            Some("drain") => {
++                let Some(CommandArgumentValue::Integer(amount)) = invocation.argument("amount")
++                else {
++                    feedback(
++                        host,
++                        "usage: /naturesaura drain <x> <y> <z> <amount>".to_owned(),
++                    );
++                    return Flow::Cancel;
++                };
++                let drained = drain_at(host, pos, (*amount).max(0));
++                let left = amount_at(host, pos);
++                let (spots, _) = area_spots(host, pos, ALTAR_RADIUS);
++                feedback(
++                    host,
++                    format!(
++                        "Aura spot at {}, {}, {}: drained {drained}, {left} left; area={}",
++                        pos[0],
++                        pos[1],
++                        pos[2],
++                        DEFAULT_AURA.saturating_add(spots)
++                    ),
++                );
++                Flow::Cancel
++            }
++            _ => {
++                feedback(
++                    host,
++                    "usage: /naturesaura aura|spot|altar|altar-build|drain ...",
++                );
++                Flow::Cancel
++            }
++        }
++    }
++
++/// Starling's port: every declared usage runs the old hook's body.
++pub(crate) fn starling_executor(
++    host: &mut dyn ServerHost,
++    source: &mod_api::CommandSource,
++    command: &mod_api::CommandInvocation,
++) -> Option<i32> {
++    crate::starling_command::execute(host, source, command, starling_run_mod_command)
++}
+diff --git a/naturesaura/src/starling_command.rs b/src/starling_command.rs
+new file mode 100644
+index 0000000..9198ea5
+--- /dev/null
++++ b/src/starling_command.rs
+@@ -0,0 +1,25 @@
++//! Starling's port to Sunrise's API: Horizon's `run_mod_command` hook, which got every command of
++//! the mod in one event, is a per-usage executor in Sunrise. The old event is rebuilt here around
++//! the executor's arguments, so the mod's command code runs as it was written.
++use mod_api::{CommandInvocation, CommandSource, Flow, ServerHost};
++
++/// Horizon's `RunModCommandEvent`: the parsed command and who ran it.
++pub(crate) struct RunModCommandEvent<'a> {
++    pub command: &'a CommandInvocation,
++    pub source: &'a CommandSource,
++}
++
++/// The executor of every usage the mod declares: the old hook's body (`run`), whose `Cancel` was a
++/// command it ran and `Continue` one it did not.
++pub(crate) fn execute(
++    host: &mut dyn ServerHost,
++    source: &CommandSource,
++    command: &CommandInvocation,
++    run: fn(&mut dyn ServerHost, &mut RunModCommandEvent<'_>) -> Flow,
++) -> Option<i32> {
++    let mut event = RunModCommandEvent { command, source };
++    match run(host, &mut event) {
++        Flow::Continue => None,
++        _ => Some(1),
++    }
++}
+diff --git a/naturesaura/src/starling_tick.rs b/src/starling_tick.rs
+new file mode 100644
+index 0000000..4de1a43
+--- /dev/null
++++ b/src/starling_tick.rs
+@@ -0,0 +1,63 @@
++//! Starling's port to Sunrise's API: a block entity tick written for Horizon's, which handed the
++//! tick the block entity's slots, compound and data slots to change in place, runs here on a copy
++//! of them taken from the tick's view; what it changed is written back and the chunk marked
++//! unsaved, as Horizon's reply did.
++use mod_api::{BlockEntityTickEvent, Compound, ItemStack, ServerHost};
++
++/// The block entity as Horizon's tick had it.
++pub(crate) struct OldEntity {
++    pub items: Vec<Option<ItemStack>>,
++    pub nbt: Compound,
++    pub data: Vec<i32>,
++}
++
++/// Run `body` on a copy of the ticking block entity (its host, the copy, its position).
++pub(crate) fn run(
++    event: &mut BlockEntityTickEvent<'_>,
++    body: impl FnOnce(&mut dyn ServerHost, &mut OldEntity, [i32; 3]),
++) {
++    let Some((handle, pos, before)) = event.subject.with_view(|view| {
++        let items = (0..view.item_slots() as u32)
++            .map(|slot| view.item_slot(slot).and_then(|stack| stack.to_owned()))
++            .collect();
++        let entity = OldEntity {
++            items,
++            nbt: view.nbt().clone(),
++            data: view.data_slots().to_vec(),
++        };
++        (view.handle(), view.position(), entity)
++    }) else {
++        return;
++    };
++    let mut after = OldEntity {
++        items: before.items.clone(),
++        nbt: before.nbt.clone(),
++        data: before.data.clone(),
++    };
++    body(event.subject.host(), &mut after, pos);
++    let mut changed = false;
++    event.subject.with_view(|mut view| {
++        for (key, value) in after.nbt.iter() {
++            if before.nbt.get(key) != Some(value) && view.set_nbt(key.clone(), Some(value.clone())) {
++                changed = true;
++            }
++        }
++        for (key, _) in before.nbt.iter() {
++            if after.nbt.get(key).is_none() && view.set_nbt(key.clone(), None) {
++                changed = true;
++            }
++        }
++        for (slot, stack) in after.items.iter().enumerate() {
++            if before.items.get(slot) != Some(stack) {
++                let _ = view.set_item_slot(slot as u32, stack.clone());
++                changed = true;
++            }
++        }
++        if after.data != before.data && view.set_data_slots(&after.data) {
++            changed = true;
++        }
++    });
++    if changed {
++        let _ = handle.set_changed(event.subject.host());
++    }
++}

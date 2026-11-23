@@ -1,0 +1,321 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 3f09337..9cb340d 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -26,11 +26,14 @@
+ //! | `register-commands` (8) | [`Mod::register_commands`] |
+ //! | `perform-command` (8) | [`Mod::run_mod_command`] (typed `CommandInvocation`) |
+ //! | `world-lifecycle` (v1) | [`Mod::world_lifecycle`] (drop the recipe cache and the push queue) |
++use crate::starling_command::RunModCommandEvent;
+ use mod_api::{
+     self, Flow, Hooks, HostSide, LevelTickPostEvent, RegisterCommandsEvent, Registrar,
+-    RegistrationContext, RunModCommandEvent, ServerHost, WorldLifecycleEvent,
++    RegistrationContext, ServerHost, WorldLifecycleEvent,
+ };
+ 
++mod starling_tick;
++mod starling_command;
+ pub mod runtime;
+ pub mod support;
+ 
+@@ -50,15 +53,6 @@ impl Hooks for Mod {
+         support::declare_commands(event.commands);
+     }
+ 
+-    /// The command body: the parsed position, then one line about the machine there.
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        support::run_command(host, event)
+-    }
+-
+     /// After a level's tick: the generators queued by their own tick push FE into the crushers
+     /// beside them. A block entity is out of the world during its own tick.
+     fn level_tick_post(&self, host: HostSide<'_>, event: &mut LevelTickPostEvent) {
+@@ -74,3 +68,20 @@ impl Hooks for Mod {
+         support::clear_push_queue();
+     }
+ }
++
++/// Starling's port: the old `run_mod_command` hook's body.
++pub(crate) fn starling_run_mod_command(
++    host: &mut dyn ServerHost,
++    event: &mut crate::starling_command::RunModCommandEvent<'_>,
++) -> Flow {
++        support::run_command(host, event)
++    }
++
++/// Starling's port: every declared usage runs the old hook's body.
++pub(crate) fn starling_executor(
++    host: &mut dyn ServerHost,
++    source: &mod_api::CommandSource,
++    command: &mod_api::CommandInvocation,
++) -> Option<i32> {
++    crate::starling_command::execute(host, source, command, starling_run_mod_command)
++}
+diff --git a/actuallyadditions/src/starling_command.rs b/src/starling_command.rs
+new file mode 100644
+index 0000000..9198ea5
+--- /dev/null
++++ b/src/starling_command.rs
+@@ -0,0 +1,25 @@
++//! Starling's port to Sunrise's API: Horizon's `run_mod_command` hook, which got every command of
++//! the mod in one event, is a per-usage executor in Sunrise. The old event is rebuilt here around
++//! the executor's arguments, so the mod's command code runs as it was written.
++use mod_api::{CommandInvocation, CommandSource, Flow, ServerHost};
++
++/// Horizon's `RunModCommandEvent`: the parsed command and who ran it.
++pub(crate) struct RunModCommandEvent<'a> {
++    pub command: &'a CommandInvocation,
++    pub source: &'a CommandSource,
++}
++
++/// The executor of every usage the mod declares: the old hook's body (`run`), whose `Cancel` was a
++/// command it ran and `Continue` one it did not.
++pub(crate) fn execute(
++    host: &mut dyn ServerHost,
++    source: &CommandSource,
++    command: &CommandInvocation,
++    run: fn(&mut dyn ServerHost, &mut RunModCommandEvent<'_>) -> Flow,
++) -> Option<i32> {
++    let mut event = RunModCommandEvent { command, source };
++    match run(host, &mut event) {
++        Flow::Continue => None,
++        _ => Some(1),
++    }
++}
+diff --git a/actuallyadditions/src/starling_tick.rs b/src/starling_tick.rs
+new file mode 100644
+index 0000000..4de1a43
+--- /dev/null
++++ b/src/starling_tick.rs
+@@ -0,0 +1,63 @@
++//! Starling's port to Sunrise's API: a block entity tick written for Horizon's, which handed the
++//! tick the block entity's slots, compound and data slots to change in place, runs here on a copy
++//! of them taken from the tick's view; what it changed is written back and the chunk marked
++//! unsaved, as Horizon's reply did.
++use mod_api::{BlockEntityTickEvent, Compound, ItemStack, ServerHost};
++
++/// The block entity as Horizon's tick had it.
++pub(crate) struct OldEntity {
++    pub items: Vec<Option<ItemStack>>,
++    pub nbt: Compound,
++    pub data: Vec<i32>,
++}
++
++/// Run `body` on a copy of the ticking block entity (its host, the copy, its position).
++pub(crate) fn run(
++    event: &mut BlockEntityTickEvent<'_>,
++    body: impl FnOnce(&mut dyn ServerHost, &mut OldEntity, [i32; 3]),
++) {
++    let Some((handle, pos, before)) = event.subject.with_view(|view| {
++        let items = (0..view.item_slots() as u32)
++            .map(|slot| view.item_slot(slot).and_then(|stack| stack.to_owned()))
++            .collect();
++        let entity = OldEntity {
++            items,
++            nbt: view.nbt().clone(),
++            data: view.data_slots().to_vec(),
++        };
++        (view.handle(), view.position(), entity)
++    }) else {
++        return;
++    };
++    let mut after = OldEntity {
++        items: before.items.clone(),
++        nbt: before.nbt.clone(),
++        data: before.data.clone(),
++    };
++    body(event.subject.host(), &mut after, pos);
++    let mut changed = false;
++    event.subject.with_view(|mut view| {
++        for (key, value) in after.nbt.iter() {
++            if before.nbt.get(key) != Some(value) && view.set_nbt(key.clone(), Some(value.clone())) {
++                changed = true;
++            }
++        }
++        for (key, _) in before.nbt.iter() {
++            if after.nbt.get(key).is_none() && view.set_nbt(key.clone(), None) {
++                changed = true;
++            }
++        }
++        for (slot, stack) in after.items.iter().enumerate() {
++            if before.items.get(slot) != Some(stack) {
++                let _ = view.set_item_slot(slot as u32, stack.clone());
++                changed = true;
++            }
++        }
++        if after.data != before.data && view.set_data_slots(&after.data) {
++            changed = true;
++        }
++    });
++    if changed {
++        let _ = handle.set_changed(event.subject.host());
++    }
++}
+diff --git a/src/support.rs b/src/support.rs
+index 865e4a8..6eaa7f1 100644
+--- a/src/support.rs
++++ b/src/support.rs
+@@ -10,12 +10,13 @@
+ use std::sync::Mutex;
+ use std::sync::atomic::{AtomicU64, Ordering};
+ 
++use crate::starling_command::RunModCommandEvent;
+ use mod_api::{
+     self, BlockClick, BlockEntityEvent, BlockEntityPart, BlockEntityTickEvent,
+-    BlockEntityTickReply, BlockEntityTicksEvent, BlockPart, Command, CommandArgumentValue,
++    BlockEntityTicksEvent, BlockPart, Command, CommandArgumentValue,
+     Compound, ENERGY, Flow, Host, HostTransaction, Identifier, Ingredient, InteractionResult,
+     ItemKey, ItemPlace, ItemResource, ItemStack, LevelRef, LevelSide, ModContainer,
+-    ModEnergyBuffer, RandomSource, Registrar, RegistrationContext, RunModCommandEvent, ServerHost,
++    ModEnergyBuffer, RandomSource, Registrar, RegistrationContext, ServerHost,
+     Tag, Text, move_energy,
+ };
+ 
+@@ -86,10 +87,10 @@ pub(crate) fn declare(r: &mut dyn Registrar, context: &RegistrationContext) {
+     // `GeneratorPart`/`CrusherPart` with `block_part` first would attach it twice and the game
+     // refuses a duplicate ("attached twice, by actuallyadditions and actuallyadditions").
+     if let Err(error) = r.block_entity_part(&generator_kind, GeneratorPart) {
+-        context.refuse(&error.to_string());
++        r.refuse(&error.to_string());
+     }
+     if let Err(error) = r.block_entity_part(&crusher_kind, CrusherPart) {
+-        context.refuse(&error.to_string());
++        r.refuse(&error.to_string());
+     }
+ }
+ 
+@@ -97,6 +98,7 @@ pub(crate) fn declare(r: &mut dyn Registrar, context: &RegistrationContext) {
+ /// (`native_block_entity_container`'s `ModContainer` at the retired pin).
+ pub(crate) fn generator_container() -> ModContainer {
+     ModContainer {
++        insert_rules: Vec::new(),
+         slots: GENERATOR_SLOTS,
+         faces: std::array::from_fn(|_| vec![INPUT_SLOT]),
+         inputs: vec![INPUT_SLOT],
+@@ -110,6 +112,7 @@ pub(crate) fn generator_container() -> ModContainer {
+ pub(crate) fn crusher_container() -> ModContainer {
+     let all: Vec<usize> = (0..CRUSHER_SLOTS).collect();
+     ModContainer {
++        insert_rules: Vec::new(),
+         slots: CRUSHER_SLOTS,
+         faces: std::array::from_fn(|_| all.clone()),
+         inputs: vec![INPUT_SLOT],
+@@ -338,7 +341,7 @@ pub(crate) fn reset_recipes() {
+ 
+ /// The item id a stack holds.
+ fn item_id(host: &dyn Host, stack: &ItemStack) -> String {
+-    stack.item().id(host)
++    stack.item().id(host).unwrap_or_default().to_owned()
+ }
+ 
+ /// An item id's key, `None` for one this world does not have.
+@@ -582,7 +585,7 @@ fn push_generator_energy(host: &mut dyn ServerHost, level: LevelRef, pos: [i32;
+ 
+ /// The block id at a position, `None` for an unknown block.
+ fn block_id(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> Option<String> {
+-    level.block(host, pos).map(|key| key.id(host))
++    level.block(host, pos).and_then(|key| key.id(host).map(str::to_owned))
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -694,14 +697,14 @@ fn insert_from_hand(
+ 
+ /// `/actuallyadditions info <pos>`: the harness's readout of one machine (a harness addition, as
+ /// the 0.1.0 command was; there is no GUI in this slice).
+-pub(crate) fn declare_commands(commands: &mut Vec<Command>) {
++pub(crate) fn declare_commands(commands: &mut Vec<mod_api::CommandRegistration>) {
+     // The readout names a crusher's input, its count and its recipe anywhere in the level,
+     // so it is registered at the operator level `/data get block` needs (2, game master) and
+     // its body asks again before reading anything.
+     commands.push(Command::op(
+         "actuallyadditions info <pos:block_pos>",
+         OPERATOR_LEVEL,
+-    ));
++    ).executes(crate::starling_executor));
+ }
+ 
+ /// The level `/actuallyadditions info` is registered at: 2, the game master level
+@@ -737,7 +740,7 @@ pub(crate) fn status_line(host: &mut dyn ServerHost, pos: [i32; 3]) -> String {
+         .item_slot(&*host, INPUT_SLOT as u32)
+         .ok()
+         .flatten()
+-        .map(|stack| (stack.item().id(&*host), stack.count()));
++        .map(|stack| (stack.item().id(&*host).unwrap_or_default().to_owned(), stack.count()));
+     if kind == GENERATOR {
+         return generator_line(
+             pos,
+@@ -751,7 +754,7 @@ pub(crate) fn status_line(host: &mut dyn ServerHost, pos: [i32; 3]) -> String {
+             .item_slot(&*host, index as u32)
+             .ok()
+             .flatten()
+-            .map(|stack| (stack.item().id(&*host), stack.count()))
++            .map(|stack| (stack.item().id(&*host).unwrap_or_default().to_owned(), stack.count()))
+     };
+     let input = slot(INPUT_SLOT);
+     let recipe = input.as_ref().and_then(|(item, count)| {
+@@ -829,21 +832,23 @@ impl BlockEntityPart for GeneratorPart {
+     }
+ 
+     /// One server tick: fuel, burn, FE, then the queue for the push.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        let pos = event.pos;
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        crate::starling_tick::run(event, |host, entity, tick_pos| {
++        let pos = tick_pos;
+         let level = in_place_level(host);
+-        if event.entity.items.len() != GENERATOR_SLOTS {
+-            event.entity.items.resize(GENERATOR_SLOTS, None);
++        if (*entity).items.len() != GENERATOR_SLOTS {
++            (*entity).items.resize(GENERATOR_SLOTS, None);
+         }
+-        let mut saved = Tag::Compound(std::mem::take(&mut event.entity.nbt));
+-        let items = &mut event.entity.items;
++        let mut saved = Tag::Compound(std::mem::take(&mut (*entity).nbt));
++        let items = &mut (*entity).items;
+         let changed = tick_generator(host, level, pos, &mut saved, items);
+         if let Tag::Compound(nbt) = saved {
+-            event.entity.nbt = nbt;
++            (*entity).nbt = nbt;
+         }
+         if !changed {
+-            *event.reply = BlockEntityTickReply::Unchanged;
++            // (unchanged: nothing is written back)
+         }
++    });
+     }
+ }
+ 
+@@ -884,20 +889,22 @@ impl BlockEntityPart for CrusherPart {
+     }
+ 
+     /// One server tick: the recipe, the FE, the progress and the outputs.
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        crate::starling_tick::run(event, |host, entity, tick_pos| {
+         let level = in_place_level(host);
+-        if event.entity.items.len() != CRUSHER_SLOTS {
+-            event.entity.items.resize(CRUSHER_SLOTS, None);
++        if (*entity).items.len() != CRUSHER_SLOTS {
++            (*entity).items.resize(CRUSHER_SLOTS, None);
+         }
+-        let mut saved = Tag::Compound(std::mem::take(&mut event.entity.nbt));
+-        let items = &mut event.entity.items;
++        let mut saved = Tag::Compound(std::mem::take(&mut (*entity).nbt));
++        let items = &mut (*entity).items;
+         let changed = tick_crusher(host, level, &mut saved, items);
+         if let Tag::Compound(nbt) = saved {
+-            event.entity.nbt = nbt;
++            (*entity).nbt = nbt;
+         }
+         if !changed {
+-            *event.reply = BlockEntityTickReply::Unchanged;
++            // (unchanged: nothing is written back)
+         }
++    });
+     }
+ }
+ 
