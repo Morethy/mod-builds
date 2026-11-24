@@ -42,8 +42,12 @@ cargo install cargo-ndk --version 3.5.4 --locked
 # tool fetched (.android-patch-home): the sandbox has no network (android_native_sdk.py `mods`, mod_lib.py).
 if python3 tools/prebuilt_game.py --help 2>/dev/null | grep -q "stage"; then
   started=$(date +%s)
-  staged=$(python3 tools/prebuilt_game.py stage "$root/staging" | tail -1)
+  # --widen where the game has it: its crates public before the stage pass, as android.yml builds the APK.
+  widen=$(python3 tools/prebuilt_game.py stage --help 2>/dev/null | grep -q -- --widen && echo --widen || true)
+  staged=$(python3 tools/prebuilt_game.py stage "$root/staging" $widen | tail -1)
   rsync -a --delete --exclude .git --exclude target "$staged/" ./
+  # The game's crates public, as android.yml builds the APK (Horizon mods name items Sunrise's split made private).
+  [ -f tools/android_widen.py ] && python3 tools/android_widen.py .
   mv "$root/staging/stage-in" .unstaged
   rm -rf "$root/staging"
   CARGO_TARGET_DIR=target/host-tools cargo build -q --release -p sunrise-native-build --bin sunrise-android-patch
