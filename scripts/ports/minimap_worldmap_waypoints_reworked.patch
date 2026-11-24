@@ -1,0 +1,85 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index a23e927..69786ab 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -12,7 +12,7 @@ pub fn initial_settings() -> runtime::minimap::Settings {
+ 
+ fn legacy_preferences(cx: &RegistrationContext) -> runtime::minimap::Settings {
+     use std::io::Read;
+-    let Some(root) = cx.instance_dir().ok().and_then(native_path) else {
++    let Some(root) = cx.instance_dir().and_then(native_path) else {
+         return runtime::minimap::Settings::default();
+     };
+     let path = root
+@@ -25,6 +25,16 @@ fn legacy_preferences(cx: &RegistrationContext) -> runtime::minimap::Settings {
+     }
+     runtime::minimap::Settings::decode(&text)
+ }
++/// Starling: a mod key's binding and modifiers, through the key mapping handle Sunrise's API now
++/// gives (`mod_key_mapping`), where Horizon's had `mod_key`.
++fn mod_key(host: &dyn ClientHost, id: &str) -> Option<(String, ClientModifiers)> {
++    let mapping = host.mod_key_mapping(runtime::MOD_ID, id).ok()?;
++    mapping
++        .binding(host)
++        .ok()
++        .map(|(key, modifiers)| (key.to_owned(), modifiers))
++}
++
+ fn native_path(directory: &mod_api::InstanceDirectory) -> Option<std::path::PathBuf> {
+     #[cfg(unix)]
+     if let mod_api::InstanceDirectory::Unix(bytes) = directory {
+@@ -45,13 +55,13 @@ impl Hooks for Mod {
+     fn register(&self, r: &mut dyn Registrar, cx: &RegistrationContext) {
+         let mut preferences = legacy_preferences(cx);
+         for (key, button) in runtime::SDK_SETTING_ROWS {
+-            if let Ok(Some(raw)) = cx.setting(runtime::MOD_ID, key) {
++            if let Some(raw) = cx.setting(runtime::MOD_ID, key) {
+                 if let Ok(index) = raw.parse() {
+                     preferences.select_option(button, index);
+                 }
+             }
+         }
+-        if let Ok(Some(raw)) = cx.setting(runtime::MOD_ID, "cache_ram_mib") {
++        if let Some(raw) = cx.setting(runtime::MOD_ID, "cache_ram_mib") {
+             if let Ok(value) = raw.parse::<f64>() {
+                 if value.is_finite() && (16. ..=512.).contains(&value) {
+                     preferences.cache_ram_mib = value.round() as u16;
+@@ -108,8 +118,8 @@ impl Hooks for Mod {
+         {
+             return;
+         }
+-        let map = host.mod_key(runtime::MOD_ID, runtime::WORLD_MAP_KEY);
+-        let waypoints = host.mod_key(runtime::MOD_ID, runtime::WAYPOINTS_KEY);
++        let map = mod_key(host, runtime::WORLD_MAP_KEY);
++        let waypoints = mod_key(host, runtime::WAYPOINTS_KEY);
+         fn binding(value: &Option<(String, ClientModifiers)>) -> Option<(&str, u32)> {
+             value
+                 .as_ref()
+@@ -147,12 +157,14 @@ impl Hooks for Mod {
+                 (runtime::WORLD_MAP_KEY, runtime::ScreenRequest::Map),
+                 (runtime::WAYPOINTS_KEY, runtime::ScreenRequest::Waypoints),
+             ] {
+-                let clicked = host.consume_click(runtime::MOD_ID, id);
++                let clicked = host
++                    .mod_key_mapping(runtime::MOD_ID, id)
++                    .ok()
++                    .and_then(|mapping| mapping.consume_click(&mut *host).ok())
++                    .unwrap_or(false);
+                 if clicked
+                     && requested.is_none()
+-                    && host
+-                        .mod_key(runtime::MOD_ID, id)
+-                        .is_some_and(|(key, _)| key.starts_with("key.mouse."))
++                    && mod_key(host, id).is_some_and(|(key, _)| key.starts_with("key.mouse."))
+                 {
+                     requested = Some(screen);
+                 }
+@@ -240,7 +252,7 @@ impl Hooks for Mod {
+     }
+     fn client_resources_reloaded(
+         &self,
+-        host: &mut dyn ClientHost,
++        host: &dyn mod_api::ClientReloadHost,
+         event: &mut ClientResourcesReloadedEvent,
+     ) {
+         let _ = host;
