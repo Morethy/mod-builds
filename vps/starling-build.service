@@ -1,0 +1,17 @@
+[Unit]
+Description=Starling build server (vps/server.py)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=starling
+WorkingDirectory=/home/starling/mod-builds
+EnvironmentFile=/etc/starling-build/env
+Environment=ANDROID_HOME=/home/starling/android-sdk
+Environment=PATH=/home/starling/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 /home/starling/mod-builds/vps/server.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

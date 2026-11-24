@@ -1,0 +1,7 @@
+# Starling's build server: HTTPS for YOUR-HOST, to vps/server.py on this machine.
+build.example.com {
+	reverse_proxy 127.0.0.1:8790
+	request_body {
+		max_size 33MB
+	}
+}
