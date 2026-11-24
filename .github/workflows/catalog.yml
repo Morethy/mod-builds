@@ -22,6 +22,9 @@ on:
       abi:
         description: The ABI to build for
         default: arm64-v8a
+      rebuild:
+        description: Mods to build again although the index holds them (ids, separated by spaces), after their port changed
+        default: ''
 permissions:
   contents: read
 jobs:
@@ -33,6 +36,7 @@ jobs:
     env:
       BUILD: ${{ inputs.build || vars.CATALOG_BUILD }}
       ABIS: ${{ inputs.abi || 'arm64-v8a' }}
+      REBUILD: ${{ inputs.rebuild }}
       GH_REPO: ${{ github.repository }}
     steps:
       - uses: actions/checkout@v4

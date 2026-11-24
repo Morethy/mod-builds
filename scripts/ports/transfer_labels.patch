@@ -1,5 +1,5 @@
 diff --git a/src/lib.rs b/src/lib.rs
-index c515fb9..f9bf205 100644
+index c515fb9..e3dfc1f 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -19,8 +19,8 @@ use mod_api::{
@@ -13,7 +13,20 @@ index c515fb9..f9bf205 100644
  };
  
  use crate::runtime::{
-@@ -117,31 +117,31 @@ impl Hooks for Mod {
+@@ -80,6 +80,12 @@ struct Mod;
+ 
+ #[mod_api::sunrise_mod]
+ impl Hooks for Mod {
++    fn register(&self, r: &mut dyn mod_api::Registrar, _: &mod_api::RegistrationContext) {
++        // Sunrise refuses an attachment its package didn't declare ("... not saved: Undeclared"); Horizon
++        // needed no declaration.
++        let _ = r.register_attachment_type("transfer_labels:labels", false);
++    }
++
+     /// A level's tick pass (upstream's `LevelTickEvent.Pre`): every due label in that level
+     /// moves its items. Only the server owns the labels and the containers.
+     fn level_tick_pre(&self, host: HostSide, event: &mut LevelTickPreEvent) {
+@@ -117,31 +123,31 @@ impl Hooks for Mod {
      /// Declares `/transfer_labels …`, the configuration path this slice has instead of the GUI.
      fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
          for usage in USAGES {
@@ -66,7 +79,7 @@ index c515fb9..f9bf205 100644
  }
  
  // ---------------------------------------------------------------------------
-@@ -265,7 +265,7 @@ fn move_once(host: &mut dyn ServerHost, level: LevelRef, key: LabelKey, label: &
+@@ -265,7 +271,7 @@ fn move_once(host: &mut dyn ServerHost, level: LevelRef, key: LabelKey, label: &
              &destination,
              |held| held.item() == item,
              plan.amount,
@@ -75,7 +88,7 @@ index c515fb9..f9bf205 100644
          )
      });
  }
-@@ -288,7 +288,7 @@ fn slots_of(
+@@ -288,7 +294,7 @@ fn slots_of(
              continue;
          }
          slots.push(Slot {
@@ -84,7 +97,7 @@ index c515fb9..f9bf205 100644
              count,
              can_take: true,
          });
-@@ -306,7 +306,7 @@ fn counts_of(
+@@ -306,7 +312,7 @@ fn counts_of(
          let Some(resource) = handler.resource(host, index) else {
              continue;
          };
@@ -93,7 +106,7 @@ index c515fb9..f9bf205 100644
          let amount = handler.amount(host, index);
          match counts.iter_mut().find(|(known, _)| *known == item) {
              Some((_, held)) => *held = held.saturating_add(amount),
-@@ -347,7 +347,7 @@ fn attach(host: &mut dyn ServerHost, click: &BlockClick<'_>) -> bool {
+@@ -347,7 +353,7 @@ fn attach(host: &mut dyn ServerHost, click: &BlockClick<'_>) -> bool {
      let Some(stack) = click.stack else {
          return false;
      };
@@ -102,7 +115,7 @@ index c515fb9..f9bf205 100644
          return false;
      };
      let Some(face) = face_of(click.hit.face) else {
-@@ -414,7 +414,7 @@ fn consume_one(host: &mut dyn ServerHost, player: PlayerRef, hand: Hand) -> bool
+@@ -414,7 +420,7 @@ fn consume_one(host: &mut dyn ServerHost, player: PlayerRef, hand: Hand) -> bool
      let Some(living) = host.living(player.entity()) else {
          return false;
      };
@@ -111,7 +124,7 @@ index c515fb9..f9bf205 100644
          return false;
      };
      let left = if stack.count() > 1 {
-@@ -439,10 +439,10 @@ fn remove_clicked(host: &mut dyn ServerHost, pos: [i32; 3], face: [i32; 3]) -> b
+@@ -439,10 +445,10 @@ fn remove_clicked(host: &mut dyn ServerHost, pos: [i32; 3], face: [i32; 3]) -> b
      let Some(living) = host.living(player.entity()) else {
          return false;
      };

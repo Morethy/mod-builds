@@ -1,5 +1,5 @@
 diff --git a/src/lib.rs b/src/lib.rs
-index 194094a..79e08d7 100644
+index 194094a..7ae5300 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -19,12 +19,15 @@
@@ -19,7 +19,18 @@ index 194094a..79e08d7 100644
  mod parts;
  mod runtime;
  mod support;
-@@ -71,13 +74,21 @@ impl Hooks for Mod {
+@@ -38,6 +41,10 @@ impl Hooks for Mod {
+     /// Declares the hut block entity types and attaches the citizen's Part, before any world
+     /// opens.
+     fn register(&self, r: &mut dyn Registrar, _: &RegistrationContext) {
++        // Sunrise refuses an attachment its package didn't declare ("... not saved: Undeclared"); Horizon
++        // needed no declaration.
++        let _ = r.register_attachment_type("minecolonies:colony", false);
++        let _ = r.register_attachment_type("minecolonies:hut", false);
+         support::register(r);
+     }
+ 
+@@ -71,13 +78,21 @@ impl Hooks for Mod {
      fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
          support::on_register_commands(event);
      }

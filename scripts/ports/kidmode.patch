@@ -15,10 +15,20 @@ index 7f95e0a..5988a7f 100644
          .flatten()
  }
 diff --git a/src/lib.rs b/src/lib.rs
-index ff7dfb0..c85270f 100644
+index ff7dfb0..019e2ba 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -230,29 +230,36 @@ impl Hooks for Mod {
+@@ -44,6 +44,9 @@ impl Hooks for Mod {
+     /// The settings page (Options > Mods > Kid Mode > Config), in docs order,
+     /// and the particles taming shows.
+     fn register(&self, r: &mut dyn Registrar, _: &RegistrationContext) {
++        // Sunrise refuses an attachment its package didn't declare ("... not saved: Undeclared"); Horizon
++        // needed no declaration.
++        let _ = r.register_attachment_type("kidmode:tamed", true);
+         for s in m::SETTINGS {
+             if let Err(e) = r.register_setting(SettingSpec::toggle(s.key, s.label_key(), s.default))
+             {
+@@ -230,29 +233,36 @@ impl Hooks for Mod {
      }
  
      /// Mob ticks are told only to a mod that asks for them.
@@ -70,7 +80,7 @@ index ff7dfb0..c85270f 100644
      }
  
      /// A tamed mob never despawns.
-@@ -285,7 +292,7 @@ impl Hooks for Mod {
+@@ -285,7 +295,7 @@ impl Hooks for Mod {
              return None;
          };
          let stack = event.stack?;
@@ -79,7 +89,7 @@ index ff7dfb0..c85270f 100644
          let entity = host.entity(u32::try_from(event.entity).ok()?)?;
          let player = host.players().acting_player()?;
          if item == "minecraft:lead" && m::leashable(event.kind) {
-@@ -311,7 +318,7 @@ fn load_settings(host: &dyn Host) {
+@@ -311,7 +321,7 @@ fn load_settings(host: &dyn Host) {
  
  /// An entity's type id (`minecraft:zombie`).
  fn kind_of(host: &dyn Host, entity: EntityRef) -> Option<String> {
@@ -88,7 +98,7 @@ index ff7dfb0..c85270f 100644
  }
  
  fn is_player(host: &dyn Host, entity: EntityRef) -> bool {
-@@ -327,7 +334,7 @@ fn is_tamed(host: &mut dyn Host, entity: EntityRef) -> bool {
+@@ -327,7 +337,7 @@ fn is_tamed(host: &mut dyn Host, entity: EntityRef) -> bool {
      attached
          || entity
              .tags(&*host)
@@ -97,7 +107,7 @@ index ff7dfb0..c85270f 100644
  }
  
  /// Auto sleep: once the day has ended in the Overworld, skip to the morning
-@@ -351,7 +358,12 @@ fn auto_sleep(host: &mut dyn ServerHost) {
+@@ -351,7 +361,12 @@ fn auto_sleep(host: &mut dyn ServerHost) {
      if matches!(weather, Ok(Some(GameRuleValue::Bool(true)))) {
          level.set_weather(host, 0, 0, false, false);
      }
@@ -111,7 +121,7 @@ index ff7dfb0..c85270f 100644
          player.reset_stat(host, StatType::Custom, "minecraft:time_since_rest");
      }
  }
-@@ -469,7 +481,7 @@ fn feed(
+@@ -469,7 +484,7 @@ fn feed(
      if success {
          let tamer = tamed::Tamed {
              owner: Some(player.uuid()),
@@ -120,7 +130,7 @@ index ff7dfb0..c85270f 100644
              profile: player.profile(&*host).map(|p| tamed::profile_tag(&p)),
          };
          let _ = tamed::TAMED.set(host, Holder::Entity(entity.id()), tamer);
-@@ -494,7 +506,9 @@ fn use_up(host: &mut dyn ServerHost, player: mod_api::PlayerRef, hand: Hand, res
+@@ -494,7 +509,9 @@ fn use_up(host: &mut dyn ServerHost, player: mod_api::PlayerRef, hand: Hand, res
      let Some(living) = host.living(player.entity()) else {
          return;
      };

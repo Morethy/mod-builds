@@ -1,5 +1,5 @@
 diff --git a/src/lib.rs b/src/lib.rs
-index f75a7f7..53e9928 100644
+index f75a7f7..cd20810 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -27,16 +27,18 @@
@@ -32,7 +32,17 @@ index f75a7f7..53e9928 100644
      }
  }
  
-@@ -105,7 +107,7 @@ impl Hooks for Mod {
+@@ -94,6 +96,9 @@ impl Hooks for Mod {
+     /// nothing; upstream's capacity is 0) and still needs a type and a tick,
+     /// because a cable is what queues its own position for the level's move phase.
+     fn register(&self, registrar: &mut dyn Registrar, context: &RegistrationContext) {
++        // Sunrise refuses an attachment its package didn't declare ("... not saved: Undeclared"); Horizon
++        // needed no declaration.
++        let _ = registrar.register_attachment_type("powah:ender_channels", false);
+         // Every furnator tier: a charge slot then a fuel slot, one buffer with the
+         // tier's own generation capacity and per-side transfer (upstream's
+         // `AbstractGeneratorBlock` over `GeneratorConfig`).
+@@ -105,7 +110,7 @@ impl Hooks for Mod {
              let kind = powah::declare(registrar, name);
              let part = powah::FurnatorPart::new(Arc::clone(&self.queue), tier);
              if let Err(error) = registrar.block_entity_part(&kind, part) {
@@ -41,7 +51,7 @@ index f75a7f7..53e9928 100644
              }
              declare_item(registrar, block);
          }
-@@ -166,7 +168,7 @@ impl Hooks for Mod {
+@@ -166,7 +171,7 @@ impl Hooks for Mod {
              let kind = powah::declare(registrar, name);
              let part = powah::HopperPart::new(Arc::clone(&self.queue), tier);
              if let Err(error) = registrar.block_entity_part(&kind, part) {
@@ -50,7 +60,7 @@ index f75a7f7..53e9928 100644
              }
              declare_item(registrar, block);
          }
-@@ -181,7 +183,7 @@ impl Hooks for Mod {
+@@ -181,7 +186,7 @@ impl Hooks for Mod {
              let kind = powah::declare(registrar, name);
              let part = powah::SolarPart::new(Arc::clone(&self.queue), tier);
              if let Err(error) = registrar.block_entity_part(&kind, part) {
@@ -59,7 +69,7 @@ index f75a7f7..53e9928 100644
              }
              declare_item(registrar, block);
          }
-@@ -197,14 +199,17 @@ impl Hooks for Mod {
+@@ -197,14 +202,17 @@ impl Hooks for Mod {
              registrar.block_capability_before_game(
                  &mod_api::ENERGY,
                  &cell,
@@ -80,7 +90,7 @@ index f75a7f7..53e9928 100644
              }
              declare_item(registrar, block);
          }
-@@ -220,14 +225,17 @@ impl Hooks for Mod {
+@@ -220,14 +228,17 @@ impl Hooks for Mod {
              registrar.block_capability_before_game(
                  &mod_api::ENERGY,
                  &gate,
@@ -101,7 +111,7 @@ index f75a7f7..53e9928 100644
              }
              declare_item(registrar, block);
          }
-@@ -244,7 +252,7 @@ impl Hooks for Mod {
+@@ -244,7 +255,7 @@ impl Hooks for Mod {
              let kind = powah::declare(registrar, name);
              let part = powah::TransmitterPart::new(tier);
              if let Err(error) = registrar.block_entity_part(&kind, part) {
@@ -110,7 +120,7 @@ index f75a7f7..53e9928 100644
              }
              declare_item(registrar, block);
          }
-@@ -288,7 +296,7 @@ impl Hooks for Mod {
+@@ -288,7 +299,7 @@ impl Hooks for Mod {
          // where its buffer is.
          let orb_kind = powah::declare(registrar, powah::ORB_TYPE);
          if let Err(error) = registrar.block_entity_part(&orb_kind, powah::OrbPart) {
@@ -119,7 +129,7 @@ index f75a7f7..53e9928 100644
          }
          for (block, name) in powah::CABLES {
              declare_idle(registrar, context, &self.queue, name, None);
-@@ -302,7 +310,7 @@ impl Hooks for Mod {
+@@ -302,7 +313,7 @@ impl Hooks for Mod {
      /// upstream's `PowahComponents.BOUND_PLAYER`), which the card's own `use` writes and the
      /// transmitter's tick reads.
      fn component_types(&self, _context: &RegistrationContext, event: &mut ComponentTypesEvent<'_>) {
@@ -128,7 +138,7 @@ index f75a7f7..53e9928 100644
      }
  
      /// A block broke: its own item carries its buffer when it is one of the
-@@ -351,14 +359,13 @@ impl Hooks for Mod {
+@@ -351,14 +362,13 @@ impl Hooks for Mod {
      fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
          powah::declare_commands(event.commands);
      }
@@ -149,7 +159,7 @@ index f75a7f7..53e9928 100644
          let literals: Vec<&str> = event.command.literals.iter().map(String::as_str).collect();
          let pos = powah::block_pos(event.command.argument("pos"));
          let amount = powah::integer(event.command.argument("amount"));
-@@ -424,4 +431,12 @@ impl Hooks for Mod {
+@@ -424,4 +434,12 @@ impl Hooks for Mod {
          let _ = host.commands().feedback(Text::literal(line));
          Flow::Cancel
      }

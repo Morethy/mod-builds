@@ -349,7 +349,7 @@ def port_digest(mod):
     return hashlib.sha256(path.read_bytes()).hexdigest() if ID.fullmatch(str(mod)) and path.is_file() else None
 
 
-def plan(catalog, build, abis, have, game=None):
+def plan(catalog, build, abis, have, game=None, rebuild=()):
     """The catalog's native mods to build for `build`: every version of each (not revoked, for the
     build's vanilla `game` when it says one) and each ABI, and the newest version of each other mod, for
     mod_lib.py to say whether it is a wasm mod (the game's catalogs leave those out); but those its index
@@ -357,7 +357,8 @@ def plan(catalog, build, abis, have, game=None):
     failed for good (unless for a reason the route now takes, NOW_TAKEN). Each: id, version, the .hmod's url,
     sha256 and size, its job."""
     revoked = {(r.get("id"), r.get("sha256")) for r in catalog.get("revoked", []) if isinstance(r, dict)}
-    held = {row["job"] for row in (have or {}).get("mods", [])}
+    # `rebuild`: mods built again although the index holds them (a port fixed after they were built).
+    held = {row["job"] for row in (have or {}).get("mods", []) if row.get("id") not in rebuild}
     held |= {row["job"] for row in (have or {}).get("failed", [])
              if row.get("settled") and not NOW_TAKEN.search(str(row.get("error", "")))
              # A port made or changed since the failure: built again with it.
@@ -443,7 +444,8 @@ def main(argv):
         if not known:
             sys.exit(f"{build} is not in the store's {BUILDS}: run store-base.yml for it first")
         have = fetch_json(download_url(mods_tag(build), INDEX))
-        planned = plan(catalog, build, [a for a in abis() if a in known["abis"]], have, known.get("game"))
+        rebuild = set(os.environ.get("REBUILD", "").split())
+        planned = plan(catalog, build, [a for a in abis() if a in known["abis"]], have, known.get("game"), rebuild)
         pathlib.Path(argv[2]).write_text(json.dumps(planned, indent=1))
         print(f"{len(planned)} to build for {build[:12]}")
         if out := os.environ.get("GITHUB_OUTPUT"):

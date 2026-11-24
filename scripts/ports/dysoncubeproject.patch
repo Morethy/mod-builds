@@ -1,5 +1,5 @@
 diff --git a/src/lib.rs b/src/lib.rs
-index 2f4d6f5..8d9afc7 100644
+index 2f4d6f5..21518c2 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -18,9 +18,9 @@
@@ -14,7 +14,17 @@ index 2f4d6f5..8d9afc7 100644
  };
  
  pub mod runtime;
-@@ -66,7 +66,9 @@ impl Hooks for Mod {
+@@ -36,6 +36,9 @@ impl Hooks for Mod {
+     /// The two block entity types, the receiver's down-only FE buffer, the block Parts
+     /// and the controller item's placement notice.
+     fn register(&self, r: &mut dyn Registrar, _cx: &RegistrationContext) {
++        // Sunrise refuses an attachment its package didn't declare ("... not saved: Undeclared"); Horizon
++        // needed no declaration.
++        let _ = r.register_attachment_type("dysoncubeproject:spheres", false);
+         let controller = r.block_key(CONTROLLER);
+         let structure = r.block_key(STRUCTURE);
+ 
+@@ -66,7 +69,9 @@ impl Hooks for Mod {
      /// `/dysoncubeproject status|set|add`, upstream's five usages at permission level 4.
      fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
          for usage in support::USAGES {
@@ -25,7 +35,7 @@ index 2f4d6f5..8d9afc7 100644
          }
      }
  
-@@ -82,33 +84,14 @@ impl Hooks for Mod {
+@@ -82,33 +87,14 @@ impl Hooks for Mod {
          support::generate_spheres(host);
      }
  
@@ -67,7 +77,7 @@ index 2f4d6f5..8d9afc7 100644
  }
  
  /// The controller's block: its placement refusal and its teardown.
-@@ -121,9 +104,10 @@ impl BlockPart for ReceiverBlock {
+@@ -121,9 +107,10 @@ impl BlockPart for ReceiverBlock {
      /// keeps the stack, as vanilla's `null` does.
      fn state_for_placement(
          &self,
@@ -79,7 +89,7 @@ index 2f4d6f5..8d9afc7 100644
          let anchor = [
              event.context.pos.x,
              event.context.pos.y,
-@@ -190,11 +174,35 @@ impl BlockEntityPart for ReceiverEntity {
+@@ -190,11 +177,35 @@ impl BlockEntityPart for ReceiverEntity {
      }
  
      /// One server tick of the receiver: generate, pull, push down.
