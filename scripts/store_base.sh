@@ -36,6 +36,20 @@ curl -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal
 . "$HOME/.cargo/env"
 GITHUB_ENV='' bash tools/ci/rustup_install.sh --profile minimal --component rust-src --target "$triple"
 cargo install cargo-ndk --version 3.5.4 --locked
+# A game that stages (tools/prebuilt_game.py `stage`): the APK's arm64 game is built from its staged copy, a slot in
+# each function (android.yml), so the base is too. The commit's unstaged source stays beside it (.unstaged), which
+# a mixin mod's patch crate copies its functions out of, and sunrise-android-patch is built with the horizon-mixins
+# tool fetched (.android-patch-home): the sandbox has no network (android_native_sdk.py `mods`, mod_lib.py).
+if python3 tools/prebuilt_game.py --help 2>/dev/null | grep -q "stage"; then
+  started=$(date +%s)
+  staged=$(python3 tools/prebuilt_game.py stage "$root/staging" | tail -1)
+  rsync -a --delete --exclude .git --exclude target "$staged/" ./
+  mv "$root/staging/stage-in" .unstaged
+  rm -rf "$root/staging"
+  CARGO_TARGET_DIR=target/host-tools cargo build -q --release -p sunrise-native-build --bin sunrise-android-patch
+  SUNRISE_ANDROID_PATCH_HOME=$PWD/.android-patch-home target/host-tools/release/sunrise-android-patch --tool
+  echo "The staged game and the patch tool: $(( $(date +%s) - started )) s"
+fi
 python3 tools/android_native_sdk.py prepare
 # The game's build identity as each mod's build gives it (mod_lib.py): horizon-mod-host's build script reads it
 # (rerun-if-env-changed), so a base built without it had Cargo build the whole game again for every mod, some 15

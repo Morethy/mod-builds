@@ -327,6 +327,11 @@ def build_one(row, mods, source, result, build, profile):
                    "--profile", profile, "--abi", abi]
         env = {**os.environ, "RUSTFLAGS": "-C prefer-dynamic", "HORIZON_GAME_BUILD_ID": build,
                "SUNRISE_GAME_BUILD_ID": build}
+        if (source / "functions.json").is_file() and (source / ".unstaged").is_dir():
+            # A staged base (store_base.sh): mods with [native.*] rows build their patch crates.
+            env.update(SUNRISE_UNSTAGED_SOURCE=str(source / ".unstaged"),
+                       SUNRISE_ANDROID_PATCH=str(source / "target/host-tools/release/sunrise-android-patch"),
+                       SUNRISE_ANDROID_PATCH_HOME=str(source / ".android-patch-home"))
         try:
             done = subprocess.run(command, cwd=source, env=env, capture_output=True, text=True, timeout=SECONDS)
         except subprocess.TimeoutExpired:
