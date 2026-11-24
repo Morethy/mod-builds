@@ -230,11 +230,13 @@ def native_of(folder, manifest):
         raise Refused(f"is not a native mod: {e}")
 
 
-def check(manifest, cargo, folder, known=frozenset()):
+def check(manifest, cargo, folder, known=frozenset(), staged=False):
     """Refused, for good, when this route won't build it. `known`: the crates in the game's Cargo.lock, which the
-    build (offline) has."""
+    build (offline) has. `staged`: the base is the staged game (store_base.sh), whose builds take `[native.*]` rows
+    (android_native_sdk.py makes their patch crates)."""
     tables = sorted(k for k, v in (manifest.get("native") or {}).items() if isinstance(v, (list, dict)))
-    why = f"has [native.{', native.'.join(tables)}]" if tables else refusal(cargo, folder, known)
+    why = (f"has [native.{', native.'.join(tables)}]" if tables and not staged
+           else refusal(cargo, folder, known))
     if why:
         raise Refused(f"{why}: it {WHOLE_GAME}")
 
@@ -317,7 +319,8 @@ def build_one(row, mods, source, result, build, profile):
         if (port := store.port_digest(mod)):
             status["port"] = port
         cargo = native_of(folder, manifest)
-        check(manifest, cargo, folder, lock_crates(source))
+        check(manifest, cargo, folder, lock_crates(source),
+              (source / "functions.json").is_file() and (source / ".unstaged").is_dir())
         if not sunrise_game(source) and not (folder / "horizon-mod.toml").is_file():
             raise Refused("is made for a newer Starling")
         package = adopted(hmod, folder, work / f"{mod}.smod", mod) if sunrise_game(source) else hmod

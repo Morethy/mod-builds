@@ -339,8 +339,9 @@ def build_row(build):
 # What a failure for good said of a mod the build route has since learned to take (mod_lib.py GAME_CRATES): asked again.
 # "uses the crate X:" and "chooses features of" were refusals of any crate but a few (before 2026-11-23): a crate the
 # game's Cargo.lock has, and a mod's own, are now built ("uses the crate X, which the game doesn't have" is for good).
+# "has [native.mixin…]" was a refusal of every mod with [native.*] rows (before 2026-11-24): a staged base builds them.
 NOW_TAKEN = re.compile(r"uses the crate [\w-]+:|chooses features of|makes the game's crates build again|"
-                       r"The game's crates built again")
+                       r"The game's crates built again|has \[native\.")
 
 
 def port_digest(mod):

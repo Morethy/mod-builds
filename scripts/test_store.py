@@ -283,7 +283,7 @@ class Plan(unittest.TestCase):
         # A failure that may pass is planned again; one for good is not.
         maybe = {"mods": [], "failed": [{"job": store.job_of("a" * 64, "arm64-v8a"), "settled": False}]}
         self.assertEqual(len(store.plan(self.catalog, BUILD, ["arm64-v8a"], maybe, "26.3")), 1)
-        for error, again in (("This mod has [native.mixin]: it needs the whole-game Compile.", 0),
+        for error, again in (("This mod has [native.mixin]: it needs the whole-game Compile.", 1),
                              ("This mod uses the crate serde_json: it needs the whole-game Compile.", 1),
                              ("This mod uses the crate rand: it needs the whole-game Compile.", 1),
                              ("This mod uses the crate rand, which the game doesn't have: it needs the whole-game Compile.", 0)):
