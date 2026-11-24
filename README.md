@@ -1,5 +1,7 @@
 # Starling's mod builds
 
+To run a build server of your own, on GitHub Actions or on a Linux machine, see [SELF-HOSTING.md](SELF-HOSTING.md).
+
 Native mods are compiled into [Starling](https://github.com/starling-client/starling), and a phone can't do that itself. When a player taps **Compile**, Starling sends their mods to the Compile service (`worker/`, on Cloudflare), which asks this repository to compile the game with them. The phone then downloads the result from this repository's `results` release.
 
 - `worker/` is the service the game talks to, at the address in Starling's [`build-server.txt`](https://github.com/starling-client/starling/blob/starling/packaging/android/build-server.txt). It seals the mods (AES-256-CTR, a key for each build) into the `requests` release under a random name, and starts `build.yml` with the key in the run's inputs. The same mods on the same commit are the same job, so a build is never done twice. `npm test` there runs its tests, with no network.
