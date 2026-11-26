@@ -178,10 +178,22 @@ def apply_port(files, patch):
     return out
 
 
-def adopted(hmod, folder, into, mod):
+# The game's Horizon layer (tools/android_native_sdk.py `adopt_horizon`): a base that has it builds a Horizon package
+# against Starling 0.9.0's API itself, and this file in a package says it came from Horizon.
+HORIZON_MARK = ".starling-horizon"
+
+
+def has_layer(source):
+    """Whether the base's game carries the Horizon layer (tools/android_compat/fixes.py)."""
+    return (source / "tools" / "android_compat" / "fixes.py").is_file()
+
+
+def adopted(hmod, folder, into, mod, layer=False):
     """The package as a Sunrise game builds it: a Horizon package (`folder`, unpacked) renamed as the game renames
     it when it installs one, and Starling's port of the mod (scripts/ports/<id>.patch: what Sunrise's API changed
-    since the mod was written) applied when it applies. The package itself when neither changes it."""
+    since the mod was written) applied when it applies. The package itself when neither changes it. With `layer`
+    (a base whose game has the Horizon layer), a Horizon package no port applies to is marked for the layer, which
+    gives it Starling 0.9.0's API: a player's own mod, or a catalog mod's version the port wasn't written for."""
     horizon = (folder / "horizon-mod.toml").is_file() and not (folder / "sunrise-mod.toml").is_file()
     port = pathlib.Path(__file__).resolve().parent / "ports" / f"{mod}.patch"
     if not horizon and not port.is_file():
@@ -205,6 +217,7 @@ def adopted(hmod, folder, into, mod):
                 except UnicodeDecodeError:
                     pass
             files[name] = data
+    ported = None
     if port.is_file():
         ported = apply_port(files, port.read_bytes())
         if ported is None:
@@ -212,6 +225,9 @@ def adopted(hmod, folder, into, mod):
         else:
             files = ported
             print(f"{mod}: built with Starling's port", flush=True)
+    if horizon and layer and ported is None:
+        files[HORIZON_MARK] = b"adopted from Horizon: the game's Horizon layer gives it Starling 0.9.0's API\n"
+        print(f"{mod}: built through the game's Horizon layer", flush=True)
     with zipfile.ZipFile(into, "w", zipfile.ZIP_DEFLATED) as new:
         for name, data in files.items():
             new.writestr(name, data)
@@ -323,7 +339,7 @@ def build_one(row, mods, source, result, build, profile):
               (source / "functions.json").is_file() and (source / ".unstaged").is_dir())
         if not sunrise_game(source) and not (folder / "horizon-mod.toml").is_file():
             raise Refused("is made for a newer Starling")
-        package = adopted(hmod, folder, work / f"{mod}.smod", mod) if sunrise_game(source) else hmod
+        package = adopted(hmod, folder, work / f"{mod}.smod", mod, has_layer(source)) if sunrise_game(source) else hmod
         if package != hmod:
             cargo = tomllib.loads(RENAMED.sub("sunrise", (folder / "Cargo.toml").read_text()))
         command = [sys.executable, str(source / "tools" / "android_native_sdk.py"), "mods", str(out), str(package),
