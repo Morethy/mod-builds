@@ -8,6 +8,7 @@
 # change what a later one starts from.
 #
 #   sandbox.sh JOBS MODS RESULT     mod_lib.py's `build`, with BUILD, ABI and PROFILE
+#   MOD_LIB_COMMAND=check sandbox.sh JOBS MODS RESULT     its `check` (corpus.yml): every job in one `cargo check`
 set -uo pipefail
 
 jobs=$(realpath "$1") mods=$(realpath "$2")
@@ -15,13 +16,15 @@ mkdir -p "$3"
 result=$(realpath "$3")
 scripts=$(realpath "$(dirname "$0")")
 seconds=${SANDBOX_SECONDS:-3000}
+command=${MOD_LIB_COMMAND:-build}
+[[ "$command" =~ ^(build|check)$ ]] || { echo "Not a mod_lib.py command: $command"; exit 1; }
 layer=$HOME/store-layer
 sudo -n rm -rf "$layer"
 mkdir -p "$layer"
 
 sudo -n timeout --kill-after=10 "$seconds" \
   unshare --net --mount --pid --fork --kill-child --propagation private bash -euc '
-home=$1 uid=$2 gid=$3 jobs=$4 mods=$5 result=$6 scripts=$7 layer=$8 build=$9 abi=${10} profile=${11}
+home=$1 uid=$2 gid=$3 jobs=$4 mods=$5 result=$6 scripts=$7 layer=$8 build=$9 abi=${10} profile=${11} command=${12}
 mount -t proc proc /proc
 mount -t tmpfs -o mode=1777 tmpfs /tmp
 ndk=$(ls "$home/android/ndk" | sort | tail -1)
@@ -71,9 +74,9 @@ exec setpriv --reuid="$uid" --regid="$gid" --clear-groups --no-new-privs \
   env -i HOME="$home" PATH="$home/.cargo/bin:/usr/bin:/bin" CARGO_NET_OFFLINE=true LANG=C.UTF-8 \
   ANDROID_HOME="$home/android" ANDROID_NDK_HOME="$home/android/ndk/$ndk" \
   BUILD="$build" ABI="$abi" PROFILE="$profile" MOD_LIB_SOURCE="$home/store/source" \
-  python3 -I "$home/scripts/mod_lib.py" build "$home/jobs.json" "$home/mods" "$home/result"
+  python3 -I "$home/scripts/mod_lib.py" "$command" "$home/jobs.json" "$home/mods" "$home/result"
 ' sandbox "$HOME" "$(id -u)" "$(id -g)" "$jobs" "$mods" "$result" "$scripts" "$layer" "${BUILD:-}" "${ABI:-}" \
-  "${PROFILE:-fast}"
+  "${PROFILE:-fast}" "$command"
 code=$?
 # The layer holds root's files.
 sudo -n rm -rf "$layer"

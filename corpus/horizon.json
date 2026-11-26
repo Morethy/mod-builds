@@ -1,0 +1,721 @@
+{
+ "release": "corpus-horizon",
+ "asset": "horizon-corpus.tar",
+ "mods": [
+  {
+   "id": "accel_torch",
+   "version": "0.2.0",
+   "sha256": "d81af61e45f4e8bc259c861c156ff27845ef553e6f25f1cfd398303c57365804"
+  },
+  {
+   "id": "actuallyadditions",
+   "version": "0.2.1",
+   "sha256": "ac2ad534cbe0ff76b30381543550f7b8bde443d787c07a8d6c2911291977ce11"
+  },
+  {
+   "id": "ambientsounds",
+   "version": "0.2.1",
+   "sha256": "389ce0fac05c65ffd5a02f6827b916a1cfda615ecba0ee877c7d465308dec84e"
+  },
+  {
+   "id": "appleskin_hzn",
+   "version": "0.2.0",
+   "sha256": "39f5d7f2dd7c19fa8fc908998dd364bba1dd0c8f7186c57edf95b7c4679f3d7a"
+  },
+  {
+   "id": "armorstatues",
+   "version": "0.4.0",
+   "sha256": "b981974197ebc3e130212428031e77542508daa8b65b013d19672a96ca8b1612"
+  },
+  {
+   "id": "artifacts",
+   "version": "0.2.1",
+   "sha256": "a77dab764afe47e3dc7190405b274c3a748d7880f70629326dadc4c34282bd10"
+  },
+  {
+   "id": "auto_fishing",
+   "version": "1.0.5",
+   "sha256": "7597c42be85b5fad2e603245d5c5dd1edc453070c2b32bc517153fb66bf34e75"
+  },
+  {
+   "id": "autologin",
+   "version": "1.1.3",
+   "sha256": "1a4fe8ced7f4492b61273f29198aa43604b9878eb584e87ec636664a7b08d419"
+  },
+  {
+   "id": "betterdungeons",
+   "version": "0.2.1",
+   "sha256": "46232ba724fde7c681de1b926a703d796f64b2af768a6b4c481964b269eb590e"
+  },
+  {
+   "id": "bettermineshafts",
+   "version": "0.2.2",
+   "sha256": "aed34b8e6c25dcb430951f5759e06c25ef4b02d3e71945b2d8f18993c8a2c81b"
+  },
+  {
+   "id": "betterthanmending",
+   "version": "0.4.0",
+   "sha256": "97d81d4f1c9fb5a6d059e61b31919b793f7283aaf22532d32f1dea1f738d32a5"
+  },
+  {
+   "id": "bhc",
+   "version": "0.2.2",
+   "sha256": "209a4f93aecf9b2922d385ea132d0accf6a8c90c16df925c66ebd8a16bce66de"
+  },
+  {
+   "id": "bibliocraft",
+   "version": "0.2.3",
+   "sha256": "3094fe7f627288ecd0edee253e6e226cce52aeea7b7adc5fd9d18511e259b1db"
+  },
+  {
+   "id": "bigreactors",
+   "version": "0.2.5",
+   "sha256": "369380ebf1f1caf2c62fe219fddc970fb5754122814ff807c8a023526d7c933b"
+  },
+  {
+   "id": "botania",
+   "version": "0.2.0",
+   "sha256": "01a6607c2a232df68bcca2fb7d2722585bef85b19ca40d24685675064a423e67"
+  },
+  {
+   "id": "botanypots",
+   "version": "0.2.2",
+   "sha256": "769c83c1990b797fe9a58094c0f3215b41a5c077daec35f7219740ecfef811f9"
+  },
+  {
+   "id": "bridgingmod",
+   "version": "0.2.2",
+   "sha256": "b06913beaac04917b846e6714d1c6cfa24dc2a5b8db03377bd467c242a79d616"
+  },
+  {
+   "id": "buildinggadgets2",
+   "version": "0.2.2",
+   "sha256": "fb2a309eef4482e7471b2359da7649bc9e858420ab251f7cd3e3010e9638dea8"
+  },
+  {
+   "id": "bwncr",
+   "version": "0.2.1",
+   "sha256": "d08e0dcfaa6c5794d7d9ec2186d32311501395e3097920368647a34e6f9d37c7"
+  },
+  {
+   "id": "carryon",
+   "version": "0.3.0",
+   "sha256": "d52c72cd66bd866d3589e3a138e28a17a7a7b280fa6dad8ec7fc1b22e3a3ece2"
+  },
+  {
+   "id": "charginggadgets",
+   "version": "0.2.1",
+   "sha256": "7344f046c3f7155f792c1de5d07090cf9231dc6a59d4bfac8d437c116e65fbfb"
+  },
+  {
+   "id": "chisel",
+   "version": "0.2.3",
+   "sha256": "d90f2f154779297117a63a6641a01d354bfc40277fd5f24cc92421fdae113b85"
+  },
+  {
+   "id": "cloudglass",
+   "version": "0.2.2",
+   "sha256": "209a516efffbd0a7e51b90281c0397112717e82bcf9cb720a9e80d40256e5fae"
+  },
+  {
+   "id": "clutter",
+   "version": "0.2.1",
+   "sha256": "1834cd403202c525250e1e8b7025927762b0b5b5fe4707ecfa820d9bf5b6c473"
+  },
+  {
+   "id": "comforts",
+   "version": "0.2.1",
+   "sha256": "1710e742949d1398c010202f0e052f358a092721e2c63f912b742f33c646f9db"
+  },
+  {
+   "id": "compactmachines",
+   "version": "0.2.2",
+   "sha256": "f3cb7fb27c86c8caeb50732cbee2380dfa4bcc802b9663b5a891e1a9662ab24d"
+  },
+  {
+   "id": "computercraft",
+   "version": "0.2.3",
+   "sha256": "af7b51cbc85d6439c601757bc5a2d03967860aed0f5f80eb87a7c75e055560bb"
+  },
+  {
+   "id": "constructionstick",
+   "version": "0.2.5",
+   "sha256": "522653bc219c02eea8afa0c0f5762fe9dbafdcf3a15d7c3b6197b0c7de0f0b8d"
+  },
+  {
+   "id": "continuity",
+   "version": "1.0.0",
+   "sha256": "752526c208e04da4b4ab21f92e20ad0ef1177112c2b491c6b140e18b8555b2ea"
+  },
+  {
+   "id": "crashutilities",
+   "version": "0.2.1",
+   "sha256": "407814fe9fc3571fbedd764334b2551033c5b90edc7c3d300934005825cae160"
+  },
+  {
+   "id": "create_hypertube",
+   "version": "0.2.1",
+   "sha256": "cfdef9fe1be06556e73b864779571bed400e060f205a1973ed3487ec9e9554b3"
+  },
+  {
+   "id": "createaddition",
+   "version": "0.2.5",
+   "sha256": "c035bf5f6fad6022ca5a04030201ecfb8e20d83923e8dddf8572db5a59c3baa6"
+  },
+  {
+   "id": "data_exporter",
+   "version": "0.2.0",
+   "sha256": "f874143f7cebea809f3f4556b54ae89ae28d7f6d3514c435d8f11e1d8b0733c3"
+  },
+  {
+   "id": "deepbore_quarry_native",
+   "version": "0.3.1",
+   "sha256": "509a563990e2d8eb9dbb96d6a32b1b627d946c5341a3d5b51d7f5952fc2c3648"
+  },
+  {
+   "id": "dimstorage",
+   "version": "0.2.1",
+   "sha256": "cc835ed2981e5fe277557954fc337c7be66faced0a51f047c5f4eb5bab47d9e0"
+  },
+  {
+   "id": "disenchanting_table",
+   "version": "0.2.1",
+   "sha256": "b54171ca7d0bf6d6f92e3f071323009573f12f2d83774d56794e3598ab0bee4f"
+  },
+  {
+   "id": "durability",
+   "version": "0.2.1",
+   "sha256": "47cc5fba7814ab4b4a88754a048b458e12204d5b16b9f763e590db05d3707ad1"
+  },
+  {
+   "id": "dynamictrees",
+   "version": "0.1.0",
+   "sha256": "367c21299cc7f89014c2fccbc2f253131a498404e11e2e4bbe9f02eca259647d"
+  },
+  {
+   "id": "dysoncubeproject",
+   "version": "0.2.1",
+   "sha256": "6c03a540db953881bb822be632a23922f814f3359b88e1155e38257eddb736de"
+  },
+  {
+   "id": "earshot",
+   "version": "2.0.7",
+   "sha256": "0f6257479b63c831eca07aac9a704ab9508bff1484e70c19bf2698ef05263b66"
+  },
+  {
+   "id": "elevatorid",
+   "version": "0.2.2",
+   "sha256": "ea7b6cb2bc252978fed8575ec2bc5ce834c1e06a04b5b8fd10c6eba5a03eca0e"
+  },
+  {
+   "id": "ender_undertow_cinematic",
+   "version": "0.1.0-beta.2",
+   "sha256": "e2079bbc608a364658b18a8749168086e09214e4a012b9cbc4aafd03a400dc6a"
+  },
+  {
+   "id": "enderio",
+   "version": "0.2.2",
+   "sha256": "f782eadc96b5d1093411e4213ee4756f1c97600f03a4ef82017fb1f19207e8f8"
+  },
+  {
+   "id": "enderstorage",
+   "version": "0.2.4",
+   "sha256": "843bef5a05f2340299a95dbcb37242a9fbc252570ec4202d2376998225f1461e"
+  },
+  {
+   "id": "enhancedvisuals",
+   "version": "1.0.4",
+   "sha256": "832e6ffce703c097efc028f30cb5a03af8bb1833db49a174e8969239363cf2ac"
+  },
+  {
+   "id": "eternal_starlight",
+   "version": "0.2.1",
+   "sha256": "ae2405307af8e8125b2223a69fd2c87c30bde3f8118492fc678b0de316fa97f4"
+  },
+  {
+   "id": "evilcraft",
+   "version": "0.2.4",
+   "sha256": "a13eb74589716a0fd36c7e40c2975de5dcfa9d1bcd6318bc9a4ddca338b37170"
+  },
+  {
+   "id": "extended_industrialization",
+   "version": "0.1.2",
+   "sha256": "3f9e08e9e9d5059ee59c61aeb570fe7fc76fc03b522645efe5f4611914f81a49"
+  },
+  {
+   "id": "extradisks",
+   "version": "0.2.1",
+   "sha256": "3b0cfb6e6a546b55eeece7f97084d0aacd9797a4ab95544b2e68afc076b82ea8"
+  },
+  {
+   "id": "fallingtrees",
+   "version": "0.4.0",
+   "sha256": "9a1a206370e6277d9350b6b627cc2d488a8d339062faa18076cf6a00d5eac7e0"
+  },
+  {
+   "id": "farmersdelight",
+   "version": "0.5.1",
+   "sha256": "ad2df60650be29cb976d6162f246031c9bff87292a12fcebe65e11de13d68a8b"
+  },
+  {
+   "id": "fluxnetworks",
+   "version": "0.2.2",
+   "sha256": "7e693ae7ea520bf449158ae0ccb75be19fe02ad6018ff5b94cb7402f379eedc0"
+  },
+  {
+   "id": "framedblocks",
+   "version": "0.2.2",
+   "sha256": "fece3d8cb4f146fd2da25bd359d0c37e8de2c99b2ff38454c021221a1b4cee78"
+  },
+  {
+   "id": "functionalstorage",
+   "version": "0.2.2",
+   "sha256": "7ae516b9c10ca680f66c1d7bf3ec08b968e5bc1cac44e2860f94efaea1ff77f3"
+  },
+  {
+   "id": "gateways",
+   "version": "0.2.1",
+   "sha256": "40b8249ce653aad9376f408dc5f3aec024918c502b4f9abb8bc2b7e169a8bba3"
+  },
+  {
+   "id": "glassential",
+   "version": "0.2.2",
+   "sha256": "255f1f3fd1cb58f8539212bb99e743540342d9fce5393584f4236e14b55abaf9"
+  },
+  {
+   "id": "gmut",
+   "version": "0.2.1",
+   "sha256": "9db18245b45c6cc2f6fa151836313f88c95cad216217a1a1f39d171884872bba"
+  },
+  {
+   "id": "gtceu",
+   "version": "0.2.1",
+   "sha256": "2b9e68ed26663eff691ece4b94594c767ad4e4f99e90e2aea73f36a171a392cb"
+  },
+  {
+   "id": "hostilenetworks",
+   "version": "0.2.3",
+   "sha256": "4379d38b5e9b5a2b3e81008e22575d742d135f14b8cbde2837907d3256903c23"
+  },
+  {
+   "id": "iceandfire",
+   "version": "0.2.1",
+   "sha256": "208f5efa60e0e7d17bbd0be598f638780b05c57aa74049847e8223f879eaa0e2"
+  },
+  {
+   "id": "incontrol",
+   "version": "0.2.1",
+   "sha256": "1d9d037ff0cccfa1ece2e20bf2748b677052227b2180e75d9b1cfaa5346cabbb"
+  },
+  {
+   "id": "industrialforegoing",
+   "version": "0.2.5",
+   "sha256": "eeb667a80768439b6c2da2bee94f389220e682fab1f53b813fd16e47266df968"
+  },
+  {
+   "id": "integratedcrafting",
+   "version": "0.2.2",
+   "sha256": "b9582ac14a5f39a613939d4b1f339223fc04984fb1c3c761f1422bf04626ea21"
+  },
+  {
+   "id": "integrateddynamics",
+   "version": "0.2.2",
+   "sha256": "eb080c0420e35fd064aef32f935abb7ca6e92cb5022a130908247421e9c253bc"
+  },
+  {
+   "id": "integratedtunnels",
+   "version": "0.2.3",
+   "sha256": "8893976f177b53a0dbb06af4e6af48193bea7f4160de18038acda372c8709cca"
+  },
+  {
+   "id": "inventory_blur",
+   "version": "1.0.0",
+   "sha256": "29d0e0dc991bd64d51a39db933adbbfda7f061b7cbe0dedb33f1c5fe474b1b2a"
+  },
+  {
+   "id": "ironjetpacks",
+   "version": "0.2.0",
+   "sha256": "302fcc2ace433c045fc6f1edc05b4edc8e85bf10b3647e75bed24dabedb08bc7"
+  },
+  {
+   "id": "itemtooltip",
+   "version": "0.2.1",
+   "sha256": "ad01c0ee6a19dd6f3b6626745ccc629ebb2f3a7a0293ad0a27a961fc01516372"
+  },
+  {
+   "id": "justdirethings",
+   "version": "0.2.3",
+   "sha256": "acfc047f2313ccc9cfe8ce393dbf4121c46311449334e98285351d1c0ab4f322"
+  },
+  {
+   "id": "kidmode",
+   "version": "0.11.0",
+   "sha256": "66925f5826f46765884119b76d352854697ef2dc72c06e7b93b70e3498bc108d"
+  },
+  {
+   "id": "laserbridges",
+   "version": "0.2.1",
+   "sha256": "90b2e1738ff3217ec92915162f3646db3bce278e5655ded6ff487cbe8ea14050"
+  },
+  {
+   "id": "laserio",
+   "version": "0.2.2",
+   "sha256": "962ba440c6fcb734174cd245d589d0632b1a4cdf3a5dbb42fd2ba0ac2377a8b5"
+  },
+  {
+   "id": "little_big_redstone",
+   "version": "0.2.2",
+   "sha256": "802ff1722fdb703ebe69a1e61610db0cba5e0828e17427d92eba03e335ecf653"
+  },
+  {
+   "id": "living_camera",
+   "version": "2.0.0",
+   "sha256": "9dbac2d70361078325f2a4e651290f4c660da0e310563765ed21412c7eab5a89"
+  },
+  {
+   "id": "measurements",
+   "version": "0.2.1",
+   "sha256": "af18c8c6c39760e8b8e53ecce74dda3d4c10041dcd0b7a66502d174d91c5672c"
+  },
+  {
+   "id": "mekanism",
+   "version": "0.2.13",
+   "sha256": "2bddbf3729dbdeae6cb41c6988526fb48f900a851e2e445234ab1ff2a28f298a"
+  },
+  {
+   "id": "mekanismcovers",
+   "version": "0.2.3",
+   "sha256": "b9198a5ab0d3d3f8fe814a6cd81fb24985899c68d0f5551a74c011ac667049e7"
+  },
+  {
+   "id": "mekanismgenerators",
+   "version": "0.2.2",
+   "sha256": "61f42a0980a508dd4e48c5d0748e95067dc6f9b6dd150579ee54c082ec2f566c"
+  },
+  {
+   "id": "mekmm",
+   "version": "0.2.2",
+   "sha256": "d807d535a07989838489c0e683f481af0e42e372a4a11535b14faba0ead1b168"
+  },
+  {
+   "id": "minecolonies",
+   "version": "0.2.7",
+   "sha256": "49acd26d8e90ad810281cf42dd246caeb6b51d12a6529573727e0a8f0ef3efc5"
+  },
+  {
+   "id": "minimap_worldmap_waypoints_reworked",
+   "version": "0.7.9",
+   "sha256": "9f96be16ade1a61ac8968424223d1ff38231191a81f03754423213524d02ec78"
+  },
+  {
+   "id": "mininggadgets",
+   "version": "0.2.1",
+   "sha256": "30373b6b70bcd730eb3d8da8033959d97efc187ec9db1037d8406c22b8fbd1f5"
+  },
+  {
+   "id": "modern_industrialization",
+   "version": "0.2.3",
+   "sha256": "8b6e6ae718953ed7859f7ab56a0b2363aac5abd8b4863cdaaa5f4cd3345db9e5"
+  },
+  {
+   "id": "moderndynamics",
+   "version": "0.2.2",
+   "sha256": "6bb030093a5718719a1a55f377c8d137b362be1e9459c764b2b60fb4f6499b02"
+  },
+  {
+   "id": "modularrouters",
+   "version": "0.2.2",
+   "sha256": "d19d16760097e49146379c6e962acee95799915578b94329890e641b89e39918"
+  },
+  {
+   "id": "moredragoneggs",
+   "version": "0.2.0",
+   "sha256": "9459ff6d04a31ae085a22b37bea751baa12ddf419f31f6b043fb63cf6420b9b0"
+  },
+  {
+   "id": "morered",
+   "version": "0.2.3",
+   "sha256": "0709af07bcf2e23ad8ec42b34f43e723a118b9ee80ead34f2261f039bc20f4ac"
+  },
+  {
+   "id": "mythicupgrades",
+   "version": "0.2.0",
+   "sha256": "c560bc66104edd58746aeec4eb7d454b56981d92c0a88528eaaf741d3d2c9944"
+  },
+  {
+   "id": "naturesaura",
+   "version": "0.2.2",
+   "sha256": "69ff19c346670ddc986b639955fe38c075efa97d11f527aa10ebc9992bb44b5b"
+  },
+  {
+   "id": "neovitae",
+   "version": "0.2.2",
+   "sha256": "ac0827ab8fb7e5c6cbc2df58aa9aae2d3efa34c31000df9cc312c6b50eae72e8"
+  },
+  {
+   "id": "occultism",
+   "version": "0.2.8",
+   "sha256": "974d64471eff0250d9f31e885e9065614cece72d9cd357fc33e5210cecebe64d"
+  },
+  {
+   "id": "occultism_horizon",
+   "version": "0.9.0-alpha.4",
+   "sha256": "64e13bc5975c9448a0e8209688a999c1aede3e4c90fea325ab98f887365fb33c"
+  },
+  {
+   "id": "oritech",
+   "version": "0.2.2",
+   "sha256": "08e72078ccdc285c9d5fdc5540c6d01bc9814394e9d5719274d9e1a282d300b8"
+  },
+  {
+   "id": "pneumaticcraft",
+   "version": "0.2.1",
+   "sha256": "920df343d20aa519bf8bbf3629ef231dd185a39d9515f9f85b922c2de1b98d3e"
+  },
+  {
+   "id": "pocketstorage",
+   "version": "0.2.5",
+   "sha256": "a051686683ba021ec27bf9a21f9f6145ed058dd9dad2264e958be3de80df3eff"
+  },
+  {
+   "id": "powah",
+   "version": "0.2.13",
+   "sha256": "f3577dae797b370a2f7d7c03fbe54798818b2ad04939d9be4f7a4bfda8d31a80"
+  },
+  {
+   "id": "pvp_music",
+   "version": "1.2.1",
+   "sha256": "e104de9f780747a502a12763ab6e7eadff8ca6ddede46d343e6ff478cad43e45"
+  },
+  {
+   "id": "quarryplus",
+   "version": "0.2.1",
+   "sha256": "c4c0d8789a84285fe5080ed6fa492e231687a428ed048038e5f0567583a5483b"
+  },
+  {
+   "id": "rangedpumps",
+   "version": "0.2.1",
+   "sha256": "b61abad979080a5e8d875b4693bf1ee98a07140a37194e61515b1e41a53e75c0"
+  },
+  {
+   "id": "redstonepen",
+   "version": "0.2.2",
+   "sha256": "5939bbdb85064f093d4cacb5f3fca50701e078c29e66cdad89f4983957cd5285"
+  },
+  {
+   "id": "refinedstorage",
+   "version": "0.2.6",
+   "sha256": "e512bed97134257730dce7f05fb885cabf1d29428c89c762da8b1b1ed2a6d4f5"
+  },
+  {
+   "id": "refinedtypes",
+   "version": "0.1.2",
+   "sha256": "9c1bbdbf8b70ddaac4b18bd2ad46f2408d6936aef26eb25647ef468d978283d2"
+  },
+  {
+   "id": "repeatable_trial_vaults",
+   "version": "0.2.0",
+   "sha256": "a7bf3a410d2a255ea639ba6b21c8801a5258ea278d9f10c1d2f1e1ede0abc1e1"
+  },
+  {
+   "id": "restrictions",
+   "version": "0.2.3",
+   "sha256": "827a35158b6ada57e1b2c0ae1b78e6baf4c89dad37299dd50a3f8aae3c50ec44"
+  },
+  {
+   "id": "rftoolsbase",
+   "version": "0.2.2",
+   "sha256": "5e920129588226265d794cde348b516fe736d5d301f0a7e64183efee8a3282b6"
+  },
+  {
+   "id": "rftoolsbuilder",
+   "version": "0.2.2",
+   "sha256": "33bc50a1ec760470941dc1e8e43bc5c130db7c95479ac76c7ea8aee61e8fe629"
+  },
+  {
+   "id": "rftoolspower",
+   "version": "0.1.3",
+   "sha256": "316c454ec341211d9b571ff18f4ed0429414ced1144f3b99d876cb9c829f77e6"
+  },
+  {
+   "id": "rftoolsstorage",
+   "version": "0.2.5",
+   "sha256": "09767aa6e005512ee93a4ba7f34005c03cb81d33eb5ba5528ed937c262a23189"
+  },
+  {
+   "id": "rftoolsutility",
+   "version": "0.2.7",
+   "sha256": "6c7a469b659062dafb352cdc30e1277d13cace6e9298691760922e60bceee537"
+  },
+  {
+   "id": "rightclickharvest",
+   "version": "0.4.0",
+   "sha256": "1b2a182f9626921aeabeb65e005b209102e228ff8bfbed43b867484581615ef8"
+  },
+  {
+   "id": "rootsclassic",
+   "version": "0.2.1",
+   "sha256": "b54e3cf3d49e41f0f4435d0f6ec5dbc562f793a99c349e6016efa0b176401411"
+  },
+  {
+   "id": "safespawn",
+   "version": "0.4.0",
+   "sha256": "8c54b1e7f151ebf6ada665cb3f76deca7d8ae3fa99bd6f387a6e1219772d3f02"
+  },
+  {
+   "id": "securecrops",
+   "version": "0.4.0",
+   "sha256": "3490b69757444f67f0144f78ba8c6fb00229bded08fe65b723d50697c0de4d7f"
+  },
+  {
+   "id": "securitycraft",
+   "version": "0.2.4",
+   "sha256": "9f9b242f1060b16bb952c6dc2ce264617551bc04e1f116b5df7bcdf60d80df9c"
+  },
+  {
+   "id": "sfm",
+   "version": "0.2.2",
+   "sha256": "1120c2c0b72380e46c19a5b7e8d7b1bea6cd7d9f69399cdb2ba90dbd686dd6f9"
+  },
+  {
+   "id": "silentgear",
+   "version": "0.2.0",
+   "sha256": "59cff66897eae1b2a18603afda37a61d70d2bd8abf648133c30a1c393a293759"
+  },
+  {
+   "id": "simplebackups",
+   "version": "0.2.1",
+   "sha256": "07f3175911349c910939aef16a68b7761c59086167123bfa949251334e1d669a"
+  },
+  {
+   "id": "skinsrestorer",
+   "version": "1.0.1",
+   "sha256": "56cbcc57d50b3fc61eda118405b05e2a9d6a7a25b11c5d04c366736e49b4697c"
+  },
+  {
+   "id": "solcarrot",
+   "version": "0.2.1",
+   "sha256": "6abd5230d0b1ba8a1d65c418c80e0569a1a4da286f53032ff3616a0d0c55495b"
+  },
+  {
+   "id": "sootychimneys",
+   "version": "0.5.0",
+   "sha256": "8a71e039725d8c58deb83c1e1ef55bfb42aaeefa09e1929ba620cf0ef1e07a18"
+  },
+  {
+   "id": "sophisticatedcore",
+   "version": "0.4.0",
+   "sha256": "c87420541f2bfc183b9e9c5b550b276d438fd78aefb6251917a86c1883bb7b0c"
+  },
+  {
+   "id": "statuseffectbars",
+   "version": "1.0.0",
+   "sha256": "03a527d835663653120d9b1a69496b29488454a2529ffc031362cb0c4288d5e0"
+  },
+  {
+   "id": "storagedelight",
+   "version": "0.2.1",
+   "sha256": "a6627a0fe5aa2424f3a5327c7e8cd401205580c4a86257402c62483b8a31eb2d"
+  },
+  {
+   "id": "sushigocrafting",
+   "version": "0.2.2",
+   "sha256": "0b2236fe5aa47d4b47ad12dbde508d6b039378c3e182d64ba3ea9c07f043ce02"
+  },
+  {
+   "id": "techreborn",
+   "version": "0.2.1",
+   "sha256": "9501c28cc438c48c9ce1644cd1c20ae0185227db8f1732a0ac7f6b5ac19a6192"
+  },
+  {
+   "id": "theurgy",
+   "version": "0.2.3",
+   "sha256": "0492c3c1cee1ba182ca40716fb4b697c59a5c2eaeb8f9377f83b8effd70e7bd1"
+  },
+  {
+   "id": "tiab",
+   "version": "0.2.3",
+   "sha256": "ebda411ce513a362eca2c6b317bb87d3d5155ce2eeb6d5da0cdddce8bd042087"
+  },
+  {
+   "id": "toms_storage",
+   "version": "0.3.0",
+   "sha256": "d1595d5e480f7be216ec2ed4586b5c26aa7132bd1796f63c3fa1bcc7b0cb640b"
+  },
+  {
+   "id": "toolbelt",
+   "version": "0.2.2",
+   "sha256": "8826c7dc92b2a32e41eb2f2a84faeea0f52016befc059f0f5fb267e559d5d2e0"
+  },
+  {
+   "id": "torchmaster",
+   "version": "0.2.1",
+   "sha256": "f73d7165c2571618e3cebceba4c7f8bffe4df4b0c370707f1cf1700d7ebba6ad"
+  },
+  {
+   "id": "transfer_labels",
+   "version": "0.2.2",
+   "sha256": "01c795c38c5d853c38850972fba9be84ce546a6d9936f0edf5f6070971531eab"
+  },
+  {
+   "id": "twilightforest",
+   "version": "0.2.2",
+   "sha256": "6fb14a143abde142e662c5a36afd96390f84972ecb6e108769133255a7c664a5"
+  },
+  {
+   "id": "undergarden",
+   "version": "0.2.2",
+   "sha256": "a5b229dee23571d672789d28e2b1c1a77b157be262744693937d7eac015996a2"
+  },
+  {
+   "id": "universalgrid",
+   "version": "0.2.0",
+   "sha256": "32dd62824fa8505bc97a31ef2c3bb591df0376f6fa7eed7a66b3644f93dcd002"
+  },
+  {
+   "id": "vastadventures",
+   "version": "0.10.2",
+   "sha256": "5d6b4b47ad6eb7d5809e29d5d2542dbf45d3b41a744488ddceab5ea79f46c849"
+  },
+  {
+   "id": "vastenchanting",
+   "version": "0.2.2",
+   "sha256": "efdab51b29cb998b881bb6f8404816d7e296ab1f899cae01a033edcafb153511"
+  },
+  {
+   "id": "vastrifts",
+   "version": "0.2.2",
+   "sha256": "2110add820fce3379fa2b9e1ffd5d0c5a5e1def674e222fc53a6e3ec018af5f4"
+  },
+  {
+   "id": "vastspawners",
+   "version": "0.3.2",
+   "sha256": "203cbbd411b6f863dd96a812485279f39b846ea04c18d1e25ba05cee862ba8ed"
+  },
+  {
+   "id": "vasttweaks",
+   "version": "1.2.3",
+   "sha256": "731428e777382b5e50cb06cc23634412a750857d435dacbc1ace9f106dcd5f03"
+  },
+  {
+   "id": "veinsweep",
+   "version": "0.6.5",
+   "sha256": "de8850b5e52b615d1da0a591106e9a74c1c6bbb2e51f95324a2d78c4e4a5cbdc"
+  },
+  {
+   "id": "wayfarer_stones_native",
+   "version": "0.8.1",
+   "sha256": "a8631e46fa22338940bce2e1e09155cd2d478bbb3a74ccdaf6770af87d3c15ff"
+  },
+  {
+   "id": "wstweaks",
+   "version": "0.2.0",
+   "sha256": "6fe415c05603223fd39b592e0711360c9830b8d64b3a21fa339501ade61924c5"
+  },
+  {
+   "id": "xnet",
+   "version": "0.2.2",
+   "sha256": "a6d46675313cbab1df291eddf3c84ad7465d651ba77e9dcfd9f47b39d3267d5f"
+  }
+ ]
+}

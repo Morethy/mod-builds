@@ -1,0 +1,130 @@
+name: corpus
+run-name: corpus ${{ inputs.ref || 'sync-sunrise-1' }} ${{ inputs.abi || 'arm64-v8a' }}
+# Whether a Starling commit still compiles the catalog's Horizon mods players had on Starling 0.9.0 (corpus/horizon.json,
+# their files in this repository's draft release, scripts/corpus.py): each one as the store would build it (its port
+# where one applies, else the game's Horizon layer), all in one `cargo check` in the sandbox beside a check base
+# (store_base.sh with CHECK, mod_lib.py `check`). The run fails when a mod of corpus/horizon-baseline.txt no longer
+# compiles: run it on a sync's or a release's commit before it lands, and on the branch players get weekly.
+#
+#   gh workflow run corpus.yml -R starling-client/mod-builds -f ref=sync-sunrise-1
+#
+# A run that compiles more than the baseline names them; its artifact holds the new baseline (ok.txt) to commit.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Starling's commit or branch
+        default: sync-sunrise-1
+      abi:
+        description: The ABI to check for
+        default: arm64-v8a
+      profile:
+        description: The Cargo profile (players' builds are fast)
+        type: choice
+        options: [fast, quick]
+        default: fast
+  # Weekly: the corpus's cache stays (GitHub drops one a week unused), and the branch is checked.
+  schedule:
+    - cron: '41 5 * * 1'
+permissions:
+  contents: read
+concurrency:
+  group: corpus-${{ inputs.ref || 'sync-sunrise-1' }}-${{ inputs.abi || 'arm64-v8a' }}
+  cancel-in-progress: true
+jobs:
+  # The corpus into the cache: a job that runs nothing of the mods, with the token that sees a draft release.
+  corpus:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    outputs:
+      key: ${{ steps.key.outputs.key }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - id: key
+        run: echo "key=corpus-$(sha256sum corpus/horizon.json | cut -c1-16)" >> "$GITHUB_OUTPUT"
+      - id: cached
+        uses: actions/cache/restore@v4
+        with:
+          key: ${{ steps.key.outputs.key }}
+          path: ~/corpus
+      - name: The corpus's files, from the draft release
+        if: steps.cached.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          mkdir -p ~/corpus "$RUNNER_TEMP/tar"
+          gh release download corpus-horizon --pattern horizon-corpus.tar --dir "$RUNNER_TEMP/tar"
+          tar -x -f "$RUNNER_TEMP/tar/horizon-corpus.tar" -C ~/corpus
+          python3 -I scripts/corpus.py verify ~/corpus
+      - if: steps.cached.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          key: ${{ steps.key.outputs.key }}
+          path: ~/corpus
+  check:
+    needs: corpus
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env:
+      REF: ${{ inputs.ref || 'sync-sunrise-1' }}
+      ABI: ${{ inputs.abi || 'arm64-v8a' }}
+      PROFILE: ${{ inputs.profile || 'fast' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: The commit
+        run: |
+          if [[ "$REF" =~ ^[0-9a-f]{40}$ ]]; then build=$REF; else
+            build=$(git ls-remote https://github.com/starling-client/starling "refs/heads/$REF" | cut -f1)
+          fi
+          [[ "$build" =~ ^[0-9a-f]{40}$ ]] || { echo "No such branch or commit: $REF"; exit 1; }
+          echo "BUILD=$build" >> "$GITHUB_ENV"
+          echo "Checking $REF at $build"
+      # Before the room is made, as store-base.yml: `room.sh clean` deletes the runner's Android SDK.
+      - name: The Android tools
+        run: |
+          (yes || true) | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$HOME/android" \
+            --install "ndk;28.2.13676358" "build-tools;35.0.0" "platforms;android-36" | tail -3
+      - name: Make room
+        run: bash scripts/room.sh clean
+      - name: The check base (the game's crates checked as the APK builds them)
+        env:
+          CHECK: '1'
+        run: bash scripts/store_base.sh
+      - uses: actions/cache/restore@v4
+        with:
+          key: ${{ needs.corpus.outputs.key }}
+          path: ~/corpus
+          fail-on-cache-miss: true
+      - name: Check every mod of the corpus, in the sandbox
+        env:
+          MOD_LIB_COMMAND: check
+          SANDBOX_SECONDS: '12000'
+        run: |
+          python3 -I scripts/corpus.py jobs jobs.json "$ABI"
+          bash scripts/sandbox.sh jobs.json ~/corpus result
+      - name: Against the baseline
+        run: |
+          set +e
+          python3 -I scripts/corpus.py compare result/check.json result/ok.txt > summary.md
+          code=$?
+          cat summary.md >> "$GITHUB_STEP_SUMMARY"
+          cat summary.md
+          exit $code
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: corpus-${{ env.ABI }}
+          path: |
+            result/check.json
+            result/ok.txt
+          retention-days: 30

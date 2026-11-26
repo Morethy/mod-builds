@@ -5,10 +5,15 @@ horizon-mod-host's native_libraries.rs): `lib<id>.so`, whose `horizon_native_bui
 "<build> <id> <version> <rustc release>", and a loader refuses a library of another build.
 
     python3 scripts/mod_lib.py build JOBS MODS RESULT   # BUILD, ABI, PROFILE, MOD_LIB_SOURCE
+    python3 scripts/mod_lib.py check JOBS MODS RESULT   # the same, a check base (store_base.sh CHECK)
 
 JOBS is a JSON list of {job, abi, sha256}; each job's .hmod is MODS/<sha256>.hmod. Its answer is
 RESULT/<job>.status.json and, when it built, RESULT/<job>.so; scripts/store.py publishes them from a job that runs
 nothing of the mods. This runs in the sandbox (scripts/sandbox.sh): no network, no token, nothing kept.
+
+`check` (corpus.yml, scripts/corpus.py) prepares each job's package as `build` does, then checks them all in one
+`android_native_sdk.py mods --check` (cargo check, no library): RESULT/check.json gives each job's answer (ok, failed
+with its first errors, or refused) and the game's. No mixin mod: a check base has no patch tool.
 
 The build is Starling's own, from the base's checkout (MOD_LIB_SOURCE): `tools/android_native_sdk.py mods OUT
 X.hmod --profile PROFILE --abi ABI`, with -C prefer-dynamic, so the game's crates are the ones the APK ships and only
@@ -38,6 +43,8 @@ UNPACKED = 64 << 20
 FILES = 4000
 # A mod's build, at most.
 SECONDS = int(os.environ.get("MOD_LIB_SECONDS", "600"))
+# `check`'s one cargo check of every job's package, the Horizon layer's rounds included.
+CHECK_SECONDS = int(os.environ.get("MOD_LIB_CHECK_SECONDS", "7200"))
 # The game's crates a mod may depend on: android_native_sdk.py points this one at the base's checkout.
 # Either naming: a game built on Sunrise (Starling since its sync with it) names its crates sunrise-*.
 API_PACKAGES = {"horizon-mod-api", "sunrise-mod-api"}
@@ -406,8 +413,78 @@ def said(result, job, status):
     return status
 
 
+def check_all(jobs, mods, source, result, build, profile, abi):
+    """`check`: each job's package as build_one prepares it, then all of them in one `android_native_sdk.py mods
+    --check` beside the base. RESULT/check.json: the game's answer, and each job's (state ok, failed with its first
+    errors, or refused, as build_one would have refused it)."""
+    work = result / "work"
+    shutil.rmtree(work, ignore_errors=True)
+    answers, packages = {}, {}
+    for row in jobs:
+        job, digest = row["job"], row["sha256"]
+        folder = work / job / "mod"
+        folder.mkdir(parents=True)
+        answer = answers[job] = {"source": digest, "abi": row["abi"]}
+        try:
+            hmod = mods / f"{digest}.hmod"
+            if store.job_of(store.sha256_of(hmod), row["abi"]) != job:
+                raise Refused("is not the file that was asked for")
+            try:
+                unpack(hmod, folder)
+            except zipfile.BadZipFile:
+                raise Refused("is not a .hmod")
+            mod, version, manifest = mod_of(folder)
+            answer.update(id=mod, version=version)
+            if (port := store.port_digest(mod)):
+                answer["port"] = port
+            cargo = native_of(folder, manifest)
+            check(manifest, cargo, folder, lock_crates(source))
+            if not sunrise_game(source):
+                raise Refused("is checked on a Sunrise-based game only")
+            package = adopted(hmod, folder, work / job / f"{mod}.smod", mod, has_layer(source))
+            if any(answers[other].get("id") == mod for other, _ in packages.values()):
+                raise Refused(f"is another version of {mod}, which this check has already")
+            packages[package.name] = (job, package)
+        except Refused as e:
+            answer.update(state="refused", error=f"This mod {e}.")
+        except (OSError, ValueError) as e:
+            answer.update(state="failed", error=f"The check went wrong: {e}")
+    game = {"ok": True, "first": []}
+    if packages:
+        out = work / "check"
+        command = [sys.executable, str(source / "tools" / "android_native_sdk.py"), "mods", str(out),
+                   *(str(package) for _, package in packages.values()), "--profile", profile, "--abi", abi, "--check"]
+        env = {**os.environ, "RUSTFLAGS": "-C prefer-dynamic", "HORIZON_GAME_BUILD_ID": build,
+               "SUNRISE_GAME_BUILD_ID": build}
+        record = None
+        try:
+            done = subprocess.run(command, cwd=source, env=env, capture_output=True, text=True, timeout=CHECK_SECONDS)
+            print(done.stdout[-6000:], done.stderr[-6000:], sep="\n", flush=True)
+            if (out / "check.json").is_file():
+                record = json.loads((out / "check.json").read_text())
+            else:
+                game = {"ok": False, "first": [(done.stderr or done.stdout or "The check failed.").strip()[-800:]]}
+        except subprocess.TimeoutExpired:
+            game = {"ok": False, "first": ["The check took too long."]}
+        if record is not None:
+            game = record.get("game", game)
+        for name, (job, _) in packages.items():
+            said_of = (record or {}).get("packages", {}).get(name)
+            if said_of is None:
+                answers[job].update(state="failed", error="The check said nothing of it.")
+            elif said_of.get("ok"):
+                answers[job].update(state="ok")
+            else:
+                answers[job].update(state="failed", error=said_of.get("refused") or f"{said_of.get('errors', 0)} errors",
+                                    first=said_of.get("first", []))
+    (result / "check.json").write_text(json.dumps({"build": build, "game": game, "jobs": answers}, indent=1) + "\n")
+    shutil.rmtree(work, ignore_errors=True)
+    print(f"check: {sum(1 for a in answers.values() if a.get('state') == 'ok')} of {len(answers)} compile"
+          + ("" if game.get("ok") else "; the game's crates do not"), flush=True)
+
+
 def main(argv):
-    if len(argv) != 5 or argv[1] != "build":
+    if len(argv) != 5 or argv[1] not in ("build", "check"):
         sys.exit(__doc__)
     build = os.environ.get("BUILD", "")
     if not store.BUILD.fullmatch(build):
@@ -417,9 +494,11 @@ def main(argv):
     jobs = json.loads(pathlib.Path(argv[2]).read_text())
     mods, result = pathlib.Path(argv[3]), pathlib.Path(argv[4])
     result.mkdir(parents=True, exist_ok=True)
+    jobs = [row for row in jobs
+            if store.JOB.fullmatch(str(row.get("job"))) and store.SHA256.fullmatch(str(row.get("sha256")))]
+    if argv[1] == "check":
+        return check_all(jobs, mods, source, result, build, profile, os.environ.get("ABI", "arm64-v8a"))
     for row in jobs:
-        if not (store.JOB.fullmatch(str(row.get("job"))) and store.SHA256.fullmatch(str(row.get("sha256")))):
-            continue
         build_one(row, mods, source, result, build, profile)
     shutil.rmtree(result / "work", ignore_errors=True)
 

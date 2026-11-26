@@ -7,8 +7,13 @@
 #
 # Given APK (a Nightly's APK on GitHub), each of the game's libraries built here is checked against the APK's: a mod
 # built beside libraries that differ from the phone's would not load there.
+#
+# With CHECK=1 (corpus.yml), a base for `cargo check` instead: the same checkout, staging and preparation, then
+# build_apk.py --check, which checks the game's crates with the APK's flags and fetches what the sandbox's checks
+# need; no library, no patch tool (no mixin mod is checked), nothing compared with an APK. Its cache is never written.
 set -euo pipefail
 [[ "${BUILD:-}" =~ ^[0-9a-f]{40}$ ]] || { echo "Not a build: ${BUILD:-}"; exit 1; }
+CHECK=${CHECK:-}
 # The profile players' Nightlies are built with (android.yml: `fast`, as releases), or `quick` for tests.
 [[ "${PROFILE:-}" =~ ^(fast|quick)$ ]] || { echo "Not a profile: ${PROFILE:-}"; exit 1; }
 triple=$(python3 -I -c 'import os, sys; sys.path.insert(0, "scripts"); import store; print(store.TARGETS[os.environ["ABI"]])')
@@ -50,8 +55,10 @@ if python3 tools/prebuilt_game.py --help 2>/dev/null | grep -q "stage"; then
   [ -f tools/android_widen.py ] && python3 tools/android_widen.py .
   mv "$root/staging/stage-in" .unstaged
   rm -rf "$root/staging"
-  CARGO_TARGET_DIR=target/host-tools cargo build -q --release -p sunrise-native-build --bin sunrise-android-patch
-  SUNRISE_ANDROID_PATCH_HOME=$PWD/.android-patch-home target/host-tools/release/sunrise-android-patch --tool
+  if [ -z "$CHECK" ]; then
+    CARGO_TARGET_DIR=target/host-tools cargo build -q --release -p sunrise-native-build --bin sunrise-android-patch
+    SUNRISE_ANDROID_PATCH_HOME=$PWD/.android-patch-home target/host-tools/release/sunrise-android-patch --tool
+  fi
   echo "The staged game and the patch tool: $(( $(date +%s) - started )) s"
 fi
 python3 tools/android_native_sdk.py prepare
@@ -65,8 +72,13 @@ started=$(date +%s)
 # android-activity and the like read the environment (cc's rerun-if-env-changed), so with a base built in the runner's,
 # every build a phone asked for compiled android-activity, cpal, horizon-android and horizon-client again, ten minutes
 # where the mod alone takes one (2026-11-22).
-env -i HOME="$HOME" PATH="$HOME/.cargo/bin:/usr/bin:/bin" LANG=C.UTF-8   ANDROID_HOME="$ANDROID_HOME" ANDROID_NDK_HOME="$ANDROID_NDK_HOME" HORIZON_GAME_BUILD_ID="$BUILD" SUNRISE_GAME_BUILD_ID="$BUILD"   RUSTFLAGS="-C prefer-dynamic"   python3 packaging/android/build_apk.py --abi "$ABI" --profile "$PROFILE" --library-only
+env -i HOME="$HOME" PATH="$HOME/.cargo/bin:/usr/bin:/bin" LANG=C.UTF-8   ANDROID_HOME="$ANDROID_HOME" ANDROID_NDK_HOME="$ANDROID_NDK_HOME" HORIZON_GAME_BUILD_ID="$BUILD" SUNRISE_GAME_BUILD_ID="$BUILD"   RUSTFLAGS="-C prefer-dynamic"   python3 packaging/android/build_apk.py --abi "$ABI" --profile "$PROFILE" --library-only ${CHECK:+--check}
 echo "The game's build: $(( $(date +%s) - started )) s"
+if [ -n "$CHECK" ]; then
+  mv "$HOME/.cargo" "$root/cargo"
+  du -sh "$root/source/target" "$root/cargo"
+  exit 0
+fi
 
 # The game's libraries as the APK ships them (build_apk.py's entry library and `rust_dylibs`, stripped, with the
 # emulated TLS runtime libemutls.so every one of them and every mod needs), by the names build_apk.py gives them:
