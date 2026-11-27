@@ -34,13 +34,14 @@ import time
 import urllib.error
 import urllib.request
 
+import registry_v2
+
 SCHEMA = 1
 STORE = "store"
 BUILDS = "builds.json"
 INDEX = "index.json"
 CATALOG = "https://horizon-rust.github.io/horizon-mods/index.json"
 # Sunrise's own catalog, which a game built on Sunrise lists beside Horizon's.
-SUNRISE_CATALOG = "https://sunrise-org.github.io/sunrise-mods/index.json"
 # Each ABI the store builds for, and the Rust target its SDK slices are named after.
 TARGETS = {
     "arm64-v8a": "aarch64-linux-android",
@@ -439,8 +440,9 @@ def main(argv):
     elif command == "plan":
         # Horizon's index has been gone since GitHub flagged its organisation (26/11), and Starling
         # takes no new Horizon mods: a catalog that isn't there plans nothing, Sunrise's still does.
+        # Sunrise serves only its signed v2 index since 26/11 (registry_v2.py), checked before it is read.
         catalog = fetch_json(CATALOG) or {}
-        other = fetch_json(SUNRISE_CATALOG) or {}
+        other = registry_v2.fetch_catalog(lambda url: fetch(url, 64 << 20)) or {}
         catalog = {**catalog, "projects": [*catalog.get("projects", []), *other.get("projects", [])],
                    "revoked": [*catalog.get("revoked", []), *other.get("revoked", [])]}
         known = build_row(build)
