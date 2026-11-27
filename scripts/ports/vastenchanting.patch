@@ -75,7 +75,7 @@ index 5832413..616831d 100644
  }
  
 diff --git a/src/lib.rs b/src/lib.rs
-index 3650b5c..8e6d1e1 100644
+index 3650b5c..0465dba 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -8,6 +8,9 @@
@@ -96,27 +96,31 @@ index 3650b5c..8e6d1e1 100644
 +use crate::starling_menu::MenuButtonEvent;
  use mod_api::{
      self, AnvilCraftPostEvent, AnvilUpdateEvent, BlockDropsEvent, BlockEntityPart, BlockEntityTickEvent,
-     BlockEntityTicksEvent, BlockPart, ClientHost, Flow, Hooks, Host, HostSide, Identifier, ItemKey, ItemPart,
+-    BlockEntityTicksEvent, BlockPart, ClientHost, Flow, Hooks, Host, HostSide, Identifier, ItemKey, ItemPart,
 -    LevelHost, MenuButtonEvent, MenuContainer, MenuPart, MenuSlotRulesEvent, ModContainer, Registrar,
 -    RegistrationContext, Screen, ScreenClickEvent, ScreenDrawEvent, ScreenEvent, ScreenMouseScrolledPreEvent,
 -    ScreenTooltipEvent, ServerHost, TooltipEvent,
++    BlockPart, ClientHost, Flow, Hooks, Host, HostSide, Identifier, ItemKey, ItemPart,
 +    LevelHost, MenuContainer, MenuPart, MenuSlotRulesEvent, ModContainer, Registrar,
 +    RegistrationContext, ScreenMouseScrolledPreEvent,
 +    ServerHost, TooltipEvent,
  };
  use std::sync::OnceLock;
  
-@@ -73,28 +78,34 @@ impl BlockEntityPart for TablePart {
-         event.ticks = true;
-     }
+@@ -69,32 +74,34 @@ impl BlockPart for TablePart {}
  
--    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
--        table::tick(host, event);
+ #[mod_api::sunrise_part]
+ impl BlockEntityPart for TablePart {
+-    fn block_entity_ticks(&self, _host: &dyn Host, event: &mut BlockEntityTicksEvent<'_>) {
+-        event.ticks = true;
 +    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
 +        crate::starling_tick::run(event, |host, entity, pos| table::tick(host, entity, pos));
      }
  
-+
+-    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        table::tick(host, event);
+-    }
+ 
 +
 +
 +
@@ -146,19 +150,22 @@ index 3650b5c..8e6d1e1 100644
      fn screen_tooltip(&self, host: &dyn ClientHost, event: &mut ScreenTooltipEvent<'_>) {
          if event.block == table::TABLE {
              screen::table_tooltip(host, event);
-@@ -116,28 +127,36 @@ impl BlockEntityPart for ArchivePart {
-         event.ticks = true;
-     }
+@@ -112,32 +119,36 @@ impl BlockPart for ArchivePart {}
  
--    fn block_entity_tick(&self, _host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
--        archive::tick(event, self.cap);
+ #[mod_api::sunrise_part]
+ impl BlockEntityPart for ArchivePart {
+-    fn block_entity_ticks(&self, _host: &dyn Host, event: &mut BlockEntityTicksEvent<'_>) {
+-        event.ticks = true;
 +    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
 +        crate::starling_tick::run(event, |_host, entity, tick_pos| {
 +            archive::tick(entity, tick_pos, self.cap);
 +        });
      }
  
-+
+-    fn block_entity_tick(&self, _host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
+-        archive::tick(event, self.cap);
+-    }
+ 
 +
 +
 +
@@ -188,7 +195,23 @@ index 3650b5c..8e6d1e1 100644
      fn screen_tooltip(&self, host: &dyn ClientHost, event: &mut ScreenTooltipEvent<'_>) {
          if archive::cap_of(event.block).is_some() {
              screen::archive_tooltip(host, event);
-@@ -202,7 +221,7 @@ fn tooltip_items() -> Vec<String> {
+@@ -189,8 +200,13 @@ struct Tooltip {
+ 
+ #[mod_api::sunrise_part]
+ impl ItemPart for Tooltip {
+-    fn tooltip(&self, _host: &dyn ClientHost, event: &mut TooltipEvent<'_>) {
+-        tooltip::lines(&self.id, event.stack, event.lines);
++    fn tooltip(&self, _host: &dyn ClientHost, event: &mut TooltipEvent<'_, '_>) {
++        // The event's lines are a checked list now: the tooltip's go in one by one.
++        let mut lines = Vec::new();
++        tooltip::lines(&self.id, event.stack, &mut lines);
++        for line in lines {
++            let _ = event.lines.push(line);
++        }
+     }
+ }
+ 
+@@ -202,7 +218,7 @@ fn tooltip_items() -> Vec<String> {
  
  /// The container of a block with a menu: `slots` slots, `inputs` reached by hoppers from every side.
  fn container(slots: usize, inputs: Vec<usize>, menu: &str) -> ModContainer {
@@ -197,7 +220,7 @@ index 3650b5c..8e6d1e1 100644
  }
  
  #[derive(Default)]
-@@ -268,7 +287,7 @@ impl Hooks for VastEnchanting {
+@@ -268,7 +284,7 @@ impl Hooks for VastEnchanting {
              _ => return Flow::Continue,
          };
          let nbt = event.block_entity.and_then(|e| level.block_entity_data(e));
@@ -652,7 +675,7 @@ index 0000000..16e2c71
 +    }
 +}
 diff --git a/src/table.rs b/src/table.rs
-index 63fcad4..254deba 100644
+index 63fcad4..b55ade0 100644
 --- a/src/table.rs
 +++ b/src/table.rs
 @@ -7,8 +7,9 @@ use crate::data::{ENCHANTMENTS, INFUSIONS};
@@ -666,6 +689,15 @@ index 63fcad4..254deba 100644
      Tag,
  };
  
+@@ -38,7 +39,7 @@ impl Items for HostItems<'_> {
+             Some(tag) => (|| {
+                 let key = parse_item(self.0, item)?;
+                 let tags = self.0.tags();
+-                tags.is_in_tag(key, tags.key(&Identifier::parse(tag).ok()?)?)
++                tags.is_in_tag(key, tags.key(&Identifier::parse(tag).ok()?)?.typed())
+             })()
+             .unwrap_or(false),
+             None => *entry == item,
 @@ -55,7 +56,7 @@ fn input_enchantments(stack: &ItemStack) -> Vec<String> {
  pub fn stats_at(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> Stats {
      enchant::gather(

@@ -1,5 +1,5 @@
 diff --git a/src/lib.rs b/src/lib.rs
-index eca9a7a..101affd 100644
+index eca9a7a..e5685fd 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -26,7 +26,7 @@ use mod_api::{
@@ -38,6 +38,15 @@ index eca9a7a..101affd 100644
              return;
          };
          let Some(player) = host.players().acting_player() else {
+@@ -188,7 +188,7 @@ impl Hooks for Mod {
+     /// The world's `mob_drops` rule is read here, not trusted to the engine: the engine clears
+     /// the mob's loot table when the rule is off but still dispatches this hook and spawns what
+     /// it returns, so a drop table of the port's own would ignore `/gamerule mob_drops false`.
+-    fn loot_drops(&self, host: &mut dyn ServerHost, event: &mut LootDropsEvent<'_>) {
++    fn loot_drops(&self, host: &mut dyn ServerHost, event: &mut LootDropsEvent<'_, '_>) {
+         let context = event.context;
+         let Some((entity, kind)) = context.entity else {
+             return;
 @@ -212,7 +212,7 @@ impl Hooks for Mod {
              .map_or("", category_name);
          let drawn = level.with_random(&mut *host, |random| {
@@ -47,6 +56,15 @@ index eca9a7a..101affd 100644
              })
          });
          let Some(drops) = drawn else {
+@@ -245,7 +245,7 @@ impl ItemPart for MiniHeartPart {
+     }
+ 
+     /// `Item.getUseAnimation`: the first-person eat pose (`UseAnim.EAT`).
+-    fn use_animation(&self, _host: &dyn ClientHost, event: &mut UseAnimationEvent<'_>) {
++    fn use_animation(&self, _host: &dyn mod_api::Host, event: &mut UseAnimationEvent<'_>) {
+         *event.animation = UseAnimation::Eat;
+     }
+ }
 @@ -253,12 +253,12 @@ impl ItemPart for MiniHeartPart {
  /// The canisters one player carries, from their main inventory and off hand. The server's slot
  /// list is the authority for a host and a guest alike.

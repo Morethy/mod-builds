@@ -1,5 +1,5 @@
 diff --git a/src/lib.rs b/src/lib.rs
-index 1dbd2fd..c94336a 100644
+index 1dbd2fd..0685be2 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -114,7 +114,7 @@ fn stack_carried(stack: &ItemStack) -> Option<Carried> {
@@ -29,6 +29,33 @@ index 1dbd2fd..c94336a 100644
          let _ = living.set_hand_item(host, Hand::Main, held);
      }
      let _ = player.tell(host, stat_line(m, logic::shown(m, value), "gold", "yellow"));
+@@ -165,7 +165,7 @@ struct ModifierPart {
+ 
+ #[mod_api::sunrise_part]
+ impl ItemPart for ModifierPart {
+-    fn tooltip(&self, _host: &dyn mod_api::ClientHost, event: &mut TooltipEvent<'_>) {
++    fn tooltip(&self, _host: &dyn mod_api::ClientHost, event: &mut TooltipEvent<'_, '_>) {
+         let m = self.modifier;
+         let mut line = coloured(tr("modifier"), "gray")
+             .append(Text::literal(": "))
+@@ -216,7 +216,7 @@ impl ItemPart for SpawnerItemPart {
+         write(host, level, event.pos, nbt);
+     }
+ 
+-    fn tooltip(&self, _host: &dyn mod_api::ClientHost, event: &mut TooltipEvent<'_>) {
++    fn tooltip(&self, _host: &dyn mod_api::ClientHost, event: &mut TooltipEvent<'_, '_>) {
+         // What placing it would put (the mob's registration is the server's to check).
+         let Some(carried) = stack_carried(event.stack).and_then(|c| logic::sanitize(c, |_| true)) else { return };
+         let name = Text::translate(format!("entity.{}", carried.entity.replace(':', ".")), Vec::new());
+@@ -233,7 +233,7 @@ struct SpawnerBlockPart;
+ 
+ #[mod_api::sunrise_part]
+ impl BlockPart for SpawnerBlockPart {
+-    fn neighbor_changed(&self, _level: &mut dyn LevelTicksHost, event: &mut NeighborChangedEvent) {
++    fn neighbor_changed(&self, _level: &mut dyn mod_api::LevelWriteHost, event: &mut NeighborChangedEvent) {
+         let at = (event.dimension.key().id(), [event.pos.x, event.pos.y, event.pos.z]);
+         if let Ok(mut pending) = NEIGHBOURED.lock()
+             && !pending.contains(&at)
 @@ -319,7 +319,7 @@ impl Hooks for VastSpawners {
  
      /// A spawner mined with Silk Touch drops itself, with the mod's record of it (none for a spawner without a mob).
@@ -38,7 +65,7 @@ index 1dbd2fd..c94336a 100644
              return Flow::Continue;
          }
          let Some(keys) = KEYS.get() else { return Flow::Continue };
-@@ -334,7 +334,7 @@ impl Hooks for VastSpawners {
+@@ -334,17 +334,17 @@ impl Hooks for VastSpawners {
          }
          let p = event.pos;
          let at = [f64::from(p.x) + 0.5, f64::from(p.y) + 0.5, f64::from(p.z) + 0.5];
@@ -47,7 +74,10 @@ index 1dbd2fd..c94336a 100644
          Flow::Continue
      }
  
-@@ -344,7 +344,7 @@ impl Hooks for VastSpawners {
+     /// A mob from a spawner with echoes drops its loot that many more times.
+-    fn loot_drops(&self, host: &mut dyn ServerHost, event: &mut LootDropsEvent<'_>) {
++    fn loot_drops(&self, host: &mut dyn ServerHost, event: &mut LootDropsEvent<'_, '_>) {
+         let context = event.context;
          let Some((id, _)) = context.entity.filter(|_| !context.used && context.damage_source.is_some()) else { return };
          let echoes = host
              .entity(id)

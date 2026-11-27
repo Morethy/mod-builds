@@ -1,5 +1,5 @@
 diff --git a/src/lib.rs b/src/lib.rs
-index 4bceee6..87e7554 100644
+index 4bceee6..05b5c11 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -114,11 +114,11 @@ impl Hooks for Mod {
@@ -10,8 +10,9 @@ index 4bceee6..87e7554 100644
 +        let Some(block) = level.block(reader, pos).map(|k| k.id(reader).unwrap_or_default()) else {
              return Flow::Continue;
          };
-         let read = |key: &str| level.block_property(reader, pos, key);
+-        let read = |key: &str| level.block_property(reader, pos, key);
 -        let Some(replant) = replant_state(&block, &read) else {
++        let read = |key: &str| level.block_property(reader, pos, key).map(str::to_owned);
 +        let Some(replant) = replant_state(block, &read) else {
              return Flow::Continue;
          };

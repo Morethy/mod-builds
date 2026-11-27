@@ -1,9 +1,18 @@
 diff --git a/src/lib.rs b/src/lib.rs
-index 688b428..2efab4c 100644
+index 688b428..0da408c 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -54,7 +54,7 @@ impl BlockPart for ResetVault {
+@@ -49,12 +49,15 @@ struct ResetVault;
+ impl BlockPart for ResetVault {
+     fn use_item_on(
+         &self,
+-        host: &mut dyn ServerHost,
++        side: mod_api::HostSide<'_>,
+         event: &mut UseItemOnEvent<'_>,
      ) -> Option<InteractionResult> {
++        let mod_api::HostSide::Server(host) = side else {
++            return None;
++        };
          let click = event.click;
          let stack = click.stack?;
 -        let item = stack.item().id(host);
@@ -11,11 +20,13 @@ index 688b428..2efab4c 100644
          let player = host.player(click.player)?;
          let level = host.level(click.dimension.key().id())?;
          let vault = host.block_entity(level, click.pos)?;
-@@ -95,7 +95,7 @@ struct ResetKeyTooltip;
+@@ -94,8 +97,8 @@ struct ResetKeyTooltip;
+ 
  #[mod_api::sunrise_part]
  impl ItemPart for ResetKeyTooltip {
-     fn tooltip(&self, host: &dyn ClientHost, event: &mut TooltipEvent<'_>) {
+-    fn tooltip(&self, host: &dyn ClientHost, event: &mut TooltipEvent<'_>) {
 -        if !runtime::tooltip_applies(&event.stack.item().id(host)) {
++    fn tooltip(&self, host: &dyn ClientHost, event: &mut TooltipEvent<'_, '_>) {
 +        if !runtime::tooltip_applies(event.stack.item().id(host).unwrap_or_default()) {
              return;
          }

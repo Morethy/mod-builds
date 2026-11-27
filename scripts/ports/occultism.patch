@@ -1,5 +1,5 @@
 diff --git a/src/lib.rs b/src/lib.rs
-index 1f02f2b..4750ced 100644
+index 1f02f2b..a8fa488 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -29,12 +29,10 @@
@@ -83,7 +83,7 @@ index 1f02f2b..4750ced 100644
      /// A right click on a block: chalk paints a spirit fire, a lighter strikes the datura
      /// lying on the clicked block alight.
      fn right_click_block(&self, host: HostSide<'_>, event: &mut RightClickBlockEvent<'_>) -> Flow {
-@@ -112,16 +87,24 @@ impl Hooks for Mod {
+@@ -112,21 +87,31 @@ impl Hooks for Mod {
      /// Whether the server tells this mod any entity's tick: without this answer none is told.
      fn entity_tick_listened(
          &self,
@@ -112,11 +112,979 @@ index 1f02f2b..4750ced 100644
      }
  
      /// A block broke and the game built its drops: a hand-broken grass carries the jar's 2%
+     /// chance of a datura seed (upstream's `add_item` loot modifier).
+-    fn loot_drops(&self, host: &mut dyn ServerHost, event: &mut LootDropsEvent<'_>) {
++    fn loot_drops(&self, host: &mut dyn ServerHost, event: &mut LootDropsEvent<'_, '_>) {
+         support::loot_drops(host, event);
+     }
+ }
++
++mod starling_sync2;
+diff --git a/occultism/src/starling_sync2.rs b/src/starling_sync2.rs
+new file mode 100644
+index 0000000..3456b3f
+--- /dev/null
++++ b/src/starling_sync2.rs
+@@ -0,0 +1,291 @@
++//! Starling's port to sync 2 of Sunrise's API (ed6772e2118): what changed shape around the mod's
++//! own code, so the code stays as written. The same file in every port that needs it
++//! (starling-ports/_shared/starling_sync2.rs).
++#![allow(dead_code)]
++
++use core::ops::ControlFlow;
++
++#[path = "starling_sync2_files.rs"]
++mod files;
++pub(crate) use files::*;
++#[path = "starling_sync2_settings.rs"]
++mod settings;
++pub(crate) use settings::*;
++#[path = "starling_sync2_menus.rs"]
++mod menus;
++pub(crate) use menus::*;
++#[path = "starling_sync2_hud.rs"]
++mod hud;
++pub(crate) use hud::*;
++#[path = "starling_sync2_attachments.rs"]
++mod attachments;
++pub(crate) use attachments::*;
++use std::sync::atomic::{AtomicBool, Ordering};
++
++/// Horizon's world phases, which Sunrise splits into server hooks (debt-re-wl): `server_started`
++/// (the world opened) and `server_stopped` (it fires once at the end of every run, a failed open
++/// included). The old `world_lifecycle` body runs from both with the phase rebuilt: the open, and
++/// at the stop a close when the world had opened, or a failed open when it never did. A failed
++/// close is not told apart from a final one (the stop says neither); mods handle both alike.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum WorldPhase {
++    WorldOpenReady,
++    WorldOpenFailed,
++    WorldCloseFinal,
++    WorldCloseFailed,
++}
++
++/// Horizon's `WorldLifecycleEvent`: the phase (its other fields no port read).
++pub(crate) struct WorldLifecycleEvent<'a> {
++    pub phase: WorldPhase,
++    _lent: core::marker::PhantomData<&'a ()>,
++}
++
++/// Whether `server_started` came since the last `server_stopped`: the open did not fail.
++static WORLD_OPEN: AtomicBool = AtomicBool::new(false);
++
++/// The phase `server_started` brings.
++pub(crate) fn world_started() -> WorldLifecycleEvent<'static> {
++    WORLD_OPEN.store(true, Ordering::Relaxed);
++    WorldLifecycleEvent { phase: WorldPhase::WorldOpenReady, _lent: core::marker::PhantomData }
++}
++
++/// The phase `server_stopped` brings: a close, or a failed open.
++pub(crate) fn world_stopped() -> WorldLifecycleEvent<'static> {
++    let phase = if WORLD_OPEN.swap(false, Ordering::Relaxed) {
++        WorldPhase::WorldCloseFinal
++    } else {
++        WorldPhase::WorldOpenFailed
++    };
++    WorldLifecycleEvent { phase, _lent: core::marker::PhantomData }
++}
++
++/// A command executor's answer as Sunrise takes it now: `Ok(n)` where it answered `Some(n)`, and a
++/// failure with no line of its own where it answered `None` (the mod said why itself, if at all).
++pub(crate) fn ok(answer: Option<i32>) -> Result<i32, Box<mod_api::Text>> {
++    answer.ok_or_else(|| Box::new(mod_api::Text::default()))
++}
++
++/// `Levels::list_levels`, which Sunrise lends as a visit now (`visit_levels`): the loaded server
++/// levels in creation order, none without a world or with the service unavailable, as before.
++pub(crate) trait LevelsList {
++    fn list_levels(&self) -> Vec<mod_api::LevelRef>;
++}
++
++/// The host's block and entity writes Sunrise moved onto the level they act in (debt-p3-07), on
++/// the level the old calls wrote: the one the hook runs in (`ServerHost::dimension`, "for a hook
++/// that isn't told which it runs in"), or the one named.
++pub(crate) trait HostLevelWrites {
++    /// `Level.setBlock` with `UPDATE_ALL`: true when the block changed.
++    fn set_block_property(&mut self, pos: [i32; 3], key: &str, value: &str) -> bool;
++    /// The same with `Level.setBlock`'s raw `flags`.
++    fn set_block_property_with(&mut self, pos: [i32; 3], key: &str, value: &str, flags: i32)
++    -> bool;
++    /// `Level.sendBlockUpdated` for the block entity at `pos`; nothing for an unloaded one.
++    fn block_entity_sync(&mut self, pos: [i32; 3]);
++    /// `/summon <kind> <pos> <nbt>` in `dimension`: the entity's id, None where it wasn't made.
++    fn summon(&mut self, dimension: &str, kind: &str, pos: [f64; 3], nbt: mod_api::Compound)
++    -> Option<u32>;
++}
++
++impl HostLevelWrites for dyn mod_api::ServerHost + '_ {
++    fn set_block_property(&mut self, pos: [i32; 3], key: &str, value: &str) -> bool {
++        HostLevelWrites::set_block_property_with(self, pos, key, value, 3)
++    }
++
++    fn set_block_property_with(
++        &mut self,
++        pos: [i32; 3],
++        key: &str,
++        value: &str,
++        flags: i32,
++    ) -> bool {
++        let Some(level) = self.level(self.dimension()) else {
++            return false;
++        };
++        let flags = mod_api::BlockUpdateFlags::from_bits_retain(flags);
++        level.set_block_property(self, pos, key, value, flags) == Ok(true)
++    }
++
++    fn block_entity_sync(&mut self, pos: [i32; 3]) {
++        let Some(level) = self.level(self.dimension()) else {
++            return;
++        };
++        if let Some(holder) = self.block_entity(level, pos) {
++            let _ = holder.sync(self);
++        }
++    }
++
++    fn summon(
++        &mut self,
++        dimension: &str,
++        kind: &str,
++        pos: [f64; 3],
++        nbt: mod_api::Compound,
++    ) -> Option<u32> {
++        let level = self.level(dimension)?;
++        level.summon(self, kind, pos, nbt).ok().flatten().map(|entity| entity.id())
++    }
++}
++
++/// The placer's look a `PlacementContext` gave as fields, which Sunrise keeps in its `source` now
++/// (placement-source): a player's, or for a directional placement (a dispenser) the direction it
++/// acts along, as vanilla's `DirectionalPlaceContext` answers (horizontal facing, North when it
++/// acts up or down; looking down or up; never sneaking).
++pub(crate) trait PlacementLook {
++    fn yaw(&self) -> f32;
++    fn pitch(&self) -> f32;
++    fn sneaking(&self) -> bool;
++}
++
++impl PlacementLook for mod_api::PlacementContext {
++    fn yaw(&self) -> f32 {
++        match self.source {
++            mod_api::PlacementSource::Player { yaw, .. } => yaw,
++            mod_api::PlacementSource::Directional { direction } => match direction {
++                mod_api::Direction::South => 0.0,
++                mod_api::Direction::West => 90.0,
++                mod_api::Direction::East => -90.0,
++                _ => 180.0,
++            },
++            _ => 0.0,
++        }
++    }
++
++    fn pitch(&self) -> f32 {
++        match self.source {
++            mod_api::PlacementSource::Player { pitch, .. } => pitch,
++            mod_api::PlacementSource::Directional { direction } => match direction {
++                mod_api::Direction::Down => 90.0,
++                mod_api::Direction::Up => -90.0,
++                _ => 0.0,
++            },
++            _ => 0.0,
++        }
++    }
++
++    fn sneaking(&self) -> bool {
++        matches!(self.source, mod_api::PlacementSource::Player { sneaking: true, .. })
++    }
++}
++
++/// `block_in_tag(block, "ns:tag")` on the host, which Sunrise reads through a resolved tag key now
++/// (debt-p3-08: `host.tags().block_in_tag(block, key)`): None where the name doesn't parse or the
++/// tags are unavailable, as an unknown tag was.
++pub(crate) trait HostTags {
++    fn block_in_tag(&self, block: mod_api::BlockKey, tag: &str) -> Option<bool>;
++}
++
++impl<H: mod_api::Host + ?Sized> HostTags for H {
++    fn block_in_tag(&self, block: mod_api::BlockKey, tag: &str) -> Option<bool> {
++        let id = mod_api::Identifier::parse(tag).ok()?;
++        let key = self.tags().key(&id)?;
++        self.tags().block_in_tag(block, key.typed())
++    }
++}
++
++/// `level.block_in_tag(block, "ns:tag")` on a level host, as `HostTags` on a host (debt-p3-08:
++/// `level.tags().block_in_tag(block, key)`).
++pub(crate) trait LevelTags {
++    fn block_in_tag(&self, block: mod_api::BlockKey, tag: &str) -> Option<bool>;
++}
++
++impl LevelTags for dyn mod_api::LevelHost + '_ {
++    fn block_in_tag(&self, block: mod_api::BlockKey, tag: &str) -> Option<bool> {
++        let id = mod_api::Identifier::parse(tag).ok()?;
++        let key = self.tags().key(&id)?;
++        self.tags().block_in_tag(block, key.typed())
++    }
++}
++
++/// `retain` on an event's checked list (drops and the like were a `Vec`): the entries `keep`
++/// refuses go, from the last, so the indices of those left stay as they were. An entry that can't
++/// be read is kept, as the list keeps it.
++pub(crate) trait HookListRetain<T> {
++    fn retain(&mut self, keep: impl FnMut(&T) -> bool);
++}
++
++impl<T, E: core::fmt::Debug> HookListRetain<T> for mod_api::HookList<'_, T, E> {
++    fn retain(&mut self, mut keep: impl FnMut(&T) -> bool) {
++        for index in (0..self.len()).rev() {
++            if self.get(index).is_some_and(|entry| !keep(&entry)) {
++                self.remove(index);
++            }
++        }
++    }
++}
++
++/// The level's shape reads as lists, which Sunrise lends as visits now (debt-p3-53): a block's
++/// local boxes (`visit_block_shape`) and the world-space collision boxes in an area
++/// (`visit_block_collisions`). None where the query was refused, as before.
++pub(crate) trait LevelShapes {
++    fn block_shape(
++        self,
++        host: &dyn mod_api::Host,
++        state: mod_api::BlockState,
++        pos: [i32; 3],
++        kind: mod_api::BlockShapeKind,
++    ) -> Option<Vec<[f64; 6]>>;
++    fn collision_boxes(self, host: &dyn mod_api::Host, area: [f64; 6]) -> Option<Vec<[f64; 6]>>;
++}
++
++impl LevelShapes for mod_api::LevelRef {
++    fn block_shape(
++        self,
++        host: &dyn mod_api::Host,
++        state: mod_api::BlockState,
++        pos: [i32; 3],
++        kind: mod_api::BlockShapeKind,
++    ) -> Option<Vec<[f64; 6]>> {
++        let mut boxes = Vec::new();
++        self.visit_block_shape(host, state, pos, kind, &mut |shape_box| {
++            boxes.push(shape_box);
++            ControlFlow::Continue(())
++        })?;
++        Some(boxes)
++    }
++
++    fn collision_boxes(self, host: &dyn mod_api::Host, area: [f64; 6]) -> Option<Vec<[f64; 6]>> {
++        let mut boxes = Vec::new();
++        self.visit_block_collisions(host, area, &mut |shape| {
++            boxes.extend(shape.boxes());
++            ControlFlow::Continue(())
++        })?;
++        Some(boxes)
++    }
++}
++
++/// `living.effects(host)`: the active effects as a list, which Sunrise lends as a visit now
++/// (`visit_effects`); None where the read was refused.
++pub(crate) trait LivingEffects {
++    fn effects(self, host: &dyn mod_api::Host) -> Option<Vec<mod_api::ActiveEffect>>;
++}
++
++impl LivingEffects for mod_api::LivingRef {
++    fn effects(self, host: &dyn mod_api::Host) -> Option<Vec<mod_api::ActiveEffect>> {
++        let mut effects = Vec::new();
++        self.visit_effects(host, &mut |effect| {
++            effects.push(effect);
++            ControlFlow::Continue(())
++        })
++        .ok()?;
++        Some(effects)
++    }
++}
++
++/// A stack written where Sunrise takes `Option<ItemStack>` now (`set_stack`): an empty one is the
++/// empty slot it meant.
++pub(crate) fn non_empty(stack: mod_api::ItemStack) -> Option<mod_api::ItemStack> {
++    (stack.count() > 0).then_some(stack)
++}
++
++impl LevelsList for dyn mod_api::Levels + '_ {
++    fn list_levels(&self) -> Vec<mod_api::LevelRef> {
++        let mut levels = Vec::new();
++        let _ = self.visit_levels(&mut |level| {
++            levels.push(level);
++            ControlFlow::Continue(())
++        });
++        levels
++    }
++}
+diff --git a/occultism/src/starling_sync2_attachments.rs b/src/starling_sync2_attachments.rs
+new file mode 100644
+index 0000000..15d8d61
+--- /dev/null
++++ b/src/starling_sync2_attachments.rs
+@@ -0,0 +1,96 @@
++//! Horizon's `static X: AttachmentType<T> = AttachmentType { .. }` attachments, which Sunrise
++//! types through the `AttachmentKey<T>` its registration returns (debt-3r-typed-attachments): the
++//! static stays the mod's description of the attachment, `register_attachment` registers it from
++//! that description and keeps the key by id, and the static's reads and writes go through the key.
++//! They take the host now where they took `host.attachments()`.
++
++use std::any::Any;
++use std::sync::Mutex;
++
++/// Horizon's attachment description: the same fields the mods' statics fill.
++pub(crate) struct AttachmentType<T: 'static> {
++    pub namespace: &'static str,
++    pub name: &'static str,
++    pub default: fn() -> T,
++    pub codec: Option<mod_api::AttachmentCodec<T>>,
++    pub copy_on_death: bool,
++    pub sync: bool,
++}
++
++/// The keys registered, by `namespace:name`.
++static KEYS: Mutex<Vec<(String, Box<dyn Any + Send + Sync>)>> = Mutex::new(Vec::new());
++
++/// Registers `attachment` as its static describes it (the codec saves it, and syncs it when the
++/// static says so; copied on death when it says so), keeping the key for its reads and writes.
++pub(crate) fn register_attachment<T: Send + Sync + 'static>(
++    r: &mut (dyn mod_api::Registrar + '_),
++    attachment: &'static AttachmentType<T>,
++) -> Result<(), String> {
++    let id: &'static str = Box::leak(format!("{}:{}", attachment.namespace, attachment.name).into_boxed_str());
++    let mut descriptor = mod_api::AttachmentDescriptor::new(id, attachment.default);
++    if let Some(codec) = attachment.codec {
++        descriptor = descriptor.serialize(codec);
++        if attachment.sync {
++            descriptor = descriptor.sync(codec);
++        }
++        if attachment.copy_on_death {
++            descriptor = descriptor.copy_on_death();
++        }
++    }
++    let key = r.register_attachment_type(descriptor)?;
++    let mut keys = KEYS.lock().unwrap_or_else(|e| e.into_inner());
++    keys.retain(|(kept, _)| kept != id);
++    keys.push((id.to_owned(), Box::new(key)));
++    Ok(())
++}
++
++impl<T: Clone + Send + Sync + 'static> AttachmentType<T> {
++    /// The key registration issued for this attachment.
++    pub(crate) fn key(&self) -> Result<mod_api::AttachmentKey<T>, mod_api::AttachmentError> {
++        let id = format!("{}:{}", self.namespace, self.name);
++        let keys = KEYS.lock().unwrap_or_else(|e| e.into_inner());
++        keys.iter()
++            .find(|(kept, _)| *kept == id)
++            .and_then(|(_, key)| key.downcast_ref::<mod_api::AttachmentKey<T>>())
++            .cloned()
++            .ok_or(mod_api::AttachmentError::TypeMismatch)
++    }
++
++    /// The value on `holder`, its default inserted where it has none.
++    pub(crate) fn get(&self, host: &mut dyn mod_api::Host, holder: mod_api::Holder) -> Result<T, mod_api::AttachmentError> {
++        self.key()?.get(host, holder, T::clone)
++    }
++
++    /// The value on `holder`, None where it has none (nothing inserted).
++    pub(crate) fn get_existing(
++        &self,
++        host: &mut dyn mod_api::Host,
++        holder: mod_api::Holder,
++    ) -> Result<Option<T>, mod_api::AttachmentError> {
++        self.key()?.get_existing(host, holder, |value| value.cloned())
++    }
++
++    /// Whether `holder` carries a value.
++    pub(crate) fn has(&self, host: &mut dyn mod_api::Host, holder: mod_api::Holder) -> Result<bool, mod_api::AttachmentError> {
++        self.key()?.has(host, holder)
++    }
++
++    /// Replaces the value on `holder`.
++    pub(crate) fn set(
++        &self,
++        host: &mut dyn mod_api::Host,
++        holder: mod_api::Holder,
++        value: T,
++    ) -> Result<(), mod_api::AttachmentError> {
++        self.key()?.set(host, holder, value)
++    }
++
++    /// Removes the value from `holder`, answering it.
++    pub(crate) fn remove(
++        &self,
++        host: &mut dyn mod_api::Host,
++        holder: mod_api::Holder,
++    ) -> Result<Option<T>, mod_api::AttachmentError> {
++        self.key()?.remove(host, holder)
++    }
++}
+diff --git a/occultism/src/starling_sync2_files.rs b/src/starling_sync2_files.rs
+new file mode 100644
+index 0000000..bac8dce
+--- /dev/null
++++ b/src/starling_sync2_files.rs
+@@ -0,0 +1,219 @@
++//! Horizon's checked mod files (`ConfigFiles`, `ConfigPath`, `ConfigFileError`), which Sunrise
++//! replaced with plain folders and `std::fs` (debt-p3-25-native-config-roots): the same calls, on
++//! the folders Sunrise names for them. Config files sit in the shared `config/` folder
++//! (`Host::config_dir`) and must be the mod's own (its `<id>/` folder, or `<id>.<ext>` /
++//! `<id>-<rest>` beside it); bulk data in `<instance>/sunrise-mod-data/<id>/`; world data in
++//! `<world>/sunrise-mod-data/<id>/`. Writes replace a file at once (a temporary file, renamed).
++
++use std::path::{Path, PathBuf};
++
++/// The mod's id: the crate's name (the package's `[lib]` name is the id).
++pub(crate) const MOD_ID: &str = env!("CARGO_CRATE_NAME");
++/// Bytes a config file may hold, read or written.
++pub(crate) const CONFIG_FILE_MAX: u64 = 4 << 20;
++/// Bytes a bulk or world data file may hold.
++pub(crate) const DATA_FILE_MAX: u64 = 64 << 20;
++
++/// A relative, `/`-separated path, checked once: no empty, `.`/`..`-like, reserved or
++/// separator-bearing component, on every platform.
++#[derive(Clone, Debug, PartialEq, Eq, Hash)]
++pub(crate) struct ConfigPath(String);
++
++impl ConfigPath {
++    /// Checks `path`, or refuses with `ConfigFileError::InvalidPath`.
++    pub(crate) fn new(path: &str) -> Result<Self, ConfigFileError> {
++        path.split('/')
++            .all(Self::is_valid_name)
++            .then(|| Self(path.to_owned()))
++            .ok_or(ConfigFileError::InvalidPath)
++    }
++
++    /// Whether a name is portable and safe.
++    pub(crate) fn is_valid_name(name: &str) -> bool {
++        if name.is_empty()
++            || name.ends_with(['.', ' '])
++            || name.chars().any(|c| {
++                c.is_control() || matches!(c, '/' | '\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*')
++            })
++        {
++            return false;
++        }
++        let base = name.split('.').next().unwrap_or(name);
++        if ["CON", "PRN", "AUX", "NUL"].iter().any(|reserved| base.eq_ignore_ascii_case(reserved)) {
++            return false;
++        }
++        let bytes = base.as_bytes();
++        !(bytes.len() == 4
++            && (bytes[..3].eq_ignore_ascii_case(b"COM") || bytes[..3].eq_ignore_ascii_case(b"LPT"))
++            && matches!(bytes[3], b'1'..=b'9'))
++    }
++
++    /// The path as written.
++    pub(crate) fn as_str(&self) -> &str {
++        &self.0
++    }
++
++    /// Whether the path is `mod_id`'s: its folder and anything in it, or `<id>.<ext>` /
++    /// `<id>-<rest>` beside it.
++    pub(crate) fn owned_by(&self, mod_id: &str) -> bool {
++        let (first, rest) = self.0.split_once('/').unwrap_or((&self.0, ""));
++        match first.strip_prefix(mod_id) {
++            Some("") => true,
++            Some(tail) => rest.is_empty() && (tail.starts_with('.') || tail.starts_with('-')),
++            None => false,
++        }
++    }
++}
++
++/// Why a file call was refused.
++#[derive(Clone, Debug, PartialEq, Eq)]
++#[non_exhaustive]
++pub(crate) enum ConfigFileError {
++    /// The path is another mod's, or `config/` itself.
++    NotOwned,
++    /// Not a path `ConfigPath::new` takes.
++    InvalidPath,
++    /// No current world save folder is open.
++    NoWorld,
++    /// More bytes than the root's per-file cap.
++    TooLarge,
++    /// Nothing is at that path.
++    NotFound,
++    /// A folder where a file was asked for.
++    NotAFile,
++    /// A symbolic link at the path, which could lead outside the root.
++    Symlink,
++    /// Any other failure of the file system, as it describes itself.
++    Io(String),
++}
++
++impl std::fmt::Display for ConfigFileError {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.write_str(match self {
++            Self::NotOwned => "the path is not the calling mod's",
++            Self::InvalidPath => "not a checked relative file path",
++            Self::NoWorld => "no current world save is open",
++            Self::TooLarge => "too large",
++            Self::NotFound => "not found",
++            Self::NotAFile => "not a file",
++            Self::Symlink => "a symbolic link is on the path",
++            Self::Io(error) => error,
++        })
++    }
++}
++
++impl std::error::Error for ConfigFileError {}
++
++fn io(error: std::io::Error) -> ConfigFileError {
++    match error.kind() {
++        std::io::ErrorKind::NotFound => ConfigFileError::NotFound,
++        _ => ConfigFileError::Io(error.to_string()),
++    }
++}
++
++/// One root of the mod's files.
++pub(crate) struct ConfigFiles {
++    root: Option<PathBuf>,
++    /// Config files must name the mod's own (the root is shared).
++    owned: bool,
++    cap: u64,
++}
++
++impl ConfigFiles {
++    fn path(&self, file: &ConfigPath) -> Result<PathBuf, ConfigFileError> {
++        let root = self.root.as_ref().ok_or(ConfigFileError::NoWorld)?;
++        if self.owned && !file.owned_by(MOD_ID) {
++            return Err(ConfigFileError::NotOwned);
++        }
++        let path = root.join(file.as_str());
++        let mut at = root.clone();
++        for part in file.as_str().split('/') {
++            at.push(part);
++            if std::fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink()) {
++                return Err(ConfigFileError::Symlink);
++            }
++        }
++        Ok(path)
++    }
++
++    /// The file's bytes, at most the root's cap.
++    pub(crate) fn read(&self, file: &ConfigPath) -> Result<Vec<u8>, ConfigFileError> {
++        let path = self.path(file)?;
++        let meta = std::fs::metadata(&path).map_err(io)?;
++        if meta.is_dir() {
++            return Err(ConfigFileError::NotAFile);
++        }
++        if meta.len() > self.cap {
++            return Err(ConfigFileError::TooLarge);
++        }
++        std::fs::read(&path).map_err(io)
++    }
++
++    /// Replaces the file's bytes at once, making its folders when missing.
++    pub(crate) fn write(&self, file: &ConfigPath, bytes: &[u8]) -> Result<(), ConfigFileError> {
++        if bytes.len() as u64 > self.cap {
++            return Err(ConfigFileError::TooLarge);
++        }
++        let path = self.path(file)?;
++        if path.is_dir() {
++            return Err(ConfigFileError::NotAFile);
++        }
++        if let Some(parent) = path.parent() {
++            std::fs::create_dir_all(parent).map_err(io)?;
++        }
++        let temporary = temporary_beside(&path);
++        std::fs::write(&temporary, bytes).map_err(io)?;
++        std::fs::rename(&temporary, &path).map_err(|e| {
++            let _ = std::fs::remove_file(&temporary);
++            io(e)
++        })
++    }
++
++    /// Removes the file: `Ok(true)` when it was there, `Ok(false)` when nothing was.
++    pub(crate) fn remove(&self, file: &ConfigPath) -> Result<bool, ConfigFileError> {
++        let path = self.path(file)?;
++        if path.is_dir() {
++            return Err(ConfigFileError::NotAFile);
++        }
++        match std::fs::remove_file(&path) {
++            Ok(()) => Ok(true),
++            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
++            Err(e) => Err(io(e)),
++        }
++    }
++}
++
++fn temporary_beside(path: &Path) -> PathBuf {
++    let mut name = path.file_name().unwrap_or_default().to_os_string();
++    name.push(".starling-write");
++    path.with_file_name(name)
++}
++
++/// `config_files()` and `data_files()` on either side's host.
++pub(crate) trait HostFiles {
++    fn config_files(&self) -> ConfigFiles;
++    fn data_files(&self) -> ConfigFiles;
++}
++
++impl<H: mod_api::Host + ?Sized> HostFiles for H {
++    fn config_files(&self) -> ConfigFiles {
++        ConfigFiles { root: Some(self.config_dir().to_path_buf()), owned: true, cap: CONFIG_FILE_MAX }
++    }
++
++    fn data_files(&self) -> ConfigFiles {
++        let root = self.instance_dir().join("sunrise-mod-data").join(MOD_ID);
++        ConfigFiles { root: Some(root), owned: false, cap: DATA_FILE_MAX }
++    }
++}
++
++/// `world_data_files()` on the server's host: none without an open world.
++pub(crate) trait ServerFiles {
++    fn world_data_files(&self) -> ConfigFiles;
++}
++
++impl<H: mod_api::ServerHost + ?Sized> ServerFiles for H {
++    fn world_data_files(&self) -> ConfigFiles {
++        let root = self.world_dir().map(|world| world.join("sunrise-mod-data").join(MOD_ID));
++        ConfigFiles { root, owned: false, cap: DATA_FILE_MAX }
++    }
++}
+diff --git a/occultism/src/starling_sync2_hud.rs b/src/starling_sync2_hud.rs
+new file mode 100644
+index 0000000..9c23a43
+--- /dev/null
++++ b/src/starling_sync2_hud.rs
+@@ -0,0 +1,84 @@
++//! Horizon's HUD corners (`Corner`, `Corners`), which Sunrise removed: each mod places its own
++//! boxes now (debt: render_gui_post's `event.corners` is gone). The same placement as before, for
++//! this mod's boxes in this frame: 2 px from the edges, stacked in each corner, the top right one
++//! starting below the active-effect icons (`hud_layer_bounds("minecraft:effects")`).
++
++const MARGIN: f32 = 2.0;
++
++/// A corner of the HUD.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum Corner {
++    TopLeft,
++    TopRight,
++    BottomLeft,
++    BottomRight,
++}
++
++impl Corner {
++    pub(crate) const ALL: [Corner; 4] = [Corner::TopLeft, Corner::TopRight, Corner::BottomLeft, Corner::BottomRight];
++
++    pub(crate) fn name(self) -> &'static str {
++        match self {
++            Corner::TopLeft => "top_left",
++            Corner::TopRight => "top_right",
++            Corner::BottomLeft => "bottom_left",
++            Corner::BottomRight => "bottom_right",
++        }
++    }
++
++    pub(crate) fn label(self) -> &'static str {
++        match self {
++            Corner::TopLeft => "Top left",
++            Corner::TopRight => "Top right",
++            Corner::BottomLeft => "Bottom left",
++            Corner::BottomRight => "Bottom right",
++        }
++    }
++
++    pub(crate) fn parse(s: &str, default: Corner) -> Corner {
++        Self::ALL.into_iter().find(|c| c.name() == s).unwrap_or(default)
++    }
++
++    pub(crate) fn top(self) -> bool {
++        matches!(self, Corner::TopLeft | Corner::TopRight)
++    }
++
++    pub(crate) fn left(self) -> bool {
++        matches!(self, Corner::TopLeft | Corner::BottomLeft)
++    }
++}
++
++/// What each corner already holds this frame.
++pub(crate) struct Corners {
++    width: f32,
++    height: f32,
++    /// Distance from the corner's top or bottom edge, per `Corner::ALL`.
++    used: [f32; 4],
++}
++
++impl Corners {
++    /// `top_right` reserves the status effect icons' rows.
++    pub(crate) fn new(width: f32, height: f32, top_right: f32) -> Self {
++        Self { width, height, used: [0.0, top_right, 0.0, 0.0] }
++    }
++
++    /// The corners of the HUD `draw` paints, the effect icons kept clear.
++    pub(crate) fn hud(host: &dyn mod_api::ClientHost, draw: &dyn mod_api::DrawContext) -> Self {
++        let [width, height] = draw.size();
++        let effects = match host.hud_layer_bounds("minecraft:effects") {
++            Ok(Some([_, y, _, h])) => y + h,
++            _ => 0.0,
++        };
++        Self::new(width, height, effects)
++    }
++
++    /// The top-left position of a `w` x `h` box in `corner`, below (or above) what it holds.
++    pub(crate) fn place(&mut self, corner: Corner, w: f32, h: f32) -> (f32, f32) {
++        let i = Corner::ALL.iter().position(|c| *c == corner).unwrap_or(0);
++        let edge = self.used[i] + MARGIN;
++        self.used[i] = edge + h;
++        let x = if corner.left() { MARGIN } else { self.width - MARGIN - w };
++        let y = if corner.top() { edge } else { self.height - edge - h };
++        (x, y)
++    }
++}
+diff --git a/occultism/src/starling_sync2_menus.rs b/src/starling_sync2_menus.rs
+new file mode 100644
+index 0000000..0cb6c37
+--- /dev/null
++++ b/src/starling_sync2_menus.rs
+@@ -0,0 +1,83 @@
++//! Horizon's native chest menus by player UUID and window id, which Sunrise moved onto `PlayerRef`
++//! and `MenuRef` (debt-p3-10, debt-p3-07), and its `menu_closed` notice, which Sunrise folds into
++//! `player_container_close` (debt-p3-67): the same calls and the same notice, rebuilt from them.
++
++/// `host.open_menu(uuid, rows, title, items, replace)`: the window id the menu opened as; None
++/// where no menu opened (the player is gone, a click is in progress, the open is deferred), and the
++/// stack refusal as it was.
++pub(crate) trait HostMenus {
++    fn open_menu(
++        &mut self,
++        uuid: u128,
++        rows: u8,
++        title: mod_api::Text,
++        items: Vec<Option<mod_api::ItemStack>>,
++        replace: mod_api::MenuReplace,
++    ) -> Result<Option<i32>, mod_api::StackWriteError>;
++    /// Closes the player's current menu, if any.
++    fn close_menu(&mut self, uuid: u128);
++    /// Replaces the items of the player's open window `window`.
++    fn menu_set_items(
++        &mut self,
++        uuid: u128,
++        window: i32,
++        items: Vec<Option<mod_api::ItemStack>>,
++    ) -> Result<(), mod_api::MenuItemsRefusal>;
++}
++
++impl HostMenus for dyn mod_api::ServerHost + '_ {
++    fn open_menu(
++        &mut self,
++        uuid: u128,
++        rows: u8,
++        title: mod_api::Text,
++        items: Vec<Option<mod_api::ItemStack>>,
++        replace: mod_api::MenuReplace,
++    ) -> Result<Option<i32>, mod_api::StackWriteError> {
++        let Some(player) = self.player(uuid) else {
++            return Ok(None);
++        };
++        match player.open_chest_menu(self, rows, title, items, replace) {
++            Ok(menu) => Ok(menu.container_id(self)),
++            Err(mod_api::OpenMenuError::Stack(error)) => Err(error),
++            Err(_) => Ok(None),
++        }
++    }
++
++    fn close_menu(&mut self, uuid: u128) {
++        if let Some(menu) = self.player(uuid).and_then(|player| player.container_menu(self)) {
++            let _ = menu.close_container(self);
++        }
++    }
++
++    fn menu_set_items(
++        &mut self,
++        uuid: u128,
++        window: i32,
++        items: Vec<Option<mod_api::ItemStack>>,
++    ) -> Result<(), mod_api::MenuItemsRefusal> {
++        let player = self.player(uuid).ok_or(mod_api::MenuItemsRefusal::NoPlayer)?;
++        let menu = player
++            .container_menu(self)
++            .filter(|menu| menu.container_id(self) == Some(window))
++            .ok_or(mod_api::MenuItemsRefusal::NotOpen)?;
++        menu.set_items(self, items)
++    }
++}
++
++/// Horizon's `MenuClosedEvent`: who closed which window (-1 for a menu with no window id).
++pub(crate) struct MenuClosedEvent {
++    pub uuid: u128,
++    pub window: i32,
++}
++
++/// The old notice for Sunrise's `player_container_close`.
++pub(crate) fn menu_closed(
++    host: &dyn mod_api::Host,
++    event: &mod_api::PlayerContainerCloseEvent<'_>,
++) -> MenuClosedEvent {
++    MenuClosedEvent {
++        uuid: event.player.uuid(),
++        window: event.menu.and_then(|menu| menu.container_id(host)).unwrap_or(-1),
++    }
++}
+diff --git a/occultism/src/starling_sync2_settings.rs b/src/starling_sync2_settings.rs
+new file mode 100644
+index 0000000..2ffe00d
+--- /dev/null
++++ b/src/starling_sync2_settings.rs
+@@ -0,0 +1,146 @@
++//! Horizon's string-keyed mod settings, which Sunrise reads and writes through the `SettingKey` its
++//! registration returns (debt-p3-26-use-one-native-settings-owner-and-author), and its
++//! `setting_changed`, which Sunrise calls with a read-only host on either side (debt-p3-26-read-
++//! only-setting-changed). The keys are kept by name as the mod registers them, the reads and writes
++//! take the names again, and the old notice runs on the next client tick with the client host it
++//! had (`settings_changed`), at most a tick after the change.
++
++use std::sync::Mutex;
++
++/// The mod's settings by the name it registered them under.
++static KEYS: Mutex<Vec<(String, mod_api::SettingKey)>> = Mutex::new(Vec::new());
++/// Changes heard since the last client tick: (mod id, key). Bounded: a server never drains it.
++static CHANGES: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
++const CHANGES_MAX: usize = 256;
++
++/// `Registrar::register_setting`, keeping the key under its name for the reads below.
++pub(crate) fn register_setting(
++    r: &mut (dyn mod_api::Registrar + '_),
++    spec: mod_api::SettingSpec,
++) -> Result<mod_api::SettingKey, mod_api::SettingError> {
++    let name = spec.key.clone();
++    let key = r.register_setting(spec)?;
++    let mut keys = KEYS.lock().unwrap_or_else(|e| e.into_inner());
++    keys.retain(|(kept, _)| *kept != name);
++    keys.push((name, key));
++    Ok(key)
++}
++
++/// The key registered under `name`.
++pub(crate) fn setting_key(name: &str) -> Option<mod_api::SettingKey> {
++    let keys = KEYS.lock().unwrap_or_else(|e| e.into_inner());
++    keys.iter().find(|(kept, _)| kept == name).map(|(_, key)| *key)
++}
++
++/// A setting's value as Horizon's settings file kept it.
++fn raw(value: mod_api::SettingValue) -> Option<String> {
++    Some(match value {
++        mod_api::SettingValue::Toggle(on) => on.to_string(),
++        mod_api::SettingValue::Choice(index) => index.to_string(),
++        mod_api::SettingValue::Range(number) => number.to_string(),
++        mod_api::SettingValue::Color(rgb) => format!("#{rgb:06x}"),
++        _ => return None,
++    })
++}
++
++/// A raw value read as the kind the setting has now.
++fn parse(current: mod_api::SettingValue, raw: &str) -> Option<mod_api::SettingValue> {
++    let raw = raw.trim();
++    Some(match current {
++        mod_api::SettingValue::Toggle(_) => mod_api::SettingValue::Toggle(raw.parse().ok()?),
++        mod_api::SettingValue::Choice(_) => mod_api::SettingValue::Choice(raw.parse().ok()?),
++        mod_api::SettingValue::Range(_) => mod_api::SettingValue::Range(raw.parse().ok()?),
++        mod_api::SettingValue::Color(_) => {
++            let hex = raw.trim_start_matches('#').trim_start_matches("0x");
++            mod_api::SettingValue::Color(u32::from_str_radix(hex, 16).ok()?)
++        }
++        _ => return None,
++    })
++}
++
++/// Horizon's setting reads by name: the player's value, else the default; None for a name the mod
++/// never registered (or another mod's: only the calling mod's settings are kept here).
++pub(crate) trait NamedSettings {
++    fn starling_setting_bool(&self, name: &str) -> Option<bool>;
++    fn starling_setting_choice(&self, name: &str) -> Option<u32>;
++    fn starling_setting_f64(&self, name: &str) -> Option<f64>;
++    fn starling_setting_color(&self, name: &str) -> Option<u32>;
++    /// The raw value, as the settings file keeps it.
++    fn starling_setting(&self, mod_id: &str, name: &str) -> Option<String>;
++}
++
++impl<H: mod_api::Host + ?Sized> NamedSettings for H {
++    fn starling_setting_bool(&self, name: &str) -> Option<bool> {
++        self.setting_bool(setting_key(name)?).ok()
++    }
++
++    fn starling_setting_choice(&self, name: &str) -> Option<u32> {
++        self.setting_choice(setting_key(name)?).ok()
++    }
++
++    fn starling_setting_f64(&self, name: &str) -> Option<f64> {
++        self.setting_f64(setting_key(name)?).ok()
++    }
++
++    fn starling_setting_color(&self, name: &str) -> Option<u32> {
++        match self.setting(setting_key(name)?).ok()? {
++            mod_api::SettingValue::Color(rgb) => Some(rgb),
++            _ => None,
++        }
++    }
++
++    fn starling_setting(&self, mod_id: &str, name: &str) -> Option<String> {
++        if mod_id != super::MOD_ID {
++            return None;
++        }
++        raw(self.setting(setting_key(name)?).ok()?)
++    }
++}
++
++/// Horizon's `set_setting(mod_id, key, raw)`: the raw value read as the setting's kind; an
++/// unregistered key, another mod's, or a value the kind can't take keeps the old value.
++pub(crate) trait SettingWrites {
++    fn starling_set_setting(&mut self, mod_id: &str, name: &str, value: &str);
++}
++
++impl SettingWrites for dyn mod_api::ClientHost + '_ {
++    fn starling_set_setting(&mut self, mod_id: &str, name: &str, value: &str) {
++        let Some(key) = setting_key(name).filter(|_| mod_id == super::MOD_ID) else {
++            return;
++        };
++        if let Some(value) = self.setting(key).ok().and_then(|current| parse(current, value)) {
++            let _ = self.set_setting(key, value);
++        }
++    }
++}
++
++impl SettingWrites for dyn mod_api::ServerHost + '_ {
++    fn starling_set_setting(&mut self, mod_id: &str, name: &str, value: &str) {
++        let Some(key) = setting_key(name).filter(|_| mod_id == super::MOD_ID) else {
++            return;
++        };
++        if let Some(value) = self.setting(key).ok().and_then(|current| parse(current, value)) {
++            let _ = self.set_setting(key, value);
++        }
++    }
++}
++
++/// Horizon's `SettingChangedEvent`: which of the mod's settings changed.
++pub(crate) struct SettingChange<'a> {
++    pub mod_id: &'a str,
++    pub key: &'a str,
++}
++
++/// Sunrise's `setting_changed`: kept for the next client tick (`settings_changed`).
++pub(crate) fn setting_changed_later(event: &mod_api::SettingChangedEvent<'_>) {
++    let mut changes = CHANGES.lock().unwrap_or_else(|e| e.into_inner());
++    if changes.len() >= CHANGES_MAX {
++        changes.remove(0);
++    }
++    changes.push((event.mod_id.to_owned(), event.key.to_owned()));
++}
++
++/// The changes heard since the last call, oldest first: the client tick runs the old notice for each.
++pub(crate) fn settings_changed() -> Vec<(String, String)> {
++    std::mem::take(&mut *CHANGES.lock().unwrap_or_else(|e| e.into_inner()))
++}
 diff --git a/src/support.rs b/src/support.rs
-index f97233d..514bd9f 100644
+index f97233d..423874d 100644
 --- a/src/support.rs
 +++ b/src/support.rs
-@@ -19,9 +19,9 @@ use std::sync::{LazyLock, Mutex};
+@@ -15,13 +15,14 @@
+ //! each item entity's own tick, which is where vanilla's `Entity.checkInsideBlocks` calls
+ //! `entityInside` for upstream.
+ 
++use crate::starling_sync2::HostLevelWrites as _;
+ use std::sync::{LazyLock, Mutex};
  
  use mod_api::{
      BlockClick, BlockUpdateFlags, Command, CommandArgumentValue, EntityRef,
@@ -128,7 +1096,7 @@ index f97233d..514bd9f 100644
  };
  
  use crate::runtime::{
-@@ -135,8 +135,8 @@ fn build(host: &dyn Host) -> Cached {
+@@ -135,8 +136,8 @@ fn build(host: &dyn Host) -> Cached {
              .and_then(|text| host.recipe_result(&text).ok().flatten());
          match (ingredient, result) {
              (Some(ingredient), Some(result)) => rules.push(runtime::Rule {
@@ -139,7 +1107,7 @@ index f97233d..514bd9f 100644
              }),
              _ => skipped += 1,
          }
-@@ -211,12 +211,12 @@ pub fn right_click(host: HostSide<'_>, event: &mut RightClickBlockEvent<'_>) ->
+@@ -211,12 +212,12 @@ pub fn right_click(host: HostSide<'_>, event: &mut RightClickBlockEvent<'_>) ->
      // The crop harvest comes first: an empty hand is the normal way to click it.
      let clicked = level
          .block(&*server, pos)
@@ -154,7 +1122,7 @@ index f97233d..514bd9f 100644
      {
          // The hook is called once per hand and the harvest writes the block, so
          // the off hand's turn would harvest the crop the main hand just
-@@ -238,9 +238,9 @@ pub fn right_click(host: HostSide<'_>, event: &mut RightClickBlockEvent<'_>) ->
+@@ -238,9 +239,9 @@ pub fn right_click(host: HostSide<'_>, event: &mut RightClickBlockEvent<'_>) ->
      let Some(stack) = click.stack else {
          return Flow::Continue;
      };
@@ -166,7 +1134,7 @@ index f97233d..514bd9f 100644
          if level.block(&*server, pos) == fire {
              server.set_block_property(pos, COLOR, colour);
              // Upstream answers `sidedSuccess` for any chalk on the fire, whether or not the
-@@ -250,20 +250,29 @@ pub fn right_click(host: HostSide<'_>, event: &mut RightClickBlockEvent<'_>) ->
+@@ -250,20 +251,29 @@ pub fn right_click(host: HostSide<'_>, event: &mut RightClickBlockEvent<'_>) ->
          }
          return Flow::Continue;
      }
@@ -201,7 +1169,7 @@ index f97233d..514bd9f 100644
          })
          .collect();
      if datura.is_empty() {
-@@ -332,14 +341,14 @@ fn harvest(
+@@ -332,14 +342,14 @@ fn harvest(
  
  /// One item entity's tick ended: convert it when it stands in a spirit fire and a recipe accepts
  /// it (upstream's `entityInside`).
@@ -220,7 +1188,7 @@ index f97233d..514bd9f 100644
          return;
      };
      let Some(pos) = entity.block_position(host) else {
-@@ -351,11 +360,16 @@ pub fn entity_tick_post(host: &mut dyn ServerHost, event: &mut EntityTickPostEve
+@@ -351,11 +361,16 @@ pub fn entity_tick_post(host: &mut dyn ServerHost, event: &mut EntityTickPostEve
      let Some(item) = host.item_entity(entity) else {
          return;
      };
@@ -240,16 +1208,27 @@ index f97233d..514bd9f 100644
      else {
          return;
      };
-@@ -369,7 +383,7 @@ pub fn entity_tick_post(host: &mut dyn ServerHost, event: &mut EntityTickPostEve
+@@ -368,8 +383,8 @@ pub fn entity_tick_post(host: &mut dyn ServerHost, event: &mut EntityTickPostEve
+     let Some(result) = ItemStack::new(key, conversion.count) else {
          return;
      };
-     if item.set_stack(host, result).unwrap_or(false) {
+-    if item.set_stack(host, result).unwrap_or(false) {
 -        record(level, event.dimension, pos, &conversion);
++    if item.set_stack(host, crate::starling_sync2::non_empty(result)).unwrap_or(false) {
 +        record(level, dimension, pos, &conversion);
      }
  }
  
-@@ -404,8 +418,8 @@ pub fn loot_drops(host: &mut dyn ServerHost, event: &mut LootDropsEvent<'_>) {
+@@ -394,7 +409,7 @@ pub fn listen(event: &mut EntityTickListenedEvent) {
+ /// `short_grass`/`tall_grass` has the jar's 2% chance of a datura seed
+ /// (`data/occultism/loot_modifiers/datura_seed_from_grass.json`, `…_from_tall_grass.json`:
+ /// NeoForge's `add_item` global loot modifier, which is this hook).
+-pub fn loot_drops(host: &mut dyn ServerHost, event: &mut LootDropsEvent<'_>) {
++pub fn loot_drops(host: &mut dyn ServerHost, event: &mut LootDropsEvent<'_, '_>) {
+     let context = event.context;
+     let Some((_pos, state)) = context.block else {
+         return;
+@@ -404,8 +419,8 @@ pub fn loot_drops(host: &mut dyn ServerHost, event: &mut LootDropsEvent<'_>) {
          return;
      };
      let block = text.split('[').next().unwrap_or(&text);
@@ -260,7 +1239,7 @@ index f97233d..514bd9f 100644
          return;
      }
      let Some(level) = host.level(context.dimension) else {
-@@ -430,21 +444,25 @@ pub fn loot_drops(host: &mut dyn ServerHost, event: &mut LootDropsEvent<'_>) {
+@@ -430,21 +445,25 @@ pub fn loot_drops(host: &mut dyn ServerHost, event: &mut LootDropsEvent<'_>) {
  }
  
  /// `/occultism info|recipes`.
@@ -275,9 +1254,9 @@ index f97233d..514bd9f 100644
 -    commands.push(Command::new("occultism recipes"));
 +    commands.push(
 +        Command::op("occultism info <pos:block_pos>", runtime::INFO_LEVEL)
-+            .executes(run_command),
++            .executes(move |host, source, invocation| crate::starling_sync2::ok(run_command(host, source, invocation))),
 +    );
-+    commands.push(Command::new("occultism recipes").executes(run_command));
++    commands.push(Command::new("occultism recipes").executes(move |host, source, invocation| crate::starling_sync2::ok(run_command(host, source, invocation))));
  }
  
  /// Run one of the commands above and take it.
@@ -295,7 +1274,7 @@ index f97233d..514bd9f 100644
      }
      let line = match literals.get(1).map(String::as_str) {
          Some("info") => {
-@@ -452,9 +470,9 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
+@@ -452,9 +471,9 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
              // again here: a source that reaches this body by another route (a
              // function, a future dispatcher change) is still refused, and the
              // refusal names no block.
@@ -307,7 +1286,7 @@ index f97233d..514bd9f 100644
              {
                  let pos = *pos;
                  let (block, colour, rules, files, world, dimension) = {
-@@ -462,7 +480,8 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
+@@ -462,11 +481,12 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
                      let level = view.level(view.dimension());
                      let block = level
                          .and_then(|level| level.block(view, pos))
@@ -317,11 +1296,18 @@ index f97233d..514bd9f 100644
                          .unwrap_or_default();
                      let colour = level
                          .and_then(|level| level.block_property(view, pos, COLOR))
-@@ -509,7 +528,7 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
+-                        .unwrap_or_else(|| "none".to_owned());
++                        .unwrap_or_else(|| "none");
+                     let (rules, files) =
+                         with_table(view, |cached| (cached.table.rules().len(), cached.files));
+                     let world = level.map(|level| level.epoch().get()).unwrap_or(0);
+@@ -508,8 +528,8 @@ pub fn run_command(host: &mut dyn ServerHost, event: &mut RunModCommandEvent<'_>
+         }
          _ => USAGE.to_owned(),
      };
-     let _ = host.commands().feedback(Text::literal(line));
+-    let _ = host.commands().feedback(Text::literal(line));
 -    Flow::Cancel
++    let _ = host.commands().feedback(Text::literal(line), false);
 +    Some(1)
  }
  
