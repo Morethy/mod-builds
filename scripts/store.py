@@ -437,7 +437,9 @@ def main(argv):
     elif command == "index":
         write_index(build, run_gh, pathlib.Path("answer"))
     elif command == "plan":
-        catalog = fetch_json(CATALOG)
+        # Horizon's index has been gone since GitHub flagged its organisation (26/11), and Starling
+        # takes no new Horizon mods: a catalog that isn't there plans nothing, Sunrise's still does.
+        catalog = fetch_json(CATALOG) or {}
         other = fetch_json(SUNRISE_CATALOG) or {}
         catalog = {**catalog, "projects": [*catalog.get("projects", []), *other.get("projects", [])],
                    "revoked": [*catalog.get("revoked", []), *other.get("revoked", [])]}
