@@ -1,14 +1,8 @@
 diff --git a/src/lib.rs b/src/lib.rs
-index a23e927..76dcfc2 100644
+index a23e927..d717385 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -1,4 +1,5 @@
- // SPDX-License-Identifier: GPL-3.0-only
-+use crate::starling_sync2::NamedSettings as _;
- use mod_api::{self, Hooks, KeyRegistration, Registrar, RegistrationContext, SettingSpec};
- pub mod runtime;
- use mod_api::*;
-@@ -12,7 +13,7 @@ pub fn initial_settings() -> runtime::minimap::Settings {
+@@ -12,7 +12,7 @@ pub fn initial_settings() -> runtime::minimap::Settings {
  
  fn legacy_preferences(cx: &RegistrationContext) -> runtime::minimap::Settings {
      use std::io::Read;
@@ -17,7 +11,7 @@ index a23e927..76dcfc2 100644
          return runtime::minimap::Settings::default();
      };
      let path = root
-@@ -25,6 +26,16 @@ fn legacy_preferences(cx: &RegistrationContext) -> runtime::minimap::Settings {
+@@ -25,6 +25,16 @@ fn legacy_preferences(cx: &RegistrationContext) -> runtime::minimap::Settings {
      }
      runtime::minimap::Settings::decode(&text)
  }
@@ -34,23 +28,32 @@ index a23e927..76dcfc2 100644
  fn native_path(directory: &mod_api::InstanceDirectory) -> Option<std::path::PathBuf> {
      #[cfg(unix)]
      if let mod_api::InstanceDirectory::Unix(bytes) = directory {
-@@ -45,13 +56,13 @@ impl Hooks for Mod {
+@@ -43,21 +53,9 @@ fn native_path(directory: &mod_api::InstanceDirectory) -> Option<std::path::Path
+ #[mod_api::sunrise_mod]
+ impl Hooks for Mod {
      fn register(&self, r: &mut dyn Registrar, cx: &RegistrationContext) {
-         let mut preferences = legacy_preferences(cx);
-         for (key, button) in runtime::SDK_SETTING_ROWS {
+-        let mut preferences = legacy_preferences(cx);
+-        for (key, button) in runtime::SDK_SETTING_ROWS {
 -            if let Ok(Some(raw)) = cx.setting(runtime::MOD_ID, key) {
-+            if let Some(raw) = cx.starling_setting(runtime::MOD_ID, key) {
-                 if let Ok(index) = raw.parse() {
-                     preferences.select_option(button, index);
-                 }
-             }
-         }
+-                if let Ok(index) = raw.parse() {
+-                    preferences.select_option(button, index);
+-                }
+-            }
+-        }
 -        if let Ok(Some(raw)) = cx.setting(runtime::MOD_ID, "cache_ram_mib") {
-+        if let Some(raw) = cx.starling_setting(runtime::MOD_ID, "cache_ram_mib") {
-             if let Ok(value) = raw.parse::<f64>() {
-                 if value.is_finite() && (16. ..=512.).contains(&value) {
-                     preferences.cache_ram_mib = value.round() as u16;
-@@ -73,7 +84,7 @@ impl Hooks for Mod {
+-            if let Ok(value) = raw.parse::<f64>() {
+-                if value.is_finite() && (16. ..=512.).contains(&value) {
+-                    preferences.cache_ram_mib = value.round() as u16;
+-                }
+-            }
+-        }
++        // Starling's port: Sunrise's registration reads no settings (its context has none), so
++        // the starting preferences are the mod's own saved ones (`legacy_preferences`).
++        let preferences = legacy_preferences(cx);
+         let _ = INITIAL.set(preferences);
+         for (id, default) in [
+             (runtime::WORLD_MAP_KEY, runtime::WORLD_MAP_DEFAULT),
+@@ -73,7 +71,7 @@ impl Hooks for Mod {
                  .enumerate()
                  .map(|(index, _)| format!("mwwr.value.{key}.{index}"))
                  .collect::<Vec<_>>();
@@ -59,7 +62,7 @@ index a23e927..76dcfc2 100644
                  key,
                  format!("mwwr.setting.{key}"),
                  options,
-@@ -81,7 +92,7 @@ impl Hooks for Mod {
+@@ -81,7 +79,7 @@ impl Hooks for Mod {
              ))
              .expect("valid minimap setting");
          }
@@ -68,7 +71,7 @@ index a23e927..76dcfc2 100644
              "cache_ram_mib",
              "mwwr.setting.cache_ram_mib",
              16.,
-@@ -91,7 +102,7 @@ impl Hooks for Mod {
+@@ -91,7 +89,7 @@ impl Hooks for Mod {
          ))
          .expect("valid RAM setting");
          for key in ["cache_manager", "reset"] {
@@ -77,7 +80,7 @@ index a23e927..76dcfc2 100644
                  key,
                  format!("mwwr.setting.{key}"),
                  [format!("mwwr.action.{key}"), format!("mwwr.action.{key}")],
-@@ -108,8 +119,8 @@ impl Hooks for Mod {
+@@ -108,8 +106,8 @@ impl Hooks for Mod {
          {
              return;
          }
@@ -88,7 +91,7 @@ index a23e927..76dcfc2 100644
          fn binding(value: &Option<(String, ClientModifiers)>) -> Option<(&str, u32)> {
              value
                  .as_ref()
-@@ -147,12 +158,14 @@ impl Hooks for Mod {
+@@ -147,12 +145,14 @@ impl Hooks for Mod {
                  (runtime::WORLD_MAP_KEY, runtime::ScreenRequest::Map),
                  (runtime::WAYPOINTS_KEY, runtime::ScreenRequest::Waypoints),
              ] {
@@ -107,16 +110,27 @@ index a23e927..76dcfc2 100644
                  {
                      requested = Some(screen);
                  }
-@@ -172,7 +185,7 @@ impl Hooks for Mod {
+@@ -172,10 +172,6 @@ impl Hooks for Mod {
          let _ = host;
          let _ = event;
      }
 -    fn gui_render_post(&self, host: &dyn ClientHost, event: &mut GuiRenderPostEvent<'_>) {
-+    fn render_gui_post(&self, host: &dyn mod_api::ClientHost, event: &mut mod_api::RenderGuiPostEvent<'_>) {
+-        let _ = host;
+-        let _ = event;
+-    }
+     fn screen_render_post(&self, host: &dyn ClientHost, event: &mut ScreenRenderPostEvent<'_>) {
          let _ = host;
          let _ = event;
+@@ -233,14 +229,15 @@ impl Hooks for Mod {
+             *event.radius = None;
+         }
      }
-@@ -240,7 +253,7 @@ impl Hooks for Mod {
+-    fn client_disconnecting(&self, host: &dyn ClientHost, event: &mut ClientDisconnectingEvent) {
++    /// Starling's port: Sunrise's one client logout event (debt-p3-64), before the teardown.
++    fn client_player_logging_out(&self, host: &mut dyn ClientHost, event: &mut ClientPlayerLoggingOutEvent) {
+         let _ = host;
+         let _ = event;
+         runtime::CLIENT_EVENTS.disconnected();
      }
      fn client_resources_reloaded(
          &self,
@@ -125,7 +139,7 @@ index a23e927..76dcfc2 100644
          event: &mut ClientResourcesReloadedEvent,
      ) {
          let _ = host;
-@@ -264,3 +277,5 @@ mod minimap_map_regression_tests;
+@@ -264,3 +261,5 @@ mod minimap_map_regression_tests;
  mod minimap_maps_tests;
  #[cfg(test)]
  mod minimap_settings_tests;

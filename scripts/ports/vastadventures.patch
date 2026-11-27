@@ -71,15 +71,17 @@ index 02c9c69..370b89b 100644
      let effects = stack_effects(tool.as_ref());
      if effects.is_empty() {
 diff --git a/src/lib.rs b/src/lib.rs
-index 2aa3944..9d7c781 100644
+index 2aa3944..bafe919 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -23,11 +23,11 @@ use mod_api::{
+@@ -22,12 +22,12 @@ use mod_api::{
+     self, AnvilCraftPostEvent, AnvilUpdateEvent, ArrowLooseEvent, AttackEntityEvent, AttributeDisplay,
      AttributeModifier, AttributeOperation, AttributeTooltip, BlockDropsEvent, CanGrindstoneRepairEvent, ClientHost,
      ClientSetupEvent, DataLoadContext, EntityJoinLevelEvent, EquipmentSlotGroup, FinalizeSpawnEvent, Flow,
-     GetEnchantmentLevelEvent, GrindstonePlaceEvent, HearsProjectileImpactsEvent, Host, HostSide, Hooks, Identifier,
+-    GetEnchantmentLevelEvent, GrindstonePlaceEvent, HearsProjectileImpactsEvent, Host, HostSide, Hooks, Identifier,
 -    ItemAttributeModifierEvent, ItemPart, ItemTooltipEvent, LevelHost, LevelRandomHost, LivingDamagePostEvent,
 -    LivingDeathEvent, LivingEquipmentChangeEvent, LivingHealEvent, LevelTickPreEvent, LivingIncomingDamageEvent, LootConditionEvent, LootDropsEvent, LootFunctionEvent,
++    GetEnchantmentLevelEvent, GrindstonePlaceEvent, Host, HostSide, Hooks, Identifier,
 +    ItemAttributeModifierEvent, ItemPart, ItemTooltipEvent, LevelHost, HitHost, LivingDamagePostEvent,
 +    LivingDeathEvent, LivingEquipmentChangeEvent, LivingHealEvent, LevelTickPreEvent, LivingIncomingDamageEvent, LootDropsEvent,
      LootTableLoadEvent, LoopContext, ModifyDefaultComponentsEvent, PlayerDestroyedBlockEvent, PlayerLoggedInEvent,
@@ -114,7 +116,7 @@ index 2aa3944..9d7c781 100644
      }
  
      fn server_about_to_start(&self, host: &mut dyn ServerHost, _: &mut ServerAboutToStartEvent) {
-@@ -89,19 +99,6 @@ impl Hooks for VastAdventures {
+@@ -89,24 +99,13 @@ impl Hooks for VastAdventures {
          loot::table_load(event.id, event.table);
      }
  
@@ -134,7 +136,29 @@ index 2aa3944..9d7c781 100644
      // ---- what stacks give ----
  
      fn item_attribute_modifier(&self, event: &mut ItemAttributeModifierEvent<'_>) {
-@@ -148,30 +145,31 @@ impl Hooks for VastAdventures {
+-        let Some(custom) = nbt::custom_data(event.stack) else { return };
+-        let item = nbt::stack_id(event.stack);
++        // Starling's port: Sunrise lends the stack as a view; the logic reads an owned copy.
++        let Some(stack) = event.stack.project() else { return };
++        let Some(custom) = nbt::custom_data(&stack) else { return };
++        let item = nbt::stack_id(&stack);
+         if item.is_empty() {
+             return;
+         }
+@@ -120,8 +119,10 @@ impl Hooks for VastAdventures {
+     }
+ 
+     fn get_enchantment_level(&self, event: &mut GetEnchantmentLevelEvent<'_>) {
+-        let Some(custom) = nbt::custom_data(event.stack) else { return };
+-        let item = nbt::stack_id(event.stack);
++        // Starling's port: Sunrise lends the stack as a view; the logic reads an owned copy.
++        let Some(stack) = event.stack.project() else { return };
++        let Some(custom) = nbt::custom_data(&stack) else { return };
++        let item = nbt::stack_id(&stack);
+         let effects = effects::effects(&item, &custom);
+         let mut ids: Vec<String> = match event.target {
+             Some(target) => vec![target.to_string()],
+@@ -148,30 +149,31 @@ impl Hooks for VastAdventures {
      }
  
      fn item_tooltip(&self, _host: &dyn ClientHost, event: &mut ItemTooltipEvent<'_>) {
@@ -172,7 +196,16 @@ index 2aa3944..9d7c781 100644
      }
  
      // ---- bosses, elites and the world tier ----
-@@ -202,10 +200,6 @@ impl Hooks for VastAdventures {
+@@ -193,7 +195,7 @@ impl Hooks for VastAdventures {
+ 
+     fn entity_join_level(&self, host: &mut dyn ServerHost, event: &mut EntityJoinLevelEvent<'_>) -> Flow {
+         if !event.loaded_from_disk {
+-            spawns::joined(host, event.entity, event.dimension, event.kind, event.pos);
++            spawns::joined(host, event.subject.id(), event.dimension, event.kind, event.pos);
+         }
+         Flow::Continue
+     }
+@@ -202,10 +204,6 @@ impl Hooks for VastAdventures {
          spawns::register_commands(event.commands);
      }
  
@@ -183,7 +216,20 @@ index 2aa3944..9d7c781 100644
      fn server_tick(&self, _host: &mut dyn ServerHost, event: &mut ServerTickEvent<'_>) {
          if matches!(event.phase, ServerTickPhase::ServerTickStart { .. }) {
              spawns::tick_start();
-@@ -252,11 +246,11 @@ impl Hooks for VastAdventures {
+@@ -233,8 +231,10 @@ impl Hooks for VastAdventures {
+     }
+ 
+     fn living_equipment_change(&self, host: &mut dyn ServerHost, event: &mut LivingEquipmentChangeEvent<'_>) {
+-        if event.kind == "minecraft:player"
+-            && let Some(uuid) = host.entity(event.entity).and_then(|e| e.uuid(host))
++        // Starling's port: Sunrise names the living by handle, not by kind and id.
++        let entity = event.entity.entity();
++        if entity.kind(&*host).and_then(|kind| kind.id(&*host)).is_some_and(|id| &*id == "minecraft:player")
++            && let Some(uuid) = entity.uuid(host)
+         {
+             combat::track(uuid);
+         }
+@@ -252,11 +252,11 @@ impl Hooks for VastAdventures {
          Flow::Continue
      }
  
@@ -197,7 +243,16 @@ index 2aa3944..9d7c781 100644
          combat::damage_dealt(event);
      }
  
-@@ -279,7 +273,10 @@ impl Hooks for VastAdventures {
+@@ -270,16 +270,15 @@ impl Hooks for VastAdventures {
+         Flow::Continue
+     }
+ 
+-    fn hears_projectile_impacts(&self, _host: &dyn Host, event: &mut HearsProjectileImpactsEvent) {
+-        event.hears = true;
+-    }
+-
+     fn projectile_impact(&self, host: &mut dyn ServerHost, event: &mut ProjectileImpactEvent<'_>) -> Flow {
+         combat::projectile(host, event.projectile, event.kind, event.owner, event.entity);
          Flow::Continue
      }
  
@@ -209,76 +264,126 @@ index 2aa3944..9d7c781 100644
          combat::destroyed_block(host, event.pos);
      }
  
-@@ -290,7 +287,7 @@ impl Hooks for VastAdventures {
+@@ -290,22 +289,98 @@ impl Hooks for VastAdventures {
          Flow::Continue
      }
  
 -    fn loot_drops(&self, host: &mut dyn ServerHost, event: &mut LootDropsEvent<'_>) {
+-        combat::loot_drops(host, event.context, event.drops);
 +    fn loot_drops(&self, host: &mut dyn ServerHost, event: &mut LootDropsEvent<'_, '_>) {
-         combat::loot_drops(host, event.context, event.drops);
++        // Starling's port: the drops are a hook list now; the logic edits a copy, written back
++        // whole when it changed something.
++        let before: Vec<mod_api::ItemStack> = event.drops.iter().collect();
++        let mut drops = before.clone();
++        combat::loot_drops(host, event.context, &mut drops);
++        if drops != before {
++            event.drops.clear();
++            for stack in drops {
++                let _ = event.drops.push(stack);
++            }
++        }
++    }
++}
++
++/// Starling's port: what the old `LootContext` snapshot told this mod, read off Sunrise's borrowed
++/// parameters (debt-p3-03): the killing player, the entity, the luck and the level.
++struct Roll {
++    player: bool,
++    entity: Option<String>,
++    luck: f32,
++    dimension: Option<String>,
++}
++
++fn roll_of(context: &dyn mod_api::LootTypeContext) -> Roll {
++    let params = context.params();
++    Roll {
++        player: params.last_damage_player().is_some(),
++        entity: params.entity().map(|entity| entity.kind().to_owned()),
++        luck: params.luck(),
++        dimension: params.level().map(|level| level.dimension().to_owned()),
      }
  }
-@@ -301,11 +298,46 @@ fn has_player(ctx: &mod_api::LootContext) -> bool {
-     ctx.player.is_some() || ctx.entity.as_ref().is_none_or(|e| e.kind == "minecraft:player")
- }
  
-+/// One of this mod's loot conditions, registered under its id.
+ /// A player opened the chest or made the kill. The items engine (`/loot`, some drops) names no entity at all, so
+ /// only a roll that names a mob and no player killer is left out.
+-fn has_player(ctx: &mod_api::LootContext) -> bool {
+-    ctx.player.is_some() || ctx.entity.as_ref().is_none_or(|e| e.kind == "minecraft:player")
++fn has_player(ctx: &Roll) -> bool {
++    ctx.player || ctx.entity.as_deref().is_none_or(|kind| kind == "minecraft:player")
++}
++
++/// One of this mod's loot conditions, registered under its id: its own codec (nothing to decode)
++/// and its rule.
 +struct LootCondition(&'static str);
 +
-+impl mod_api::ModLootCondition for LootCondition {
-+    fn validate(&self, _: &mod_api::LootEntryData) -> Result<(), String> {
-+        Ok(())
-+    }
-+
-+    fn test(&self, _: &mod_api::LootEntryData, context: &mut dyn mod_api::LootTypeContext) -> Result<bool, String> {
-+        let ctx = context.snapshot();
-+        let entity = ctx.entity.as_ref().map(|e| e.kind.as_str());
-+        loot::loot_condition(self.0, has_player(&ctx), entity).ok_or_else(|| format!("{}: not a condition", self.0))
++impl mod_api::ModLootConditionCodec for LootCondition {
++    fn decode(&self, _: &Value) -> Result<std::sync::Arc<dyn mod_api::ModLootCondition>, String> {
++        Ok(std::sync::Arc::new(LootCondition(self.0)))
 +    }
 +}
 +
-+/// One of this mod's loot functions, registered under its id.
++impl mod_api::ModLootCondition for LootCondition {
++    fn test(&self, context: &mut dyn mod_api::LootTypeContext) -> Result<bool, String> {
++        let ctx = roll_of(&*context);
++        loot::loot_condition(self.0, has_player(&ctx), ctx.entity.as_deref())
++            .ok_or_else(|| format!("{}: not a condition", self.0))
++    }
++}
++
++/// One of this mod's loot functions, registered under its id: the codec keeps each entry's JSON
++/// on the rule it decodes to.
 +struct LootFunction(&'static str);
 +
-+impl mod_api::ModLootFunction for LootFunction {
-+    fn validate(&self, _: &mod_api::LootEntryData) -> Result<(), String> {
-+        Ok(())
-+    }
++struct LootFunctionRule {
++    kind: &'static str,
++    data: Value,
++}
 +
-+    fn apply(
-+        &self,
-+        data: &mod_api::LootEntryData,
-+        mut stack: mod_api::LootStack,
-+        context: &mut dyn mod_api::LootTypeContext,
-+    ) -> Result<mod_api::LootStack, String> {
-+        let ctx = context.snapshot();
-+        // The roll's own random gives the seed the context no longer carries.
-+        let seed = context.random().next_long();
-+        loot_function(self.0, data.value(), &ctx, seed, &mut stack);
-+        Ok(stack)
++impl mod_api::ModLootFunctionCodec for LootFunction {
++    fn decode(&self, data: &Value) -> Result<std::sync::Arc<dyn mod_api::ModLootFunction>, String> {
++        Ok(std::sync::Arc::new(LootFunctionRule { kind: self.0, data: data.clone() }))
 +    }
 +}
 +
++impl mod_api::ModLootFunction for LootFunctionRule {
++    fn apply(
++        &self,
++        stack: &mut mod_api::LootStackEditor<'_>,
++        context: &mut dyn mod_api::LootTypeContext,
++    ) -> Result<(), String> {
++        let ctx = roll_of(&*context);
++        // The roll's own random gives the seed the context no longer carries.
++        let seed = context.random().next_long();
++        // Starling's port: the pure logic edits an owned stack, put back whole.
++        let mut owned = stack.to_owned().map_err(|error| error.to_string())?;
++        loot_function(self.kind, &self.data, &ctx, seed, &mut owned);
++        stack.replace(owned).map_err(|error| error.to_string())
++    }
+ }
+ 
  /// This mod's loot functions, on the pure logic's view of the stack (JSON components).
 -fn loot_function(event: &mut LootFunctionEvent<'_>) {
 -    let ctx = event.ctx;
 -    loot::note_context(event.kind, ctx.player.is_some(), ctx.entity.as_ref().map(|e| e.kind.as_str()));
 -    let stack = &mut *event.stack;
-+fn loot_function(kind: &str, data: &Value, ctx: &mod_api::LootContext, seed: i64, stack: &mut mod_api::LootStack) {
-+    loot::note_context(kind, ctx.player.is_some(), ctx.entity.as_ref().map(|e| e.kind.as_str()));
++fn loot_function(kind: &str, data: &Value, ctx: &Roll, seed: i64, stack: &mut mod_api::LootStack) {
++    loot::note_context(kind, ctx.player, ctx.entity.as_deref());
      let mut item = nbt::item_id(stack.item);
      if item.is_empty() {
          return;
-@@ -318,7 +350,7 @@ fn loot_function(event: &mut LootFunctionEvent<'_>) {
+@@ -316,9 +391,9 @@ fn loot_function(event: &mut LootFunctionEvent<'_>) {
+     let before: Vec<(String, Value)> =
+         stack.components.iter().filter_map(|(k, v)| Some((k.clone(), nbt::tag_to_json(v.as_ref()?)))).collect();
      let mut components = before.clone();
-     let dimension = ctx.place.as_ref().and_then(|p| p.level.as_ref()).map(|l| l.dimension.as_str());
+-    let dimension = ctx.place.as_ref().and_then(|p| p.level.as_ref()).map(|l| l.dimension.as_str());
++    let dimension = ctx.dimension.as_deref();
      let mut view = loot::Stack { item: &mut item, count: &mut count, names: &mut names, components: &mut components };
 -    loot::loot_function(event.kind, event.data, has_player(ctx), ctx.luck, ctx.seed, dimension, &mut view);
 +    loot::loot_function(kind, data, has_player(ctx), ctx.luck, seed, dimension, &mut view);
      stack.count = count;
      if item != before_item {
          match nbt::item_key(&item) {
-@@ -362,3 +394,5 @@ fn slot_group(value: &Value) -> EquipmentSlotGroup {
+@@ -362,3 +437,5 @@ fn slot_group(value: &Value) -> EquipmentSlotGroup {
          _ => EquipmentSlotGroup::Any,
      }
  }
@@ -335,7 +440,7 @@ index c2bc432..0d2765d 100644
              items.keys.insert(id.clone(), k);
              items.ids.insert(k, id);
 diff --git a/src/spawns.rs b/src/spawns.rs
-index ec7110c..3a79777 100644
+index ec7110c..ccbd7e1 100644
 --- a/src/spawns.rs
 +++ b/src/spawns.rs
 @@ -4,13 +4,16 @@
@@ -356,7 +461,16 @@ index ec7110c..3a79777 100644
      Host, PermissionLevel, ServerHost, SpawnReason, Tag, Text,
  };
  use std::sync::Mutex;
-@@ -55,8 +58,8 @@ pub fn finalize_spawn(_host: &dyn Host, event: &mut FinalizeSpawnEvent<'_>) {
+@@ -48,15 +51,16 @@ fn seed(id: u32, pos: [f64; 3]) -> u64 {
+ /// A monster the world spawns naturally is marked (finalization must stay a pure function of the mob).
+ pub fn finalize_spawn(_host: &dyn Host, event: &mut FinalizeSpawnEvent<'_>) {
+     if matches!(event.reason, SpawnReason::Natural) && is_monster(event.kind) {
+-        let _ = event.edits.add_tag(event.mob, NATURAL_TAG);
++        // Starling's port: the unspawned mob is edited directly (debt-38).
++        let _ = event.mob.add_tag(NATURAL_TAG);
+     }
+ }
+ 
  /// A mob joined a level (not loaded from disk): a marked one is looked at in its level's next tick.
  pub fn joined(host: &mut dyn ServerHost, entity: u32, dimension: &str, kind: &str, pos: [f64; 3]) {
      let Some(tags) = host.entity(entity).and_then(|e| e.tags(&*host)) else { return };
@@ -367,7 +481,7 @@ index ec7110c..3a79777 100644
          && let Ok(mut joined) = JOINED.lock()
      {
          joined.push(Joined { entity, dimension: dimension.to_owned(), kind: kind.to_owned(), pos, spawner, age: 0 });
-@@ -231,10 +234,13 @@ const OPERATOR: PermissionLevel = PermissionLevel::Gamemasters;
+@@ -231,10 +235,13 @@ const OPERATOR: PermissionLevel = PermissionLevel::Gamemasters;
  
  /// `/vastadventures tier` shows the world tier (anyone); `/vastadventures tier <tier>` sets it and
  /// `/vastadventures boss` summons a boss (operators).
@@ -385,7 +499,7 @@ index ec7110c..3a79777 100644
  }
  
  /// Whether `source` may change the world: the dispatcher checks the level each usage registered with, and the
-@@ -246,7 +252,7 @@ fn operator(source: &CommandSource) -> bool {
+@@ -246,7 +253,7 @@ fn operator(source: &CommandSource) -> bool {
  fn tell(host: &mut dyn ServerHost, line: Text, color: &str) {
      let mut line = line;
      line.style.color = Some(color.into());
