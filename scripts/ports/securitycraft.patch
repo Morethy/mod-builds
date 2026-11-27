@@ -1,10 +1,13 @@
 diff --git a/src/lib.rs b/src/lib.rs
-index fb32c1e..3836058 100644
+index fb32c1e..37311a3 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -19,8 +19,8 @@ use mod_api::{
+@@ -17,10 +17,10 @@ mod support;
+ 
+ use mod_api::{
      self, BlockChangedEvent, BlockEntityEvent, BlockEntityPart, BlockEntityTickEvent,
-     BlockEntityTicksEvent, BlockPart, Flow, Hooks, HostSide, InteractionResult,
+-    BlockEntityTicksEvent, BlockPart, Flow, Hooks, HostSide, InteractionResult,
++    BlockPart, Flow, Hooks, HostSide, InteractionResult,
      IsSignalSourceEvent, ItemPart, LevelHost, LevelSide, LevelTickPostEvent, MenuButtonEvent,
 -    MenuClosedEvent, OnBlockPlacedByEvent, PlayerContainerCloseEvent, RegisterCommandsEvent,
 -    Registrar, RegistrationContext, RunModCommandEvent, Screen, ScreenClickEvent, ScreenDrawEvent,
@@ -52,16 +55,18 @@ index fb32c1e..3836058 100644
          support::on_state_for_placement(level, event)
      }
  }
-@@ -84,36 +91,28 @@ impl BlockEntityPart for Keypad {
-         support::on_ticks(event);
+@@ -79,41 +86,29 @@ impl BlockEntityPart for Keypad {
+         support::on_block_entity()
      }
  
+-    /// `EntityBlock.getTicker`: the keypad's signal counts down on the server.
+-    fn block_entity_ticks(&self, _host: &dyn mod_api::Host, event: &mut BlockEntityTicksEvent<'_>) {
+-        support::on_ticks(event);
+-    }
+-
 -    fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
 -        support::on_tick(host, event);
-+    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
-+        support::on_tick(event);
-     }
-+}
+-    }
  
 -    /// The panel's layout: one hidden container slot and the player's inventory below it.
 -    fn screen(
@@ -70,15 +75,18 @@ index fb32c1e..3836058 100644
 -        _event: &mut mod_api::ScreenEvent<'_>,
 -    ) -> Option<Screen> {
 -        Some(support::screen())
--    }
-+/// The keypad's menu: the keys of its screen, applied on the server.
-+struct KeypadMenu;
++    fn block_entity_tick(&self, event: &mut BlockEntityTickEvent<'_>) {
++        support::on_tick(event);
+     }
++}
  
 -    /// The code display and the twelve keys.
 -    fn screen_draw(&self, host: &dyn mod_api::ClientHost, event: &mut ScreenDrawEvent<'_>) {
 -        support::on_screen_draw(host, event);
 -    }
--
++/// The keypad's menu: the keys of its screen, applied on the server.
++struct KeypadMenu;
+ 
 -    /// A press on a drawn key names the menu button the server applies.
 -    fn screen_click(
 -        &self,
@@ -105,7 +113,7 @@ index fb32c1e..3836058 100644
      }
  }
  
-@@ -136,7 +135,7 @@ struct Mod;
+@@ -136,7 +131,7 @@ struct Mod;
  impl Hooks for Mod {
      /// Declare the keypad's block entity, its part, and its one-slot container with the mod
      /// menu the block's use opens.
@@ -114,7 +122,7 @@ index fb32c1e..3836058 100644
          let block = r.block_key(support::KEYPAD);
          let kind = r
              .block_entity_type("keypad")
-@@ -146,12 +145,20 @@ impl Hooks for Mod {
+@@ -146,12 +141,20 @@ impl Hooks for Mod {
          // would stand inert: refuse the mod's registration rather than load a half-working
          // keypad, so the game log names it.
          if let Err(error) = r.block_entity_part(&kind, Keypad) {
@@ -136,7 +144,7 @@ index fb32c1e..3836058 100644
          // Bound first: `r.item_part(r.item_key(…), …)` borrows `r` twice.
          let item = r.item_key(support::KEYPAD_ITEM);
          r.item_part(item, KeyPanel);
-@@ -166,30 +173,28 @@ impl Hooks for Mod {
+@@ -166,31 +169,30 @@ impl Hooks for Mod {
      fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
          event
              .commands
@@ -168,13 +176,16 @@ index fb32c1e..3836058 100644
          event: &mut PlayerContainerCloseEvent<'_>,
      ) {
 -        if event.menu == support::KEYPAD_MENU {
+-            support::on_container_closed(event.player, event.dimension, event.pos);
 +        let mut closed = crate::starling_sync2::menu_closed(&*host, event);
 +        self.starling_menu_closed(host, &mut closed);
 +        if event.menu_type == support::KEYPAD_MENU {
-             support::on_container_closed(event.player, event.dimension, event.pos);
++            let dimension = event.player.dimension(&*host).map(|d| d.to_string()).unwrap_or_default();
++            support::on_container_closed(event.player.uuid(), &dimension, event.pos);
          }
      }
-@@ -211,16 +216,27 @@ impl Hooks for Mod {
+ 
+@@ -211,16 +213,27 @@ impl Hooks for Mod {
          }
      }
  
@@ -215,10 +226,10 @@ index fb32c1e..3836058 100644
 +mod starling_sync2;
 diff --git a/securitycraft/src/starling_sync2.rs b/src/starling_sync2.rs
 new file mode 100644
-index 0000000..3456b3f
+index 0000000..7ab0f9c
 --- /dev/null
 +++ b/src/starling_sync2.rs
-@@ -0,0 +1,291 @@
+@@ -0,0 +1,453 @@
 +//! Starling's port to sync 2 of Sunrise's API (ed6772e2118): what changed shape around the mod's
 +//! own code, so the code stays as written. The same file in every port that needs it
 +//! (starling-ports/_shared/starling_sync2.rs).
@@ -241,6 +252,9 @@ index 0000000..3456b3f
 +#[path = "starling_sync2_attachments.rs"]
 +mod attachments;
 +pub(crate) use attachments::*;
++#[path = "starling_sync2_configs.rs"]
++mod configs;
++pub(crate) use configs::*;
 +use std::sync::atomic::{AtomicBool, Ordering};
 +
 +/// Horizon's world phases, which Sunrise splits into server hooks (debt-re-wl): `server_started`
@@ -424,6 +438,8 @@ index 0000000..3456b3f
 +/// be read is kept, as the list keeps it.
 +pub(crate) trait HookListRetain<T> {
 +    fn retain(&mut self, keep: impl FnMut(&T) -> bool);
++    /// `extend`: each entry pushed, a refused one left out (as the list refuses it).
++    fn extend(&mut self, entries: impl IntoIterator<Item = T>);
 +}
 +
 +impl<T, E: core::fmt::Debug> HookListRetain<T> for mod_api::HookList<'_, T, E> {
@@ -432,6 +448,12 @@ index 0000000..3456b3f
 +            if self.get(index).is_some_and(|entry| !keep(&entry)) {
 +                self.remove(index);
 +            }
++        }
++    }
++
++    fn extend(&mut self, entries: impl IntoIterator<Item = T>) {
++        for entry in entries {
++            let _ = self.push(entry);
 +        }
 +    }
 +}
@@ -500,6 +522,137 @@ index 0000000..3456b3f
 +    (stack.count() > 0).then_some(stack)
 +}
 +
++/// `entity.passengers(host)`: the riders as a list, which Sunrise lends as a visit now
++/// (`visit_passengers`); None where the read was refused.
++pub(crate) trait EntityPassengers {
++    fn passengers(self, host: &dyn mod_api::Host) -> Option<Vec<mod_api::EntityRef>>;
++}
++
++impl EntityPassengers for mod_api::EntityRef {
++    fn passengers(self, host: &dyn mod_api::Host) -> Option<Vec<mod_api::EntityRef>> {
++        let mut riders = Vec::new();
++        self.visit_passengers(host, &mut |rider| {
++            riders.push(rider);
++            ControlFlow::Continue(())
++        })
++        .ok()?;
++        Some(riders)
++    }
++}
++
++/// `client_surface_heights(columns, heightmap)`: the local player's level's heights, in the
++/// columns' order, which Sunrise lends by column to a visit on the level now (debt-p3-33).
++pub(crate) trait ClientHeights {
++    fn client_surface_heights(
++        &self,
++        columns: &[(i32, i32)],
++        heightmap: mod_api::Heightmap,
++    ) -> Result<Vec<Option<i32>>, mod_api::LevelReadError>;
++}
++
++impl ClientHeights for dyn mod_api::ClientHost + '_ {
++    fn client_surface_heights(
++        &self,
++        columns: &[(i32, i32)],
++        heightmap: mod_api::Heightmap,
++    ) -> Result<Vec<Option<i32>>, mod_api::LevelReadError> {
++        let level = self
++            .local_player()
++            .and_then(|player| player.entity().level(self))
++            .ok_or(mod_api::LevelReadError::Unavailable)?;
++        let mut by_column = std::collections::HashMap::with_capacity(columns.len());
++        level.visit_surface_heights(self, columns, heightmap, &mut |column, height| {
++            by_column.insert(column, height);
++            ControlFlow::Continue(())
++        })?;
++        Ok(columns.iter().map(|column| by_column.get(column).copied().flatten()).collect())
++    }
++}
++
++/// Horizon's client `command` hook heard the line the player typed and said whether the mod ran it;
++/// Sunrise runs each registered usage's own executor with the parsed invocation. The old hook's
++/// body runs from the executor on the line rebuilt from the invocation (its literals, then its
++/// arguments as typed), and a run it claimed (`Flow::Cancel`) answers `Some(1)`.
++pub(crate) struct CommandEvent<'a> {
++    pub command: &'a str,
++}
++
++/// The old hook, implemented by the mod's type (its body as the mod wrote it).
++pub(crate) trait OldClientCommand: Default {
++    fn starling_command(&self, host: &mut dyn mod_api::ClientHost, event: &mut CommandEvent<'_>) -> mod_api::Flow;
++}
++
++/// The line `invocation` was typed as, as near as its parse keeps it.
++pub(crate) fn command_line(invocation: &mod_api::CommandInvocation) -> String {
++    let mut parts: Vec<String> = invocation.literals.clone();
++    for argument in &invocation.arguments {
++        parts.push(match &argument.value {
++            mod_api::CommandArgumentValue::String(text) => text.clone(),
++            mod_api::CommandArgumentValue::Integer(n) => n.to_string(),
++            mod_api::CommandArgumentValue::Long(n) => n.to_string(),
++            mod_api::CommandArgumentValue::Number(n) => n.to_string(),
++            mod_api::CommandArgumentValue::Boolean(b) => b.to_string(),
++            _ => String::new(),
++        });
++    }
++    parts.join(" ")
++}
++
++/// The executor every one of the mod's client usages gets: the old hook on the typed line.
++pub(crate) fn client_command<T: OldClientCommand + 'static>()
++-> impl Fn(&mut dyn mod_api::ClientHost, &mod_api::CommandInvocation) -> Option<i32> + Send + Sync + 'static {
++    |host, invocation| {
++        let line = command_line(invocation);
++        let mut event = CommandEvent { command: &line };
++        matches!(T::default().starling_command(host, &mut event), mod_api::Flow::Cancel).then_some(1)
++    }
++}
++
++/// `surface_heights(dimension, columns, heightmap)` on the server: that level's heights in the
++/// columns' order, which Sunrise lends by column to a visit on the level now (debt-p3-33).
++pub(crate) trait ServerHeights {
++    fn surface_heights(
++        &self,
++        dimension: &str,
++        columns: &[(i32, i32)],
++        heightmap: mod_api::Heightmap,
++    ) -> Result<Vec<Option<i32>>, mod_api::LevelReadError>;
++}
++
++impl ServerHeights for dyn mod_api::ServerHost + '_ {
++    fn surface_heights(
++        &self,
++        dimension: &str,
++        columns: &[(i32, i32)],
++        heightmap: mod_api::Heightmap,
++    ) -> Result<Vec<Option<i32>>, mod_api::LevelReadError> {
++        let level = self.level(dimension).ok_or(mod_api::LevelReadError::Unavailable)?;
++        let mut by_column = std::collections::HashMap::with_capacity(columns.len());
++        level.visit_surface_heights(self, columns, heightmap, &mut |column, height| {
++            by_column.insert(column, height);
++            ControlFlow::Continue(())
++        })?;
++        Ok(columns.iter().map(|column| by_column.get(column).copied().flatten()).collect())
++    }
++}
++
++/// A structure refusal with a message, as `StructureError(message)` was: Sunrise's takes an error
++/// as its cause now.
++#[derive(Debug)]
++struct StructureMessage(String);
++
++impl std::fmt::Display for StructureMessage {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.write_str(&self.0)
++    }
++}
++
++impl std::error::Error for StructureMessage {}
++
++pub(crate) fn structure_error(message: impl Into<String>) -> mod_api::StructureError {
++    mod_api::StructureError::new(StructureMessage(message.into()))
++}
++
 +impl LevelsList for dyn mod_api::Levels + '_ {
 +    fn list_levels(&self) -> Vec<mod_api::LevelRef> {
 +        let mut levels = Vec::new();
@@ -508,6 +661,26 @@ index 0000000..3456b3f
 +            ControlFlow::Continue(())
 +        });
 +        levels
++    }
++}
++
++/// `ServerHost::entity_by_uuid`, which Sunrise moved onto the level that holds the entity
++/// (level-entity-by-uuid): the hook's own level first (`ServerHost::dimension`), then the others of
++/// `host.levels()`, as vanilla's `ServerLevel.getEntityInAnyDimension(UUID)` asks them.
++pub(crate) trait AnyLevelEntity {
++    fn entity_by_uuid(&self, uuid: mod_api::EntityUuid) -> Option<mod_api::EntityRef>;
++}
++
++impl AnyLevelEntity for dyn mod_api::ServerHost + '_ {
++    fn entity_by_uuid(&self, uuid: mod_api::EntityUuid) -> Option<mod_api::EntityRef> {
++        let own = self.level(self.dimension());
++        if let Some(entity) = own.and_then(|level| level.entity_by_uuid(self, uuid)) {
++            return Some(entity);
++        }
++        LevelsList::list_levels(self.levels())
++            .into_iter()
++            .filter(|&level| Some(level) != own)
++            .find_map(|level| level.entity_by_uuid(self, uuid))
 +    }
 +}
 diff --git a/securitycraft/src/starling_sync2_attachments.rs b/src/starling_sync2_attachments.rs
@@ -612,12 +785,124 @@ index 0000000..15d8d61
 +        self.key()?.remove(host, holder)
 +    }
 +}
+diff --git a/securitycraft/src/starling_sync2_configs.rs b/src/starling_sync2_configs.rs
+new file mode 100644
+index 0000000..1ab9123
+--- /dev/null
++++ b/src/starling_sync2_configs.rs
+@@ -0,0 +1,106 @@
++//! Horizon's config hooks (`register_configs`, `config_loading`, `config_reloading`,
++//! `config_unloading`), which Sunrise replaced with a registration in `register` and a listener of
++//! its own per file (debt-p3-25-native-config-roots). The mod's old hook bodies stay as
++//! `OldConfigs`; `register_configs` registers each config they declare, and its listener runs the
++//! old body for the event with the file as the old hooks were given it.
++
++use std::sync::Arc;
++
++/// A config the mod declares: `config/<mod id>-<kind>.toml` unless named, `default` when missing.
++pub(crate) struct Config {
++    pub mod_id: String,
++    pub kind: mod_api::ConfigKind,
++    pub file: String,
++    pub default: String,
++}
++
++fn suffix(kind: mod_api::ConfigKind) -> &'static str {
++    match kind {
++        mod_api::ConfigKind::Client => "client",
++        mod_api::ConfigKind::Common => "common",
++        _ => "server",
++    }
++}
++
++impl Config {
++    pub(crate) fn new(mod_id: &str, kind: mod_api::ConfigKind, default: &str) -> Self {
++        Self {
++            mod_id: mod_id.to_owned(),
++            kind,
++            file: format!("{mod_id}-{}.toml", suffix(kind)),
++            default: default.to_owned(),
++        }
++    }
++
++    /// The same in another file of `config/`, such as `mymod/machines.toml`.
++    pub(crate) fn file(mut self, file: &str) -> Self {
++        file.clone_into(&mut self.file);
++        self
++    }
++}
++
++/// A config file as read: its registered name and its text.
++pub(crate) struct ConfigFile {
++    pub mod_id: String,
++    pub kind: mod_api::ConfigKind,
++    pub file: String,
++    pub text: String,
++}
++
++pub(crate) struct RegisterConfigsEvent<'a> {
++    pub configs: &'a mut Vec<Config>,
++}
++
++pub(crate) struct ConfigLoadingEvent<'a> {
++    pub config: &'a ConfigFile,
++}
++
++pub(crate) struct ConfigReloadingEvent<'a> {
++    pub config: &'a ConfigFile,
++}
++
++pub(crate) struct ConfigUnloadingEvent<'a> {
++    pub config: &'a ConfigFile,
++}
++
++/// The mod's old config hooks, as it wrote them.
++pub(crate) trait OldConfigs: Default + Send + Sync + 'static {
++    fn starling_register_configs(&self, _event: &mut RegisterConfigsEvent<'_>) {}
++    fn starling_config_loading(&self, _context: &dyn mod_api::ConfigContext, _event: &mut ConfigLoadingEvent<'_>) {}
++    fn starling_config_reloading(&self, _host: mod_api::HostSide<'_>, _event: &mut ConfigReloadingEvent<'_>) {}
++    fn starling_config_unloading(&self, _host: &mut dyn mod_api::ServerHost, _event: &mut ConfigUnloadingEvent<'_>) {}
++}
++
++/// Registers every config the mod's `register_configs` declares, each with a listener that runs
++/// its old loading, reloading and unloading hooks (on the mod's shared state: `T::default()`).
++pub(crate) fn register_configs<T: OldConfigs>(r: &mut (dyn mod_api::Registrar + '_)) {
++    let mut configs = Vec::new();
++    T::default().starling_register_configs(&mut RegisterConfigsEvent { configs: &mut configs });
++    for config in configs {
++        let spec = mod_api::ConfigSpec::new(config.kind, config.default.clone()).file(config.file.clone());
++        let (mod_id, kind) = (config.mod_id.clone(), config.kind);
++        let listener = move |event: mod_api::ConfigEvent<'_>, snapshot: &mod_api::ConfigSnapshot| -> Result<(), String> {
++            let file = ConfigFile {
++                mod_id: mod_id.clone(),
++                kind,
++                file: snapshot.file.to_string_lossy().replace('\\', "/"),
++                text: snapshot.text.clone(),
++            };
++            let this = T::default();
++            match event {
++                mod_api::ConfigEvent::Loading(context) => {
++                    this.starling_config_loading(context, &mut ConfigLoadingEvent { config: &file })
++                }
++                mod_api::ConfigEvent::Reloading(host) => {
++                    this.starling_config_reloading(host, &mut ConfigReloadingEvent { config: &file })
++                }
++                mod_api::ConfigEvent::Unloading(host) => {
++                    this.starling_config_unloading(host, &mut ConfigUnloadingEvent { config: &file })
++                }
++                _ => {}
++            }
++            Ok(())
++        };
++        let _ = r.register_config(spec, Some(Arc::new(listener)));
++    }
++}
 diff --git a/securitycraft/src/starling_sync2_files.rs b/src/starling_sync2_files.rs
 new file mode 100644
-index 0000000..bac8dce
+index 0000000..1e14e5f
 --- /dev/null
 +++ b/src/starling_sync2_files.rs
-@@ -0,0 +1,219 @@
+@@ -0,0 +1,254 @@
 +//! Horizon's checked mod files (`ConfigFiles`, `ConfigPath`, `ConfigFileError`), which Sunrise
 +//! replaced with plain folders and `std::fs` (debt-p3-25-native-config-roots): the same calls, on
 +//! the folders Sunrise names for them. Config files sit in the shared `config/` folder
@@ -683,6 +968,23 @@ index 0000000..bac8dce
 +            None => false,
 +        }
 +    }
++}
++
++/// What a path holds.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum ConfigEntryKind {
++    File,
++    Folder,
++}
++
++/// A file's or folder's size and age (`java.io.File.length` / `lastModified`).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) struct ConfigStat {
++    pub kind: ConfigEntryKind,
++    /// Bytes, for a file; 0 for a folder.
++    pub len: u64,
++    /// Milliseconds since the Unix epoch; 0 where the system doesn't say.
++    pub modified_millis: u64,
 +}
 +
 +/// Why a file call was refused.
@@ -787,6 +1089,24 @@ index 0000000..bac8dce
 +            let _ = std::fs::remove_file(&temporary);
 +            io(e)
 +        })
++    }
++
++    /// What is at `path`; None where nothing is.
++    pub(crate) fn stat(&self, path: &ConfigPath) -> Result<Option<ConfigStat>, ConfigFileError> {
++        let at = self.path(path)?;
++        match std::fs::metadata(&at) {
++            Ok(meta) => Ok(Some(ConfigStat {
++                kind: if meta.is_dir() { ConfigEntryKind::Folder } else { ConfigEntryKind::File },
++                len: if meta.is_dir() { 0 } else { meta.len() },
++                modified_millis: meta
++                    .modified()
++                    .ok()
++                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
++                    .map_or(0, |d| d.as_millis() as u64),
++            })),
++            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
++            Err(e) => Err(io(e)),
++        }
 +    }
 +
 +    /// Removes the file: `Ok(true)` when it was there, `Ok(false)` when nothing was.
@@ -929,10 +1249,10 @@ index 0000000..9c23a43
 +}
 diff --git a/securitycraft/src/starling_sync2_menus.rs b/src/starling_sync2_menus.rs
 new file mode 100644
-index 0000000..0cb6c37
+index 0000000..80253fb
 --- /dev/null
 +++ b/src/starling_sync2_menus.rs
-@@ -0,0 +1,83 @@
+@@ -0,0 +1,90 @@
 +//! Horizon's native chest menus by player UUID and window id, which Sunrise moved onto `PlayerRef`
 +//! and `MenuRef` (debt-p3-10, debt-p3-07), and its `menu_closed` notice, which Sunrise folds into
 +//! `player_container_close` (debt-p3-67): the same calls and the same notice, rebuilt from them.
@@ -951,6 +1271,8 @@ index 0000000..0cb6c37
 +    ) -> Result<Option<i32>, mod_api::StackWriteError>;
 +    /// Closes the player's current menu, if any.
 +    fn close_menu(&mut self, uuid: u128);
++    /// The player's open window `window`: None for another window or a player who isn't here.
++    fn menu(&self, uuid: u128, window: i32) -> Option<mod_api::MenuRef>;
 +    /// Replaces the items of the player's open window `window`.
 +    fn menu_set_items(
 +        &mut self,
@@ -983,6 +1305,11 @@ index 0000000..0cb6c37
 +        if let Some(menu) = self.player(uuid).and_then(|player| player.container_menu(self)) {
 +            let _ = menu.close_container(self);
 +        }
++    }
++
++    fn menu(&self, uuid: u128, window: i32) -> Option<mod_api::MenuRef> {
++        let menu = self.player(uuid)?.container_menu(self)?;
++        (menu.container_id(self) == Some(window)).then_some(menu)
 +    }
 +
 +    fn menu_set_items(
@@ -1169,7 +1496,7 @@ index 0000000..2ffe00d
 +    std::mem::take(&mut *CHANGES.lock().unwrap_or_else(|e| e.into_inner()))
 +}
 diff --git a/src/support.rs b/src/support.rs
-index 62e8693..5440a31 100644
+index 62e8693..ca9a729 100644
 --- a/src/support.rs
 +++ b/src/support.rs
 @@ -1,3 +1,6 @@
@@ -1199,7 +1526,18 @@ index 62e8693..5440a31 100644
  }
  
  /// The `powered` state of the block at `pos`.
-@@ -342,33 +346,64 @@ fn data_slots(
+@@ -317,10 +321,6 @@ pub(crate) fn on_block_placed_by(host: &mut dyn ServerHost, event: &mut OnBlockP
+ 
+ /// A keypad block entity ticks: the signal countdown and the menu's data slots
+ /// (`EntityBlock.getTicker`).
+-pub(crate) fn on_ticks(event: &mut mod_api::BlockEntityTicksEvent<'_>) {
+-    event.ticks = true;
+-}
+-
+ /// The data slots the screen reads: mode, typed length, status, code-set flag,
+ /// powered flag and the signal left.
+ fn data_slots(
+@@ -342,33 +342,64 @@ fn data_slots(
  
  /// One keypad tick: count the signal down and turn it off when it reaches zero,
  /// then keep the menu's data slots current.
@@ -1285,7 +1623,7 @@ index 62e8693..5440a31 100644
  }
  
  /// A player uses the keypad: a powered keypad does nothing (upstream's
-@@ -388,7 +423,7 @@ pub(crate) fn on_use(
+@@ -388,7 +419,7 @@ pub(crate) fn on_use(
      // runs before the block's own use. A stranger's module, a second one of a type the
      // keypad already has and any other held item all fall through to the menu below.
      if let Some(stack) = click.stack
@@ -1294,7 +1632,7 @@ index 62e8693..5440a31 100644
          && may_install(owner_of(&data), click.player)
          && !has_module(&data, HARMING_MODULE)
      {
-@@ -450,8 +485,8 @@ pub(crate) fn on_use(
+@@ -450,8 +481,8 @@ pub(crate) fn on_use(
  
  /// The keypad's screen layout: one container slot the game keeps but the panel
  /// does not show (a keypad has no item view), and the player's inventory below.
@@ -1305,7 +1643,7 @@ index 62e8693..5440a31 100644
          width: SCREEN_WIDTH,
          height: SCREEN_HEIGHT,
          slots: vec![None],
-@@ -459,8 +494,13 @@ pub(crate) fn screen() -> Screen {
+@@ -459,8 +490,13 @@ pub(crate) fn screen() -> Screen {
          inventory_x: 8.0,
          own_labels: false,
          own_background: false,
@@ -1321,7 +1659,7 @@ index 62e8693..5440a31 100644
  }
  
  fn centred_text(draw: &mut dyn DrawContext, origin: [f32; 2], text: &str, row: f32, argb: u32) {
-@@ -470,10 +510,9 @@ fn centred_text(draw: &mut dyn DrawContext, origin: [f32; 2], text: &str, row: f
+@@ -470,10 +506,9 @@ fn centred_text(draw: &mut dyn DrawContext, origin: [f32; 2], text: &str, row: f
  }
  
  /// Draws the code display and the twelve keys (`screen_draw`).
@@ -1333,7 +1671,7 @@ index 62e8693..5440a31 100644
      let mode = Mode::from_int(data.first().copied().unwrap_or(0));
      let typed = usize::try_from(data.get(1).copied().unwrap_or(0)).unwrap_or(0);
      let status = data.get(2).copied().unwrap_or(STATUS_NONE);
-@@ -527,7 +566,7 @@ pub(crate) fn on_screen_draw(_host: &dyn ClientHost, event: &mut ScreenDrawEvent
+@@ -527,7 +562,7 @@ pub(crate) fn on_screen_draw(_host: &dyn ClientHost, event: &mut ScreenDrawEvent
  
  /// A press on the keypad screen names the menu button the game sends to the
  /// server (`screen_click`).
@@ -1342,7 +1680,7 @@ index 62e8693..5440a31 100644
      let at = event.at;
      (0..=11).find(|id| {
          key_rect(*id).is_some_and(|[x, y, width, height]| {
-@@ -645,7 +684,7 @@ fn fresh_salt(host: &mut dyn ServerHost) -> Option<String> {
+@@ -645,7 +680,7 @@ fn fresh_salt(host: &mut dyn ServerHost) -> Option<String> {
      let bytes = level.with_random(host, |random| {
          let mut bytes = [0u8; 16];
          for chunk in bytes.chunks_mut(4) {
@@ -1351,7 +1689,7 @@ index 62e8693..5440a31 100644
              chunk.copy_from_slice(&draw.to_le_bytes());
          }
          bytes
-@@ -753,29 +792,55 @@ fn apply_key(
+@@ -753,29 +788,55 @@ fn apply_key(
  }
  
  /// The server applies a key press (`menu_button`).
@@ -1424,7 +1762,7 @@ index 62e8693..5440a31 100644
  }
  
  /// A wrong submission with the harming module installed hurts the player who made it
-@@ -836,7 +901,7 @@ pub(crate) fn on_state_for_placement(
+@@ -836,7 +897,7 @@ pub(crate) fn on_state_for_placement(
      if !is_keypad(level, event.state) {
          return None;
      }
@@ -1433,7 +1771,7 @@ index 62e8693..5440a31 100644
      level
          .state_with_property(event.state, "facing", facing)
          .map(Some)
-@@ -972,6 +1037,7 @@ pub(crate) fn container() -> ModContainer {
+@@ -972,6 +1033,7 @@ pub(crate) fn container() -> ModContainer {
          inputs: Vec::new(),
          outputs: Vec::new(),
          menu: Some(KEYPAD_MENU.to_owned()),
@@ -1441,7 +1779,7 @@ index 62e8693..5440a31 100644
      }
  }
  
-@@ -1153,10 +1219,10 @@ fn set_owner(
+@@ -1153,10 +1215,10 @@ fn set_owner(
  /// Answers a `/securitycraft` invocation, or `None` when it is not one.
  pub(crate) fn command(
      host: &mut dyn ServerHost,
@@ -1455,7 +1793,7 @@ index 62e8693..5440a31 100644
          mod_api::CommandSource::Player { player, .. } => Some(player.uuid()),
          _ => None,
      };
-@@ -1219,7 +1285,7 @@ pub(crate) fn command(
+@@ -1219,7 +1281,7 @@ pub(crate) fn command(
  /// The command's answer, routed to its originating source (the swapped-in
  /// player, the console, a command block) as the command service does.
  pub(crate) fn feedback(host: &mut dyn ServerHost, line: &str) {

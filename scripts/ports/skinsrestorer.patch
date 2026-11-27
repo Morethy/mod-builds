@@ -1,21 +1,86 @@
 diff --git a/src/lib.rs b/src/lib.rs
-index 68c1dae..4a02066 100644
+index 68c1dae..e766174 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -12,9 +12,11 @@
+@@ -12,11 +12,14 @@
  
  #![deny(unsafe_code)]
  
++use crate::starling_sync2::{Config, ConfigFile};
 +use crate::starling_sync2::HostFiles as _;
 +use crate::starling_sync2::ConfigPath;
  use mod_api::{
-     self, Command, CommandArgumentValue, CommandSource, Config, ConfigFile, ConfigKind,
+-    self, Command, CommandArgumentValue, CommandSource, Config, ConfigFile, ConfigKind,
 -    ConfigLoadingEvent, ConfigPath, ConfigReloadingEvent, Flow, GameProfile, Hooks, HostSide,
-+    ConfigLoadingEvent, ConfigReloadingEvent, Flow, GameProfile, Hooks, HostSide,
-     PlayerLoginProfileEvent, PlayerRef, ProfileProperty, ProfileResolution, RegisterCommandsEvent,
-     RegisterConfigsEvent, RunModCommandEvent, ServerHost, ServerTickEvent, ServerTickPhase, Text,
+-    PlayerLoginProfileEvent, PlayerRef, ProfileProperty, ProfileResolution, RegisterCommandsEvent,
+-    RegisterConfigsEvent, RunModCommandEvent, ServerHost, ServerTickEvent, ServerTickPhase, Text,
++    self, Command, CommandArgumentValue, CommandSource, ConfigKind,
++    Flow, Hooks, HostSide,
++    PlayerLoginProfileEvent, PlayerRef, ProfileResolution, RegisterCommandsEvent,
++    ServerHost, ServerTickEvent, ServerTickPhase, Text,
  };
-@@ -305,7 +307,7 @@ fn stored_skin(profile: &GameProfile) -> Result<StoredSkin, String> {
+ use serde::{Deserialize, Serialize};
+ use std::{
+@@ -63,18 +66,25 @@ struct PendingLookup {
+     looked_up: String,
+ }
+ 
++#[derive(Clone)]
+ struct SkinsRestorer {
+-    skins: RwLock<BTreeMap<String, StoredSkin>>,
++    skins: std::sync::Arc<RwLock<BTreeMap<String, StoredSkin>>>,
+     /// Lookups the resolver is still running, in the order they started.
+-    pending: Mutex<Vec<PendingLookup>>,
++    pending: std::sync::Arc<Mutex<Vec<PendingLookup>>>,
+ }
+ 
++/// Starling's port: one state for every `SkinsRestorer` the port makes: the game's, the ones the
++/// config listeners reach through `Default` (crate::starling_sync2::OldConfigs) and the command
++/// executors' clones, as the old hooks all had the game's.
+ impl Default for SkinsRestorer {
+     fn default() -> Self {
+-        Self {
+-            skins: RwLock::new(BTreeMap::new()),
+-            pending: Mutex::new(Vec::new()),
+-        }
++        static SHARED: std::sync::OnceLock<SkinsRestorer> = std::sync::OnceLock::new();
++        SHARED
++            .get_or_init(|| Self {
++                skins: std::sync::Arc::new(RwLock::new(BTreeMap::new())),
++                pending: std::sync::Arc::new(Mutex::new(Vec::new())),
++            })
++            .clone()
+     }
+ }
+ 
+@@ -281,12 +291,12 @@ fn profile_skin(skin: &StoredSkin) -> bool {
+ }
+ 
+ /// The `textures` property a stored skin sends.
+-fn textures_property(skin: &StoredSkin) -> ProfileProperty {
+-    ProfileProperty::new(
+-        "textures".to_owned(),
+-        skin.value.clone(),
+-        skin.signature.clone(),
+-    )
++fn textures_property(skin: &StoredSkin) -> mod_api::AccountProfileProperty {
++    mod_api::AccountProfileProperty {
++        name: "textures".to_owned(),
++        value: skin.value.clone(),
++        signature: skin.signature.clone(),
++    }
+ }
+ 
+ /// The skin a player's login should send, if the stored one fits the profile.
+@@ -298,14 +308,14 @@ fn login_skin(skins: &BTreeMap<String, StoredSkin>, player: u128) -> Option<Stor
+ }
+ 
+ /// The skin a resolved profile carries: its `textures` property.
+-fn stored_skin(profile: &GameProfile) -> Result<StoredSkin, String> {
++fn stored_skin(profile: &mod_api::AccountProfile) -> Result<StoredSkin, String> {
+     let textures = profile
+         .properties
+         .iter()
          .find(|property| property.name == "textures")
          .ok_or_else(|| format!("{} has no skin property.", profile.name))?;
      Ok(StoredSkin {
@@ -24,7 +89,7 @@ index 68c1dae..4a02066 100644
          value: textures.value.clone(),
          signature: textures.signature.clone(),
      })
-@@ -336,7 +338,7 @@ fn target_player(
+@@ -336,7 +346,7 @@ fn target_player(
  impl SkinsRestorer {
      /// Answers the command's source.
      fn feedback(host: &mut dyn ServerHost, line: impl Into<String>) {
@@ -33,25 +98,25 @@ index 68c1dae..4a02066 100644
      }
  
      /// `/skin set <name> [target]`: starts the lookup.
-@@ -362,7 +364,7 @@ impl SkinsRestorer {
+@@ -358,7 +368,7 @@ impl SkinsRestorer {
+             CommandSource::Player { player, .. } => Some(*player),
+             _ => None,
+         };
+-        let target_name = player.name(host);
++        let target_name = player.name(host).map(str::to_owned);
          let lookup = PendingLookup {
              player,
              requested_by,
--            target_name: target_name.clone(),
-+            target_name: target_name.clone().map(str::to_owned),
-             looked_up: name.clone(),
-         };
-         if self.start_lookup(host, lookup) {
-@@ -370,7 +372,7 @@ impl SkinsRestorer {
+@@ -370,7 +380,7 @@ impl SkinsRestorer {
              if let Some(requester) = requested_by
                  && requester != player
              {
 -                let target = target_name.unwrap_or_else(|| "that player".to_owned());
-+                let target = target_name.unwrap_or_else(|| "that player");
++                let target = target_name.as_deref().unwrap_or("that player");
                  let _ = requester.tell(
                      host,
                      Text::literal(format!("Looking up {name} for {target}...")),
-@@ -423,7 +425,7 @@ impl SkinsRestorer {
+@@ -423,7 +433,7 @@ impl SkinsRestorer {
          let lookup = PendingLookup {
              player: *player,
              requested_by: Some(*player),
@@ -60,27 +125,164 @@ index 68c1dae..4a02066 100644
              looked_up: skin.name.clone(),
          };
          if self.start_lookup(host, lookup) {
-@@ -523,7 +525,7 @@ impl Hooks for SkinsRestorer {
-                     Self::feedback(host, "Usage: /skin set <name> [player]");
-                     return Flow::Cancel;
-                 };
+@@ -448,21 +458,10 @@ impl SkinsRestorer {
+ 
+ #[mod_api::sunrise_mod]
+ impl Hooks for SkinsRestorer {
+-    fn register_configs(&self, _: HostSide<'_>, event: &mut RegisterConfigsEvent<'_>) {
+-        event.configs.push(
+-            Config::new("skinsrestorer", ConfigKind::Common, DEFAULT_CONFIG).file(CONFIG_FILE),
+-        );
+-    }
+ 
+-    fn config_loading(&self, _: HostSide<'_>, event: &mut ConfigLoadingEvent<'_>) {
+-        self.load(event.config);
+-    }
+ 
+-    fn config_reloading(&self, _: HostSide<'_>, event: &mut ConfigReloadingEvent<'_>) {
+-        self.load(event.config);
+-    }
+ 
+-    fn player_login_profile(&self, event: &mut PlayerLoginProfileEvent<'_>) {
++    fn player_login_profile(&self, _host: &mut dyn ServerHost, event: &mut PlayerLoginProfileEvent<'_>) {
+         let Some(skin) = self
+             .skins
+             .read()
+@@ -499,42 +498,14 @@ impl Hooks for SkinsRestorer {
+             Command::op("skin clear <target:player>", 2),
+             Command::new("skin update"),
+         ] {
+-            event.commands.push(command);
+-        }
+-    }
+-
+-    fn run_mod_command(
+-        &self,
+-        host: &mut dyn ServerHost,
+-        event: &mut RunModCommandEvent<'_>,
+-    ) -> Flow {
+-        if event.command.literals.first().map(String::as_str) != Some("skin") {
+-            return Flow::Continue;
+-        }
+-        let subcommand = event.command.literals.get(1).map(String::as_str);
+-        let target = match event.command.argument("target") {
+-            Some(CommandArgumentValue::Player(player)) => Some(*player),
+-            _ => None,
+-        };
+-        match subcommand {
+-            Some("set") => {
+-                let Some(CommandArgumentValue::String(name)) = event.command.argument("name")
+-                else {
+-                    Self::feedback(host, "Usage: /skin set <name> [player]");
+-                    return Flow::Cancel;
+-                };
 -                if !valid_account_name(name) {
-+                if !valid_account_name(&name) {
-                     Self::feedback(
-                         host,
-                         "A Minecraft name is 3 to 16 letters, digits or underscores.",
-@@ -636,3 +638,5 @@ mod tests {
+-                    Self::feedback(
+-                        host,
+-                        "A Minecraft name is 3 to 16 letters, digits or underscores.",
+-                    );
+-                    return Flow::Cancel;
+-                }
+-                self.command_set(host, event.source, name.clone(), target)
+-            }
+-            Some("clear") => self.command_clear(host, event.source, target),
+-            Some("update") => self.command_update(host, event.source),
+-            _ => self.command_show(host, event.source),
++            // Starling's port: each usage runs its own executor (debt-43), the old
++            // `run_mod_command` routing below; a cancelled answer is the command's success.
++            let this = self.clone();
++            event.commands.push(command.executes(move |host, source, invocation| {
++                crate::starling_sync2::ok(
++                    matches!(this.run_command(host, source, invocation), Flow::Cancel).then_some(1),
++                )
++            }));
+         }
+     }
+ 
+@@ -543,8 +514,32 @@ impl Hooks for SkinsRestorer {
+             self.poll(host);
+         }
+     }
++
++    /// Starling's port: the old config hooks' files (crate::starling_sync2::OldConfigs).
++    fn register(&self, r: &mut dyn mod_api::Registrar, _cx: &mod_api::RegistrationContext) {
++        crate::starling_sync2::register_configs::<SkinsRestorer>(&mut *r);
++    }
++
+ }
+ 
++impl crate::starling_sync2::OldConfigs for SkinsRestorer {
++
++    fn starling_register_configs(&self, event: &mut crate::starling_sync2::RegisterConfigsEvent<'_>) {
++        event.configs.push(
++            Config::new("skinsrestorer", ConfigKind::Common, DEFAULT_CONFIG).file(CONFIG_FILE),
++        );
++    }
++
++    fn starling_config_loading(&self, _: &dyn mod_api::ConfigContext, event: &mut crate::starling_sync2::ConfigLoadingEvent<'_>) {
++        self.load(event.config);
++    }
++
++    fn starling_config_reloading(&self, _: mod_api::HostSide<'_>, event: &mut crate::starling_sync2::ConfigReloadingEvent<'_>) {
++        self.load(event.config);
++    }
++}
++
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -636,3 +631,44 @@ mod tests {
          assert!(!valid_account_name(&"a".repeat(17)));
      }
  }
 +
 +mod starling_sync2;
++
++impl SkinsRestorer {
++    /// Starling's port: Horizon's `run_mod_command`, which every `/skin` usage's executor runs.
++    fn run_command(
++        &self,
++        host: &mut dyn ServerHost,
++        source: &CommandSource,
++        command: &mod_api::CommandInvocation,
++    ) -> Flow {
++        if command.literals.first().map(String::as_str) != Some("skin") {
++            return Flow::Continue;
++        }
++        let subcommand = command.literals.get(1).map(String::as_str);
++        let target = match command.argument("target") {
++            Some(CommandArgumentValue::Player(player)) => Some(*player),
++            _ => None,
++        };
++        match subcommand {
++            Some("set") => {
++                let Some(CommandArgumentValue::String(name)) = command.argument("name")
++                else {
++                    Self::feedback(host, "Usage: /skin set <name> [player]");
++                    return Flow::Cancel;
++                };
++                if !valid_account_name(&name) {
++                    Self::feedback(
++                        host,
++                        "A Minecraft name is 3 to 16 letters, digits or underscores.",
++                    );
++                    return Flow::Cancel;
++                }
++                self.command_set(host, source, name.clone(), target)
++            }
++            Some("clear") => self.command_clear(host, source, target),
++            Some("update") => self.command_update(host, source),
++            _ => self.command_show(host, source),
++        }
++    }
++}
 diff --git a/skinsrestorer/src/starling_sync2.rs b/src/starling_sync2.rs
 new file mode 100644
-index 0000000..3456b3f
+index 0000000..7ab0f9c
 --- /dev/null
 +++ b/src/starling_sync2.rs
-@@ -0,0 +1,291 @@
+@@ -0,0 +1,453 @@
 +//! Starling's port to sync 2 of Sunrise's API (ed6772e2118): what changed shape around the mod's
 +//! own code, so the code stays as written. The same file in every port that needs it
 +//! (starling-ports/_shared/starling_sync2.rs).
@@ -103,6 +305,9 @@ index 0000000..3456b3f
 +#[path = "starling_sync2_attachments.rs"]
 +mod attachments;
 +pub(crate) use attachments::*;
++#[path = "starling_sync2_configs.rs"]
++mod configs;
++pub(crate) use configs::*;
 +use std::sync::atomic::{AtomicBool, Ordering};
 +
 +/// Horizon's world phases, which Sunrise splits into server hooks (debt-re-wl): `server_started`
@@ -286,6 +491,8 @@ index 0000000..3456b3f
 +/// be read is kept, as the list keeps it.
 +pub(crate) trait HookListRetain<T> {
 +    fn retain(&mut self, keep: impl FnMut(&T) -> bool);
++    /// `extend`: each entry pushed, a refused one left out (as the list refuses it).
++    fn extend(&mut self, entries: impl IntoIterator<Item = T>);
 +}
 +
 +impl<T, E: core::fmt::Debug> HookListRetain<T> for mod_api::HookList<'_, T, E> {
@@ -294,6 +501,12 @@ index 0000000..3456b3f
 +            if self.get(index).is_some_and(|entry| !keep(&entry)) {
 +                self.remove(index);
 +            }
++        }
++    }
++
++    fn extend(&mut self, entries: impl IntoIterator<Item = T>) {
++        for entry in entries {
++            let _ = self.push(entry);
 +        }
 +    }
 +}
@@ -362,6 +575,137 @@ index 0000000..3456b3f
 +    (stack.count() > 0).then_some(stack)
 +}
 +
++/// `entity.passengers(host)`: the riders as a list, which Sunrise lends as a visit now
++/// (`visit_passengers`); None where the read was refused.
++pub(crate) trait EntityPassengers {
++    fn passengers(self, host: &dyn mod_api::Host) -> Option<Vec<mod_api::EntityRef>>;
++}
++
++impl EntityPassengers for mod_api::EntityRef {
++    fn passengers(self, host: &dyn mod_api::Host) -> Option<Vec<mod_api::EntityRef>> {
++        let mut riders = Vec::new();
++        self.visit_passengers(host, &mut |rider| {
++            riders.push(rider);
++            ControlFlow::Continue(())
++        })
++        .ok()?;
++        Some(riders)
++    }
++}
++
++/// `client_surface_heights(columns, heightmap)`: the local player's level's heights, in the
++/// columns' order, which Sunrise lends by column to a visit on the level now (debt-p3-33).
++pub(crate) trait ClientHeights {
++    fn client_surface_heights(
++        &self,
++        columns: &[(i32, i32)],
++        heightmap: mod_api::Heightmap,
++    ) -> Result<Vec<Option<i32>>, mod_api::LevelReadError>;
++}
++
++impl ClientHeights for dyn mod_api::ClientHost + '_ {
++    fn client_surface_heights(
++        &self,
++        columns: &[(i32, i32)],
++        heightmap: mod_api::Heightmap,
++    ) -> Result<Vec<Option<i32>>, mod_api::LevelReadError> {
++        let level = self
++            .local_player()
++            .and_then(|player| player.entity().level(self))
++            .ok_or(mod_api::LevelReadError::Unavailable)?;
++        let mut by_column = std::collections::HashMap::with_capacity(columns.len());
++        level.visit_surface_heights(self, columns, heightmap, &mut |column, height| {
++            by_column.insert(column, height);
++            ControlFlow::Continue(())
++        })?;
++        Ok(columns.iter().map(|column| by_column.get(column).copied().flatten()).collect())
++    }
++}
++
++/// Horizon's client `command` hook heard the line the player typed and said whether the mod ran it;
++/// Sunrise runs each registered usage's own executor with the parsed invocation. The old hook's
++/// body runs from the executor on the line rebuilt from the invocation (its literals, then its
++/// arguments as typed), and a run it claimed (`Flow::Cancel`) answers `Some(1)`.
++pub(crate) struct CommandEvent<'a> {
++    pub command: &'a str,
++}
++
++/// The old hook, implemented by the mod's type (its body as the mod wrote it).
++pub(crate) trait OldClientCommand: Default {
++    fn starling_command(&self, host: &mut dyn mod_api::ClientHost, event: &mut CommandEvent<'_>) -> mod_api::Flow;
++}
++
++/// The line `invocation` was typed as, as near as its parse keeps it.
++pub(crate) fn command_line(invocation: &mod_api::CommandInvocation) -> String {
++    let mut parts: Vec<String> = invocation.literals.clone();
++    for argument in &invocation.arguments {
++        parts.push(match &argument.value {
++            mod_api::CommandArgumentValue::String(text) => text.clone(),
++            mod_api::CommandArgumentValue::Integer(n) => n.to_string(),
++            mod_api::CommandArgumentValue::Long(n) => n.to_string(),
++            mod_api::CommandArgumentValue::Number(n) => n.to_string(),
++            mod_api::CommandArgumentValue::Boolean(b) => b.to_string(),
++            _ => String::new(),
++        });
++    }
++    parts.join(" ")
++}
++
++/// The executor every one of the mod's client usages gets: the old hook on the typed line.
++pub(crate) fn client_command<T: OldClientCommand + 'static>()
++-> impl Fn(&mut dyn mod_api::ClientHost, &mod_api::CommandInvocation) -> Option<i32> + Send + Sync + 'static {
++    |host, invocation| {
++        let line = command_line(invocation);
++        let mut event = CommandEvent { command: &line };
++        matches!(T::default().starling_command(host, &mut event), mod_api::Flow::Cancel).then_some(1)
++    }
++}
++
++/// `surface_heights(dimension, columns, heightmap)` on the server: that level's heights in the
++/// columns' order, which Sunrise lends by column to a visit on the level now (debt-p3-33).
++pub(crate) trait ServerHeights {
++    fn surface_heights(
++        &self,
++        dimension: &str,
++        columns: &[(i32, i32)],
++        heightmap: mod_api::Heightmap,
++    ) -> Result<Vec<Option<i32>>, mod_api::LevelReadError>;
++}
++
++impl ServerHeights for dyn mod_api::ServerHost + '_ {
++    fn surface_heights(
++        &self,
++        dimension: &str,
++        columns: &[(i32, i32)],
++        heightmap: mod_api::Heightmap,
++    ) -> Result<Vec<Option<i32>>, mod_api::LevelReadError> {
++        let level = self.level(dimension).ok_or(mod_api::LevelReadError::Unavailable)?;
++        let mut by_column = std::collections::HashMap::with_capacity(columns.len());
++        level.visit_surface_heights(self, columns, heightmap, &mut |column, height| {
++            by_column.insert(column, height);
++            ControlFlow::Continue(())
++        })?;
++        Ok(columns.iter().map(|column| by_column.get(column).copied().flatten()).collect())
++    }
++}
++
++/// A structure refusal with a message, as `StructureError(message)` was: Sunrise's takes an error
++/// as its cause now.
++#[derive(Debug)]
++struct StructureMessage(String);
++
++impl std::fmt::Display for StructureMessage {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.write_str(&self.0)
++    }
++}
++
++impl std::error::Error for StructureMessage {}
++
++pub(crate) fn structure_error(message: impl Into<String>) -> mod_api::StructureError {
++    mod_api::StructureError::new(StructureMessage(message.into()))
++}
++
 +impl LevelsList for dyn mod_api::Levels + '_ {
 +    fn list_levels(&self) -> Vec<mod_api::LevelRef> {
 +        let mut levels = Vec::new();
@@ -370,6 +714,26 @@ index 0000000..3456b3f
 +            ControlFlow::Continue(())
 +        });
 +        levels
++    }
++}
++
++/// `ServerHost::entity_by_uuid`, which Sunrise moved onto the level that holds the entity
++/// (level-entity-by-uuid): the hook's own level first (`ServerHost::dimension`), then the others of
++/// `host.levels()`, as vanilla's `ServerLevel.getEntityInAnyDimension(UUID)` asks them.
++pub(crate) trait AnyLevelEntity {
++    fn entity_by_uuid(&self, uuid: mod_api::EntityUuid) -> Option<mod_api::EntityRef>;
++}
++
++impl AnyLevelEntity for dyn mod_api::ServerHost + '_ {
++    fn entity_by_uuid(&self, uuid: mod_api::EntityUuid) -> Option<mod_api::EntityRef> {
++        let own = self.level(self.dimension());
++        if let Some(entity) = own.and_then(|level| level.entity_by_uuid(self, uuid)) {
++            return Some(entity);
++        }
++        LevelsList::list_levels(self.levels())
++            .into_iter()
++            .filter(|&level| Some(level) != own)
++            .find_map(|level| level.entity_by_uuid(self, uuid))
 +    }
 +}
 diff --git a/skinsrestorer/src/starling_sync2_attachments.rs b/src/starling_sync2_attachments.rs
@@ -474,12 +838,124 @@ index 0000000..15d8d61
 +        self.key()?.remove(host, holder)
 +    }
 +}
+diff --git a/skinsrestorer/src/starling_sync2_configs.rs b/src/starling_sync2_configs.rs
+new file mode 100644
+index 0000000..1ab9123
+--- /dev/null
++++ b/src/starling_sync2_configs.rs
+@@ -0,0 +1,106 @@
++//! Horizon's config hooks (`register_configs`, `config_loading`, `config_reloading`,
++//! `config_unloading`), which Sunrise replaced with a registration in `register` and a listener of
++//! its own per file (debt-p3-25-native-config-roots). The mod's old hook bodies stay as
++//! `OldConfigs`; `register_configs` registers each config they declare, and its listener runs the
++//! old body for the event with the file as the old hooks were given it.
++
++use std::sync::Arc;
++
++/// A config the mod declares: `config/<mod id>-<kind>.toml` unless named, `default` when missing.
++pub(crate) struct Config {
++    pub mod_id: String,
++    pub kind: mod_api::ConfigKind,
++    pub file: String,
++    pub default: String,
++}
++
++fn suffix(kind: mod_api::ConfigKind) -> &'static str {
++    match kind {
++        mod_api::ConfigKind::Client => "client",
++        mod_api::ConfigKind::Common => "common",
++        _ => "server",
++    }
++}
++
++impl Config {
++    pub(crate) fn new(mod_id: &str, kind: mod_api::ConfigKind, default: &str) -> Self {
++        Self {
++            mod_id: mod_id.to_owned(),
++            kind,
++            file: format!("{mod_id}-{}.toml", suffix(kind)),
++            default: default.to_owned(),
++        }
++    }
++
++    /// The same in another file of `config/`, such as `mymod/machines.toml`.
++    pub(crate) fn file(mut self, file: &str) -> Self {
++        file.clone_into(&mut self.file);
++        self
++    }
++}
++
++/// A config file as read: its registered name and its text.
++pub(crate) struct ConfigFile {
++    pub mod_id: String,
++    pub kind: mod_api::ConfigKind,
++    pub file: String,
++    pub text: String,
++}
++
++pub(crate) struct RegisterConfigsEvent<'a> {
++    pub configs: &'a mut Vec<Config>,
++}
++
++pub(crate) struct ConfigLoadingEvent<'a> {
++    pub config: &'a ConfigFile,
++}
++
++pub(crate) struct ConfigReloadingEvent<'a> {
++    pub config: &'a ConfigFile,
++}
++
++pub(crate) struct ConfigUnloadingEvent<'a> {
++    pub config: &'a ConfigFile,
++}
++
++/// The mod's old config hooks, as it wrote them.
++pub(crate) trait OldConfigs: Default + Send + Sync + 'static {
++    fn starling_register_configs(&self, _event: &mut RegisterConfigsEvent<'_>) {}
++    fn starling_config_loading(&self, _context: &dyn mod_api::ConfigContext, _event: &mut ConfigLoadingEvent<'_>) {}
++    fn starling_config_reloading(&self, _host: mod_api::HostSide<'_>, _event: &mut ConfigReloadingEvent<'_>) {}
++    fn starling_config_unloading(&self, _host: &mut dyn mod_api::ServerHost, _event: &mut ConfigUnloadingEvent<'_>) {}
++}
++
++/// Registers every config the mod's `register_configs` declares, each with a listener that runs
++/// its old loading, reloading and unloading hooks (on the mod's shared state: `T::default()`).
++pub(crate) fn register_configs<T: OldConfigs>(r: &mut (dyn mod_api::Registrar + '_)) {
++    let mut configs = Vec::new();
++    T::default().starling_register_configs(&mut RegisterConfigsEvent { configs: &mut configs });
++    for config in configs {
++        let spec = mod_api::ConfigSpec::new(config.kind, config.default.clone()).file(config.file.clone());
++        let (mod_id, kind) = (config.mod_id.clone(), config.kind);
++        let listener = move |event: mod_api::ConfigEvent<'_>, snapshot: &mod_api::ConfigSnapshot| -> Result<(), String> {
++            let file = ConfigFile {
++                mod_id: mod_id.clone(),
++                kind,
++                file: snapshot.file.to_string_lossy().replace('\\', "/"),
++                text: snapshot.text.clone(),
++            };
++            let this = T::default();
++            match event {
++                mod_api::ConfigEvent::Loading(context) => {
++                    this.starling_config_loading(context, &mut ConfigLoadingEvent { config: &file })
++                }
++                mod_api::ConfigEvent::Reloading(host) => {
++                    this.starling_config_reloading(host, &mut ConfigReloadingEvent { config: &file })
++                }
++                mod_api::ConfigEvent::Unloading(host) => {
++                    this.starling_config_unloading(host, &mut ConfigUnloadingEvent { config: &file })
++                }
++                _ => {}
++            }
++            Ok(())
++        };
++        let _ = r.register_config(spec, Some(Arc::new(listener)));
++    }
++}
 diff --git a/skinsrestorer/src/starling_sync2_files.rs b/src/starling_sync2_files.rs
 new file mode 100644
-index 0000000..bac8dce
+index 0000000..1e14e5f
 --- /dev/null
 +++ b/src/starling_sync2_files.rs
-@@ -0,0 +1,219 @@
+@@ -0,0 +1,254 @@
 +//! Horizon's checked mod files (`ConfigFiles`, `ConfigPath`, `ConfigFileError`), which Sunrise
 +//! replaced with plain folders and `std::fs` (debt-p3-25-native-config-roots): the same calls, on
 +//! the folders Sunrise names for them. Config files sit in the shared `config/` folder
@@ -545,6 +1021,23 @@ index 0000000..bac8dce
 +            None => false,
 +        }
 +    }
++}
++
++/// What a path holds.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum ConfigEntryKind {
++    File,
++    Folder,
++}
++
++/// A file's or folder's size and age (`java.io.File.length` / `lastModified`).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) struct ConfigStat {
++    pub kind: ConfigEntryKind,
++    /// Bytes, for a file; 0 for a folder.
++    pub len: u64,
++    /// Milliseconds since the Unix epoch; 0 where the system doesn't say.
++    pub modified_millis: u64,
 +}
 +
 +/// Why a file call was refused.
@@ -649,6 +1142,24 @@ index 0000000..bac8dce
 +            let _ = std::fs::remove_file(&temporary);
 +            io(e)
 +        })
++    }
++
++    /// What is at `path`; None where nothing is.
++    pub(crate) fn stat(&self, path: &ConfigPath) -> Result<Option<ConfigStat>, ConfigFileError> {
++        let at = self.path(path)?;
++        match std::fs::metadata(&at) {
++            Ok(meta) => Ok(Some(ConfigStat {
++                kind: if meta.is_dir() { ConfigEntryKind::Folder } else { ConfigEntryKind::File },
++                len: if meta.is_dir() { 0 } else { meta.len() },
++                modified_millis: meta
++                    .modified()
++                    .ok()
++                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
++                    .map_or(0, |d| d.as_millis() as u64),
++            })),
++            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
++            Err(e) => Err(io(e)),
++        }
 +    }
 +
 +    /// Removes the file: `Ok(true)` when it was there, `Ok(false)` when nothing was.
@@ -791,10 +1302,10 @@ index 0000000..9c23a43
 +}
 diff --git a/skinsrestorer/src/starling_sync2_menus.rs b/src/starling_sync2_menus.rs
 new file mode 100644
-index 0000000..0cb6c37
+index 0000000..80253fb
 --- /dev/null
 +++ b/src/starling_sync2_menus.rs
-@@ -0,0 +1,83 @@
+@@ -0,0 +1,90 @@
 +//! Horizon's native chest menus by player UUID and window id, which Sunrise moved onto `PlayerRef`
 +//! and `MenuRef` (debt-p3-10, debt-p3-07), and its `menu_closed` notice, which Sunrise folds into
 +//! `player_container_close` (debt-p3-67): the same calls and the same notice, rebuilt from them.
@@ -813,6 +1324,8 @@ index 0000000..0cb6c37
 +    ) -> Result<Option<i32>, mod_api::StackWriteError>;
 +    /// Closes the player's current menu, if any.
 +    fn close_menu(&mut self, uuid: u128);
++    /// The player's open window `window`: None for another window or a player who isn't here.
++    fn menu(&self, uuid: u128, window: i32) -> Option<mod_api::MenuRef>;
 +    /// Replaces the items of the player's open window `window`.
 +    fn menu_set_items(
 +        &mut self,
@@ -845,6 +1358,11 @@ index 0000000..0cb6c37
 +        if let Some(menu) = self.player(uuid).and_then(|player| player.container_menu(self)) {
 +            let _ = menu.close_container(self);
 +        }
++    }
++
++    fn menu(&self, uuid: u128, window: i32) -> Option<mod_api::MenuRef> {
++        let menu = self.player(uuid)?.container_menu(self)?;
++        (menu.container_id(self) == Some(window)).then_some(menu)
 +    }
 +
 +    fn menu_set_items(
