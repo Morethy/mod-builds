@@ -20,6 +20,7 @@ ls "$HOME/android/ndk/28.2.13676358/toolchains" "$HOME/android/build-tools/35.0.
 
 rev=$(sed -n 's/^MIXINS_REV=//p' "$root/source/packaging/android/native_build.sh")
 git_url=$(sed -n 's/^MIXINS_GIT=//p' "$root/source/packaging/android/native_build.sh")
+git_url=https://github.com/Morethy/horizon-mixins
 cargo install --locked --git "$git_url" --rev "$rev" --root "$root/base/mixins-${rev:0:12}" horizon-mixins-cli
 
 cargo fetch --locked --manifest-path "$root/source/Cargo.toml"
